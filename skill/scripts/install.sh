@@ -23,7 +23,7 @@ fi
 TMP="${TMPDIR:-/tmp}/halo-install"
 rm -rf "$TMP"
 echo "  cloning halo…"
-git clone --depth 1 https://github.com/warden-protocol/halo.git "$TMP"
+git clone --depth 1 https://github.com/runhalodev/halo.git "$TMP"
 
 echo "  building CLI…"
 cd "$TMP/cli"

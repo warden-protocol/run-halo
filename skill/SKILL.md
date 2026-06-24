@@ -14,7 +14,7 @@ metadata:
       - node
       - halo
     emoji: "◉"
-    homepage: https://github.com/warden-protocol/halo
+    homepage: https://github.com/runhalodev/halo
 ---
 
 # Halo
@@ -64,7 +64,7 @@ Both roles use the `halo` CLI. One command installs it (idempotent — safe to r
 exits cleanly if already installed):
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/warden-protocol/halo/main/skill/scripts/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/runhalodev/halo/main/skill/scripts/install.sh)
 ```
 
 The script checks for **Node 20+** (the CLI fails fast on older versions), clones the repo
