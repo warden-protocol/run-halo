@@ -2,9 +2,8 @@
 
 Halo is a marketplace for **x402-paid inference on Base mainnet**. Payment is settled
 on-chain by the Halo protocol facilitator, which submits the transfer and covers the gas —
-so neither side handles a network fee. There's **no token, no stake, and no deposit**:
-operators earn real USDC per request, consumers pay real USDC per request, and the wallet is
-the only credential on either side.
+so neither side handles a network fee. Operators earn real USDC per request, consumers pay
+real USDC per request, and the wallet is the only credential on either side.
 
 Two roles, one network:
 
