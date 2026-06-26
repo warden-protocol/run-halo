@@ -1,23 +1,24 @@
-# @runhalodev/cli
+# halo
 
-`halo` — operator + payer CLI for [Halo](https://www.npmjs.com/org/runhalodev). Run and pay for x402-gated services from the terminal.
+`halo` — operator + payer CLI for [Halo](https://github.com/warden-protocol/run-halo). Run and pay for x402-gated services from the terminal.
 
-## Usage
+## Install
 
-No install required:
-
-```bash
-npx @runhalodev/cli --help
-```
-
-Or install globally to get the `halo` command:
+Requires Node.js >= 20. The install script clones the repo, builds the CLI, and links the `halo` command globally:
 
 ```bash
-npm install -g @runhalodev/cli
+bash <(curl -fsSL https://raw.githubusercontent.com/warden-protocol/run-halo/main/skill/scripts/install.sh)
 halo --help
 ```
 
-Requires Node.js >= 20.
+Or build from source:
+
+```bash
+git clone https://github.com/warden-protocol/run-halo.git
+cd run-halo/cli
+npm install && npm run build && npm link
+halo --help
+```
 
 ## Commands
 

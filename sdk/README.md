@@ -1,22 +1,24 @@
-# @runhalodev/sdk
+# halo-sdk
 
-x402 client for [Halo](https://www.npmjs.com/org/runhalodev) — pay any HTTP 402–gated service with an [ethers](https://docs.ethers.org/) signer, and discover payable resources via the Coinbase CDP x402 Bazaar.
+x402 client for [Halo](https://github.com/warden-protocol/run-halo) — pay any HTTP 402–gated service with an [ethers](https://docs.ethers.org/) signer, and discover payable resources via the Coinbase CDP x402 Bazaar.
 
 It targets the standard "exact" EVM scheme (USDC `transferWithAuthorization`, EIP‑3009) — the same flow Coinbase's CDP facilitator settles onchain.
 
 ## Install
 
-```bash
-npm install @runhalodev/sdk ethers
-```
+Not yet published to a registry. Build it from source (requires Node.js >= 20):
 
-Requires Node.js >= 20.
+```bash
+git clone https://github.com/warden-protocol/run-halo.git
+cd run-halo/sdk
+npm install && npm run build
+```
 
 ## Pay a 402-gated endpoint
 
 ```ts
 import { ethers } from "ethers";
-import { fetchWithX402 } from "@runhalodev/sdk";
+import { fetchWithX402 } from "halo-sdk";
 
 const signer = new ethers.Wallet(process.env.PRIVATE_KEY!);
 
@@ -36,7 +38,7 @@ console.log(await response.json());
 ## Discover and call resources (x402 Bazaar)
 
 ```ts
-import { searchBazaar, callX402Json } from "@runhalodev/sdk";
+import { searchBazaar, callX402Json } from "halo-sdk";
 
 const { resources } = await searchBazaar({ query: "weather", asset: "USDC" });
 

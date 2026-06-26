@@ -1,5 +1,5 @@
 {
-  "name": "@runhalodev/sdk",
+  "name": "halo-sdk",
   "version": "0.0.1",
   "description": "x402 client for Halo",
   "license": "Apache-2.0",
