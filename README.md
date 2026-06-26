@@ -15,18 +15,18 @@ Two roles, one network:
 
 ## Repository layout
 
-| Path | Package | Description |
-| --- | --- | --- |
-| [`cli/`](cli) | [`@runhalodev/cli`](https://www.npmjs.com/package/@runhalodev/cli) | The `halo` operator + payer CLI |
-| [`sdk/`](sdk) | [`@runhalodev/sdk`](https://www.npmjs.com/package/@runhalodev/sdk) | x402 client — pay any 402-gated service with an ethers signer |
-| [`skill/`](skill) | — | Agent skill that drives the CLI end-to-end for both roles |
+| Path | Description |
+| --- | --- |
+| [`cli/`](cli) | The `halo` operator + payer CLI |
+| [`sdk/`](sdk) | x402 client — pay any 402-gated service with an ethers signer |
+| [`skill/`](skill) | Agent skill that drives the CLI end-to-end for both roles |
 
 ## Quick start
 
 Install the CLI (Node.js >= 20):
 
 ```bash
-npm install -g @runhalodev/cli
+bash <(curl -fsSL https://raw.githubusercontent.com/warden-protocol/run-halo/main/skill/scripts/install.sh)
 halo --help
 ```
 

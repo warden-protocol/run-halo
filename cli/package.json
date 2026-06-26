@@ -1,5 +1,5 @@
 {
-  "name": "@runhalodev/cli",
+  "name": "halo",
   "version": "0.0.3",
   "description": "halo — operator + payer CLI",
   "license": "Apache-2.0",
