@@ -179,9 +179,18 @@ async function selectVaultOperator(
           : null;
       })
       .filter((x): x is VaultOperatorPin => x !== null)
-      .filter((x) => maxPriceUsdPerMtok === undefined || x.priceUsdPerMtok <= maxPriceUsdPerMtok)
-      .sort((a, b) => a.priceUsdPerMtok - b.priceUsdPerMtok);
-    return priced[0] ?? null;
+      .filter((x) => maxPriceUsdPerMtok === undefined || x.priceUsdPerMtok <= maxPriceUsdPerMtok);
+    if (priced.length === 0) return null;
+    // Spread across operators TIED at the cheapest price instead of always
+    // pinning the first. Vault mode pins ONE operator (so the reservation,
+    // request, and receipt line up) and bypasses the relay's balanced routing —
+    // so without this, several equally-priced operators serving one model (e.g.
+    // a confidential model on multiple TEE operators) all starve but one, and
+    // only that one ever redeems. (#364)
+    const best = Math.min(...priced.map((x) => x.priceUsdPerMtok));
+    const PRICE_EPS = 1e-9;
+    const cheapest = priced.filter((x) => x.priceUsdPerMtok <= best + PRICE_EPS);
+    return cheapest[Math.floor(Math.random() * cheapest.length)];
   } catch {
     return null;
   }
