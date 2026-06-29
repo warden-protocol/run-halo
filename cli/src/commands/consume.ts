@@ -89,6 +89,11 @@ interface Args {
    *  ETH on Base for the deposit tx. 0/unset = never auto-deposit (manage with
    *  `halo vault deposit`). */
   vaultDeposit?: number;
+  /** Batch size for vault reservations: reserve this many requests' worth at once
+   *  to amortize the reserve tx. Default 5. Lower it when fanning out across many
+   *  operators so reservations don't lock the whole deposit (#367); a single
+   *  reservation is also auto-capped at a slice of the free balance regardless. */
+  vaultReserveMultiple?: number;
   /** Self-daemonize: re-spawn the server detached (own session, reparented to
    *  init) and return immediately, so an agent/gateway that launches consume
    *  can't kill it on restart. Idempotent — no-ops if one's already serving. */
@@ -148,7 +153,8 @@ async function selectVaultOperator(
   relayBase: string,
   model: string,
   teeOnly: boolean,
-  maxPriceUsdPerMtok?: number
+  maxPriceUsdPerMtok?: number,
+  requireAddress?: string
 ): Promise<VaultOperatorPin | null> {
   try {
     const url = `${relayBase}/v1/operators` + (teeOnly ? "?tee=1" : "");
@@ -181,6 +187,15 @@ async function selectVaultOperator(
       .filter((x): x is VaultOperatorPin => x !== null)
       .filter((x) => maxPriceUsdPerMtok === undefined || x.priceUsdPerMtok <= maxPriceUsdPerMtok);
     if (priced.length === 0) return null;
+    // Honor an explicit operator pin (X-Halo-Operator) when the caller forced
+    // one: return THAT operator's pin if it serves+prices the model, so a caller
+    // can deliberately target any operator (e.g. a settlement sweep funding every
+    // operator, not just the cheapest). null when the pinned operator doesn't
+    // qualify, so the caller surfaces a clear 503 instead of silently rerouting.
+    if (requireAddress) {
+      const want = requireAddress.toLowerCase();
+      return priced.find((x) => x.address.toLowerCase() === want) ?? null;
+    }
     // Spread across operators TIED at the cheapest price instead of always
     // pinning the first. Vault mode pins ONE operator (so the reservation,
     // request, and receipt line up) and bypasses the relay's balanced routing —
@@ -450,6 +465,11 @@ export async function cmdConsume(args: Args): Promise<void> {
         // Push signed receipts to the serving operator through the relay
         // (operator-driven redeem, issue #369); self-redeem is the fallback.
         relayUrl: relayBase,
+        // Optional override for the reservation batch size (#367). Omitted (not
+        // undefined) when unset so the client's default (5) isn't clobbered.
+        ...(args.vaultReserveMultiple && args.vaultReserveMultiple > 0
+          ? { reserveMultiple: BigInt(Math.floor(args.vaultReserveMultiple)) }
+          : {}),
         // Same target drives startup deposit AND mid-run auto-refill, so the
         // vault doesn't drain to a 402 (which would bounce the agent to a fallback).
         autoTopUpUsd: args.vaultDeposit,
@@ -779,7 +799,11 @@ export async function cmdConsume(args: Args): Promise<void> {
     let vaultPin: VaultOperatorPin | null = null;
     if (vault) {
       const m = typeof parsed.model === "string" ? parsed.model : "";
-      vaultPin = m ? await selectVaultOperator(relayBase, m, wantConfidential) : null;
+      // If the caller explicitly pinned an operator (X-Halo-Operator, e.g. a
+      // settlement sweep targeting every operator), honor it; otherwise fall back
+      // to the default cheapest-tier selection.
+      const pinned = (forwardHeaders["x-halo-operator"] || "").trim() || undefined;
+      vaultPin = m ? await selectVaultOperator(relayBase, m, wantConfidential, undefined, pinned) : null;
       if (!vaultPin) {
         return sendJson(
           res,
@@ -788,7 +812,9 @@ export async function cmdConsume(args: Args): Promise<void> {
             503,
             JSON.stringify({
               error: {
-                message: `no priced${wantConfidential ? " confidential" : ""} operator is online for "${m}". Vault mode needs an operator advertising a price for this model.`,
+                message: pinned
+                  ? `pinned operator ${pinned} is not advertising a price for "${m}"${wantConfidential ? " (confidential)" : ""} right now — it can't be reserved against. Drop X-Halo-Operator to use the cheapest available operator.`
+                  : `no priced${wantConfidential ? " confidential" : ""} operator is online for "${m}". Vault mode needs an operator advertising a price for this model.`,
               },
             }),
             errCtx

@@ -121,6 +121,48 @@ export function estimateTokens(messages: unknown, maxTokens: number): number {
   return Math.ceil(chars / 4) + maxTokens;
 }
 
+// How many operators the consumer aims to keep enough free balance to fund.
+// A single reservation never locks more than ~1/this of the current free balance
+// beyond the minimum to serve the request — so fanning out across many operators
+// (random routing) can't lock the whole deposit (#367). Tunable via env.
+const RESERVE_LIQUIDITY_SLOTS = (() => {
+  const v = Number(process.env.HALO_VAULT_RESERVE_SLOTS ?? "8");
+  return Number.isFinite(v) && v >= 1 ? BigInt(Math.floor(v)) : 8n;
+})();
+
+/**
+ * Decide how much to (re)reserve to an operator. Batches up to
+ * `reserveMultiple × estCost` to amortize the on-chain reserve tx, but caps a
+ * single reservation at ~1/`slots` of the free balance so a wide fan-out can't
+ * lock the entire deposit (#367) — while ALWAYS covering at least this request's
+ * cost so it still serves. Pure (no I/O) so it's unit-testable.
+ *
+ * @returns base units to add to the reservation (0 = already covered & live).
+ */
+export function computeReserveAmount(p: {
+  estCost: bigint;
+  /** Current on-chain `locked` for this operator. */
+  locked: bigint;
+  /** Consumer's free (withdrawable) balance. */
+  withdrawable: bigint;
+  reserveMultiple: bigint;
+  slots: bigint;
+  /** Whether the existing reservation is still live (not near expiry). */
+  live: boolean;
+}): bigint {
+  const target = p.estCost * p.reserveMultiple;
+  let amount = target > p.locked ? target - p.locked : 0n;
+  // The bare minimum this request needs reserved (on top of what's already there).
+  const needed = p.locked >= p.estCost ? 0n : p.estCost - p.locked;
+  // Liquidity cap: don't sink more than a slice of free balance into batching.
+  const cap = p.slots > 0n ? p.withdrawable / p.slots : p.withdrawable;
+  if (amount > cap) amount = cap;
+  if (amount < needed) amount = needed; // never under-reserve the request itself
+  if (amount > p.withdrawable) amount = p.withdrawable;
+  if (amount === 0n && !p.live) amount = 1n; // minimal bump to refresh expiry
+  return amount;
+}
+
 export interface VaultConfig {
   facilitatorUrl: string;
   rpcUrl: string;
@@ -153,6 +195,17 @@ export class VaultConsumeClient {
   private readonly cumulative = new Map<string, bigint>();
   private ensureQueue: Promise<unknown> = Promise.resolve();
   private redeemQueue: Promise<void> = Promise.resolve();
+  // Operators we've reserved to this session, so expired headroom can be
+  // reclaimed back to the free balance (#367). The vault can't enumerate them.
+  // An operator is dropped only once a read confirms it's fully drained
+  // (locked==0) — never on an unconfirmed release broadcast — so a dropped
+  // release is retried and a settled operator stops being re-read.
+  private readonly reservedOperators = new Set<string>();
+  // operator → epoch ms of the last release we broadcast for it, so we don't
+  // re-broadcast every short-balance request during the ~1-block window before
+  // it mines; after the cooldown a still-locked operator is retried.
+  private readonly releaseAttemptedAt = new Map<string, number>();
+  private redeemGraceCache: bigint | null = null;
 
   private readonly autoTopUpBase: bigint;
 
@@ -326,6 +379,81 @@ export class VaultConsumeClient {
     return body.hash;
   }
 
+  // ── reservation reclaim (#367) ───────────────────────────────────────────────
+  /** Contract `redeemGrace` — the window AFTER a reservation's expiry during which
+   *  only the operator may still redeem; release is permitted only past it. */
+  private async redeemGrace(): Promise<bigint> {
+    if (this.redeemGraceCache !== null) return this.redeemGraceCache;
+    const c = new Contract(VAULT_ADDRESS, ["function redeemGrace() view returns (uint64)"], this.provider);
+    this.redeemGraceCache = BigInt(await withTimeout(c.redeemGrace(), READ_TIMEOUT_MS, "redeemGrace read"));
+    return this.redeemGraceCache;
+  }
+
+  /** Ask the facilitator to release an expired reservation (permissionless on-chain;
+   *  it relays + pays gas). The contract enforces `expiry + redeemGrace`. */
+  private async postRelease(operator: string): Promise<string> {
+    const res = await fetch(`${this.facBase()}/vault/release`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ consumer: this.consumer, operator }),
+      signal: AbortSignal.timeout(60_000),
+    });
+    const body = (await res.json().catch(() => ({}))) as { hash?: string; error?: string };
+    if (!res.ok || !body.hash) throw new Error(body.error || `release failed (HTTP ${res.status})`);
+    return body.hash;
+  }
+
+  /**
+   * Reclaim expired reservations to OTHER operators back to the free balance
+   * (#367). Best-effort and ASYNC: the facilitator broadcasts the release and
+   * returns before it mines, so the freed funds land on a SUBSEQUENT request, not
+   * the one that triggered this — we never delete an operator on an unconfirmed
+   * broadcast (a dropped release would otherwise strand its headroom for the
+   * session). An operator is dropped only once a read confirms it's fully drained
+   * (`locked==0`); a still-locked one past grace is (re)released, throttled by a
+   * cooldown so we don't re-broadcast every request while a release is in flight.
+   * Returns true if a release was broadcast this pass. Skips `skipOperator`.
+   */
+  async releaseExpiredReservations(skipOperator?: string): Promise<boolean> {
+    let grace: bigint;
+    try {
+      grace = await this.redeemGrace();
+    } catch {
+      // Can't read the grace window → skip reclaim this pass. grace=0 would be the
+      // WIDEST (least safe) window: we'd broadcast releases the contract reverts as
+      // NotExpired during the real on-chain grace. Wait for a readable grace.
+      return false;
+    }
+    const RELEASE_RETRY_COOLDOWN_MS = 60_000;
+    const now = BigInt(Math.floor(toUnixSeconds()));
+    const nowMs = Date.now();
+    const skip = skipOperator?.toLowerCase();
+    let released = false;
+    for (const op of this.reservedOperators) {
+      if (op === skip) continue;
+      try {
+        const o = await this.readOps(op);
+        // Fully drained/released (mined) → nothing to reclaim; stop tracking it.
+        if (o.locked === 0n) {
+          this.reservedOperators.delete(op);
+          this.releaseAttemptedAt.delete(op);
+          continue;
+        }
+        const eligible = o.expiry !== 0n && now > o.expiry + grace;
+        const onCooldown = (this.releaseAttemptedAt.get(op) ?? 0) > nowMs - RELEASE_RETRY_COOLDOWN_MS;
+        if (eligible && !onCooldown) {
+          await this.postRelease(op); // broadcast only — frees on confirmation
+          this.releaseAttemptedAt.set(op, nowMs);
+          console.log(`  ♻ releasing expired vault reservation to ${op.slice(0, 8)}… ($${fmtUsd(o.locked)}, frees on confirmation)`);
+          released = true;
+        }
+      } catch {
+        /* best-effort — a stuck reservation is retried on the next pass */
+      }
+    }
+    return released;
+  }
+
   // ── reservation ────────────────────────────────────────────────────────────
   /**
    * Ensure a live reservation to `operator` covers `estCost`. Serialized through
@@ -353,17 +481,34 @@ export class VaultConsumeClient {
     const live = () => ops.expiry === 0n || BigInt(sec + REFRESH_MARGIN) < ops.expiry;
 
     if (ops.locked < estCost || !live()) {
-      // The free balance can't cover even this one request → try to refill the
-      // vault from the wallet mid-run, then re-read. This is what keeps the agent
-      // ON the Halo rail instead of erroring → falling back to another provider.
+      // Free balance can't cover this request. Before depositing more, kick off
+      // RECLAIM of any expired reservations to OTHER operators back to the free
+      // balance (#367): a fan-out strands headroom per operator until its TTL, so
+      // a sustained run can starve itself even though funds aren't lost. Release
+      // is async (broadcast now, mines ~a block later), so the re-read below
+      // usually still shows it locked — the freed funds land on a SUBSEQUENT
+      // request; this pass falls through to top-up/serve as before.
+      if (ops.locked + state.withdrawable < estCost) {
+        if (await this.releaseExpiredReservations(operator)) {
+          [state, ops] = await Promise.all([this.readVaultState(), this.readOps(operator)]);
+        }
+      }
+      // Still short → try to refill the vault from the wallet mid-run, then
+      // re-read. This is what keeps the agent ON the Halo rail instead of
+      // erroring → falling back to another provider.
       if (ops.locked + state.withdrawable < estCost && this.autoTopUpBase > 0n) {
         if (await this.autoTopUp(target)) {
           [state, ops] = await Promise.all([this.readVaultState(), this.readOps(operator)]);
         }
       }
-      let amount = target > ops.locked ? target - ops.locked : 0n;
-      if (amount > state.withdrawable) amount = state.withdrawable;
-      if (amount === 0n && !live()) amount = 1n; // bump expiry even when funds suffice
+      const amount = computeReserveAmount({
+        estCost,
+        locked: ops.locked,
+        withdrawable: state.withdrawable,
+        reserveMultiple: this.cfg.reserveMultiple,
+        slots: RESERVE_LIQUIDITY_SLOTS,
+        live: live(),
+      });
       if (ops.locked + amount < estCost) {
         throw new Error(this.insufficientMsg(state.withdrawable, estCost));
       }
@@ -380,6 +525,9 @@ export class VaultConsumeClient {
         ops = await this.waitForReservation(operator, ops);
       }
     }
+    // Remember operators we've reserved to so their expired headroom can be
+    // reclaimed later (#367).
+    this.reservedOperators.add(operator.toLowerCase());
     return { ops, keyEpoch: state.keyEpoch };
   }
 
