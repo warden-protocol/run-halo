@@ -37,7 +37,9 @@ import {
   OpenAIChatRequest,
 } from "../anthropic-adapter";
 import { upstreamRatePer1KUsd, upstreamContextLength, estimatePromptTokens } from "../pricing";
-import { checkReservationCached, noteServed, VAULT_ADDRESS } from "../vault";
+import { checkReservationCached, noteServed, verifyReceipt, invalidateGate, ReservationCheck, VAULT_ADDRESS } from "../vault";
+import { VaultCreditLedger, creditWindowBase, AdmitResult } from "../vaultCredit";
+import { OperatorRedeemer } from "../vaultRedeemer";
 import { isAddress } from "ethers";
 import { decryptSecret, isEncryptedSecret } from "../secret";
 import { sanitizeChatRequest, sanitizeMessages } from "../sanitize";
@@ -701,6 +703,32 @@ export async function cmdServe(): Promise<void> {
     cfg.facilitator.failoverUrls
   );
 
+  // Operator-driven vault redeem (issue #369): the operator holds the consumer's
+  // signed cumulative receipts, bounds un-receipted serving via a per-consumer
+  // credit window, and redeems the receipts itself (with retry) — so served work
+  // can never go uncollected because a consumer didn't bother to redeem.
+  const creditLedger = new VaultCreditLedger();
+  const redeemer = new OperatorRedeemer(cfg.facilitator.url, creditLedger, (m) => console.log(m));
+  // Periodic sweep: re-attempt any receipt whose redeem failed transiently and
+  // got no follow-up receipt, so it's collected before the reservation expires.
+  const redeemSweep = setInterval(() => redeemer.sweep(), 30_000);
+  redeemSweep.unref?.();
+  // Verify a consumer-pushed receipt against on-chain state, record it (freeing
+  // this pair's credit window), and trigger collection. Shared by the WS receipt
+  // message and the piggybacked `x-halo-receipt` header.
+  const handleReceipt = async (consumer: string, cumulative: bigint, signature: string): Promise<boolean> => {
+    if (!isAddress(consumer) || cumulative <= 0n || !signature) return false;
+    const v = await verifyReceipt({ consumer, operator: cfg.operator.address, cumulative, signature });
+    if (!v.ok) {
+      console.warn(`  ⚠ rejecting vault receipt from ${abbrevAddr(consumer)}: ${v.reason}`);
+      return false;
+    }
+    if (creditLedger.recordReceipt(consumer, cfg.operator.address, { cumulative, signature, cycle: v.cycle })) {
+      redeemer.kick(consumer, cfg.operator.address);
+    }
+    return true;
+  };
+
   // Warm the facilitator address cache at startup so the first inference
   // request doesn't pay the latency of a /supported fetch.
   const facilitatorAddress = await facilitator.getFacilitatorAddress();
@@ -750,7 +778,12 @@ export async function cmdServe(): Promise<void> {
   process.on("SIGINT", () => {
     shuttingDown = true;
     console.log("\n  shutting down");
-    process.exit(0);
+    // Best-effort: collect any held receipts before exit (issue #369), bounded
+    // so shutdown never hangs on a slow facilitator.
+    void Promise.race([
+      redeemer.flush(),
+      new Promise((r) => setTimeout(r, 3000)),
+    ]).finally(() => process.exit(0));
   });
 
   // Run the WS lifecycle. Resolves when the socket closes; never rejects —
@@ -905,6 +938,28 @@ export async function cmdServe(): Promise<void> {
           return;
         }
 
+        // Consumer-pushed cumulative receipt for prior vault work, routed by the
+        // relay (operator-driven redeem, issue #369). Off the serve path: verify,
+        // record (frees the credit window), and collect. The tail of a burst (no
+        // follow-up request to piggyback on) relies on this dedicated push.
+        if (msg.type === "receipt") {
+          const m = msg as { receiptId?: string; consumer?: string; cumulative?: string; signature?: string };
+          let cumulative: bigint;
+          try {
+            cumulative = BigInt(m.cumulative ?? "0");
+          } catch {
+            if (m.receiptId && ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: "receipt-ack", receiptId: m.receiptId, accepted: false }));
+            }
+            return;
+          }
+          const accepted = await handleReceipt((m.consumer || "").toLowerCase(), cumulative, m.signature || "");
+          if (m.receiptId && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "receipt-ack", receiptId: m.receiptId, accepted }));
+          }
+          return;
+        }
+
         if (msg.type !== "inference-request") return;
         const req = msg as InferenceRequestMessage;
         const requestStartedAt = Date.now();
@@ -990,6 +1045,12 @@ export async function cmdServe(): Promise<void> {
           typeof req.headers["x-encryption-version"] === "string";
         const reqHeaders = req.headers as Record<string, string>;
 
+        // Credit-window reservation held across this serve (issue #369): set when
+        // a vault request is admitted, cleared once it's settled/released. The
+        // catch releases it so a thrown serve can't strand the window.
+        let creditAdmitted: { consumer: string; ceiling: bigint; cycle: bigint } | null = null;
+        let creditAdmit: AdmitResult;
+
         try {
           if (paymentMode === "vault") {
             // ── VAULT MODE PATH (RFC v2) ──────────────────────────────────
@@ -1008,6 +1069,23 @@ export async function cmdServe(): Promise<void> {
                 body: { error: { message: "vault mode requires a valid X-Halo-Vault-Consumer header" } },
               };
             } else {
+              // Piggybacked receipt for prior work (issue #369): `x-halo-receipt`
+              // is base64(JSON{cumulative, signature}) for THIS consumer. Process
+              // it BEFORE gating so a receipt riding on this request frees the
+              // credit window in time to admit it. Free for mid-burst calls; the
+              // burst tail uses the dedicated WS `receipt` push instead.
+              const rcptHeader = req.headers["x-halo-receipt"];
+              if (typeof rcptHeader === "string" && rcptHeader) {
+                try {
+                  const r = JSON.parse(Buffer.from(rcptHeader, "base64").toString("utf-8")) as {
+                    cumulative?: string;
+                    signature?: string;
+                  };
+                  await handleReceipt(consumerAddr, BigInt(r.cumulative ?? "0"), r.signature || "");
+                } catch {
+                  /* malformed piggyback receipt — ignore; the gate still protects us */
+                }
+              }
               // Cost ceiling = exact prompt tokens + the completion ceiling.
               const ceilingCost = await priceRequest({
                 cfg,
@@ -1015,12 +1093,12 @@ export async function cmdServe(): Promise<void> {
                 promptTokens: estimatePromptTokens((req.body as { messages?: unknown }).messages),
                 completionTokens: estimatedCompletionTokens,
               });
-              let chk;
+              let chk: ReservationCheck;
               try {
                 chk = await checkReservationCached(consumerAddr, cfg.operator.address, ceilingCost);
               } catch (err) {
                 logError("vault reservation read failed", err);
-                chk = { ok: false, reason: "could not read on-chain reservation", remaining: 0n };
+                chk = { ok: false, reason: "could not read on-chain reservation", remaining: 0n, cycle: 0n, redeemed: 0n };
               }
               if (!chk.ok) {
                 console.warn(
@@ -1040,6 +1118,72 @@ export async function cmdServe(): Promise<void> {
                   },
                 };
               } else {
+                // Window = configured credit cap, never above the on-chain
+                // collectible (`locked`) — we won't float more than funds exist
+                // to back. Bounds loss to a ghosting consumer at this amount.
+                // Recomputed from `chk` so a stale-cycle refresh below uses the
+                // refreshed reservation's `remaining`.
+                const creditWindow = (): bigint =>
+                  creditWindowBase() < chk.remaining ? creditWindowBase() : chk.remaining;
+                // Align process-local cumulative accounting with the durable
+                // on-chain baseline before the synchronous admission check.
+                creditLedger.syncOnchain(consumerAddr, cfg.operator.address, chk.cycle, chk.redeemed);
+                creditAdmit = creditLedger.admit(
+                  consumerAddr,
+                  cfg.operator.address,
+                  chk.cycle,
+                  ceilingCost,
+                  creditWindow()
+                );
+                if (!creditAdmit.ok && creditAdmit.stale) {
+                  // Our cached reservation view lagged a cycle bump: a receipt for
+                  // the NEW generation advanced the ledger (via the uncached verify
+                  // path) while this request read the gate cache. Don't serve on
+                  // stale coverage or strand the window — drop the cache, refresh
+                  // from chain, and re-gate ONCE against the current cycle.
+                  invalidateGate(consumerAddr, cfg.operator.address);
+                  try {
+                    chk = await checkReservationCached(consumerAddr, cfg.operator.address, ceilingCost);
+                  } catch (err) {
+                    logError("vault reservation refresh failed", err);
+                    chk = { ok: false, reason: "could not refresh on-chain reservation", remaining: 0n, cycle: 0n, redeemed: 0n };
+                  }
+                  if (chk.ok) {
+                    creditLedger.syncOnchain(consumerAddr, cfg.operator.address, chk.cycle, chk.redeemed);
+                    creditAdmit = creditLedger.admit(
+                      consumerAddr,
+                      cfg.operator.address,
+                      chk.cycle,
+                      ceilingCost,
+                      creditWindow()
+                    );
+                  } else {
+                    creditAdmit = {
+                      ok: false,
+                      reason: `reservation no longer covers this request after a cycle change${chk.reason ? `: ${chk.reason}` : ""}`,
+                      outstanding: 0n,
+                    };
+                  }
+                }
+                if (!creditAdmit.ok) {
+                console.warn(
+                  `  ⚠ rejecting vault request ${req.requestId}: ${creditAdmit.reason}`
+                );
+                out = {
+                  status: 402,
+                  headers: {},
+                  body: {
+                    error: {
+                      message: `Vault credit window exceeded: ${creditAdmit.reason}. The operator is awaiting a signed receipt for your prior requests before serving more — push the receipt (or it rides on your next request) to free the window.`,
+                      type: "vault_credit_window_exceeded",
+                      requiredUsdcBase: ceilingCost.toString(),
+                    },
+                  },
+                };
+                } else {
+                // Admitted — the ceiling is reserved against the window until we
+                // settle (served) or release (failed). Remember it for both.
+                creditAdmitted = { consumer: consumerAddr, ceiling: ceilingCost, cycle: chk.cycle };
                 // Reservation covers it — serve. stream:true pumps deltas to
                 // the consumer as inference-chunk frames (relay → SSE). Unlike
                 // budget mode this needs no opt-in flag: the reservation
@@ -1091,6 +1235,9 @@ export async function cmdServe(): Promise<void> {
                     : data;
                 if (!(upstream.status >= 200 && upstream.status < 300)) {
                   // Upstream failed — no charge owed; consumer simply won't redeem.
+                  // Return the request's reserved ceiling to the credit window.
+                  creditLedger.releaseInflight(consumerAddr, cfg.operator.address, chk.cycle, ceilingCost);
+                  creditAdmitted = null;
                   console.warn(`  ⚠ upstream ${upstream.status} on vault request; nothing to settle`);
                   out = {
                     status: upstream.status,
@@ -1141,6 +1288,10 @@ export async function cmdServe(): Promise<void> {
                   // Discount what we just served from the cached reservation
                   // headroom so the gate cache never approves past coverage.
                   noteServed(consumerAddr, cfg.operator.address, actualAmount);
+                  // True up the credit window: replace this request's reserved
+                  // ceiling with its ACTUAL served cost (issue #369).
+                  creditLedger.settleServed(consumerAddr, cfg.operator.address, chk.cycle, ceilingCost, actualAmount);
+                  creditAdmitted = null;
                   console.log(
                     `  ✓ vault-served ${req.requestId} for ${abbrevAddr(consumerAddr)} — ${fmtUsd(actualAmount)} (${upstream.usage.total_tokens} tok); awaiting redeem`
                   );
@@ -1164,6 +1315,7 @@ export async function cmdServe(): Promise<void> {
                     .signMessage(sigMessage)
                     .then((signature) => postEvent(cfg, { ...eventPayload, signature }))
                     .catch((err) => logError("event post failed", err));
+                }
                 }
               }
             }
@@ -1747,6 +1899,17 @@ export async function cmdServe(): Promise<void> {
             }
           }
         } catch (err) {
+          // A thrown serve must not strand the credit window — return the
+          // admitted request's reserved ceiling (issue #369).
+          if (creditAdmitted) {
+            creditLedger.releaseInflight(
+              creditAdmitted.consumer,
+              cfg.operator.address,
+              creditAdmitted.cycle,
+              creditAdmitted.ceiling
+            );
+            creditAdmitted = null;
+          }
           out = {
             status: 502,
             headers: {},
