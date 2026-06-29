@@ -14,7 +14,7 @@
  * it must match the consumer + facilitator); RPC from BASE_RPC_URL (falls back to
  * the public Base endpoint).
  */
-import { Contract, JsonRpcProvider } from "ethers";
+import { Contract, JsonRpcProvider, TypedDataDomain, verifyTypedData } from "ethers";
 import { VAULT_ADDRESS } from "./vault-address";
 
 // Re-export so existing `import { VAULT_ADDRESS } from "../vault"` keeps working.
@@ -23,7 +23,21 @@ const RPC_URL = (process.env.BASE_RPC_URL || "https://mainnet.base.org").trim();
 
 const VAULT_ABI = [
   "function ops(address,address) view returns (uint256 locked,uint256 redeemed,uint64 expiry,uint64 created,uint64 cycle)",
+  "function sessionKey(address) view returns (address)",
+  "function keyEpoch(address) view returns (uint256)",
 ];
+
+// EIP-712 (MUST match HaloVault.sol + the consumer's vault-consume.ts byte for
+// byte, or a valid receipt fails to recover and the operator drops real money).
+const RECEIPT_TYPES = {
+  Receipt: [
+    { name: "consumer", type: "address" },
+    { name: "operator", type: "address" },
+    { name: "cumulative", type: "uint256" },
+    { name: "keyEpoch", type: "uint256" },
+    { name: "cycle", type: "uint64" },
+  ],
+};
 
 let provider: JsonRpcProvider | null = null;
 function rpc(): JsonRpcProvider {
@@ -106,19 +120,31 @@ export interface ReservationCheck {
   ok: boolean;
   reason?: string;
   remaining: bigint;
+  /** Current reservation cycle (for credit-window accounting). 0 when there is
+   *  no reservation. */
+  cycle: bigint;
+  /** On-chain cumulative already redeemed in this cycle. Used to seed the
+   * operator's process-local credit ledger safely after a restart. */
+  redeemed: bigint;
 }
 
 function evaluate(r: Reservation, requiredBase: bigint, nowSec: number): ReservationCheck {
   if (r.locked === 0n) {
-    return { ok: false, reason: "no active reservation for this operator", remaining: 0n };
+    return { ok: false, reason: "no active reservation for this operator", remaining: 0n, cycle: r.cycle, redeemed: r.redeemed };
   }
   if (r.expiry !== 0n && BigInt(nowSec) >= r.expiry) {
-    return { ok: false, reason: "reservation expired", remaining: r.remaining };
+    return { ok: false, reason: "reservation expired", remaining: r.remaining, cycle: r.cycle, redeemed: r.redeemed };
   }
   if (r.remaining < requiredBase) {
-    return { ok: false, reason: "reservation does not cover this request's cost", remaining: r.remaining };
+    return {
+      ok: false,
+      reason: "reservation does not cover this request's cost",
+      remaining: r.remaining,
+      cycle: r.cycle,
+      redeemed: r.redeemed,
+    };
   }
-  return { ok: true, remaining: r.remaining };
+  return { ok: true, remaining: r.remaining, cycle: r.cycle, redeemed: r.redeemed };
 }
 
 /**
@@ -159,6 +185,15 @@ const gateCache = new Map<string, GateEntry>(); // key `${consumer}:${operator}`
 export function noteServed(consumer: string, operator: string, amountBase: bigint): void {
   const e = gateCache.get(`${consumer.toLowerCase()}:${operator.toLowerCase()}`);
   if (e) e.servedSinceRead += amountBase;
+}
+
+/** Drop the cached reservation read for a pair, forcing the next
+ *  `checkReservationCached` to re-read on-chain. Used when the credit ledger
+ *  detects the cached cycle has fallen behind a generation bump (a receipt for
+ *  the new cycle advanced the ledger via the uncached verify path), so the gate
+ *  re-evaluates against the current cycle instead of stale coverage. */
+export function invalidateGate(consumer: string, operator: string): void {
+  gateCache.delete(`${consumer.toLowerCase()}:${operator.toLowerCase()}`);
 }
 
 /**
@@ -209,4 +244,130 @@ export async function checkReservationCached(
   }
   gateCache.set(key, { r, at: Date.now(), servedSinceRead: 0n });
   return evaluate(r, requiredBase, nowSec);
+}
+
+// ── Receipt verification (operator-driven redeem, issue #369) ────────────────
+// Before the operator trusts a consumer-pushed cumulative receipt — recording it
+// frees credit-window headroom and lets the operator collect — it MUST confirm
+// the signature recovers to the consumer's registered session key, over the
+// CURRENT on-chain cycle + keyEpoch. Skipping this would let a consumer forge a
+// high-cumulative "receipt", inflate `held`, and pull free service (the receipt
+// would simply never redeem). Verify against on-chain state, never client claims.
+
+let chainIdCache: bigint | null = null;
+async function chainId(): Promise<bigint> {
+  if (chainIdCache !== null) return chainIdCache;
+  const net = await withTimeout(rpc().getNetwork(), READ_TIMEOUT_MS, "getNetwork");
+  chainIdCache = net.chainId;
+  return chainIdCache;
+}
+
+function vaultDomain(id: bigint): TypedDataDomain {
+  return { name: "Halo", version: "2", chainId: id, verifyingContract: VAULT_ADDRESS };
+}
+
+// Session key + keyEpoch change only on an explicit rotation, so a short cache
+// keeps receipt verification off the per-receipt RPC path without trusting stale
+// data across a rotation.
+const KEY_CACHE_TTL_MS = 60_000;
+interface KeyEntry { sessionKey: string; keyEpoch: bigint; at: number }
+const keyCache = new Map<string, KeyEntry>();
+
+async function readConsumerKey(consumer: string): Promise<KeyEntry> {
+  const k = consumer.toLowerCase();
+  const cached = keyCache.get(k);
+  if (cached && Date.now() - cached.at < KEY_CACHE_TTL_MS) return cached;
+  const c = new Contract(VAULT_ADDRESS, VAULT_ABI, rpc());
+  const [sk, ep] = await withTimeout(
+    Promise.all([c.sessionKey(consumer), c.keyEpoch(consumer)]),
+    READ_TIMEOUT_MS,
+    "sessionKey/keyEpoch read"
+  );
+  const entry: KeyEntry = { sessionKey: String(sk).toLowerCase(), keyEpoch: BigInt(ep), at: Date.now() };
+  keyCache.set(k, entry);
+  return entry;
+}
+
+export interface ReceiptVerification {
+  ok: boolean;
+  reason?: string;
+  /** On-chain cycle the receipt was verified against (for ledger recording). */
+  cycle: bigint;
+}
+
+/**
+ * Pure EIP-712 recovery for a vault Receipt — the anti-forgery core, split out
+ * from the chain reads so it's testable in isolation. Returns the recovered
+ * signer address (lower-case), or null when the signature is malformed. The
+ * caller must compare this to the consumer's on-chain session key; a forged or
+ * tampered receipt recovers to a different (or random) address and is rejected.
+ */
+export function recoverReceiptSigner(
+  chainIdValue: bigint,
+  p: { consumer: string; operator: string; cumulative: bigint; keyEpoch: bigint; cycle: bigint },
+  signature: string
+): string | null {
+  try {
+    return verifyTypedData(
+      vaultDomain(chainIdValue),
+      RECEIPT_TYPES,
+      {
+        consumer: p.consumer,
+        operator: p.operator,
+        cumulative: p.cumulative,
+        keyEpoch: p.keyEpoch,
+        cycle: p.cycle,
+      },
+      signature
+    ).toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Verify a consumer-pushed cumulative receipt against on-chain state. Recovers
+ * the EIP-712 signer using the CURRENT on-chain `cycle` + `keyEpoch` for this
+ * pair and confirms it equals the consumer's registered session key. Returns the
+ * cycle it verified against so the caller records the receipt under the right
+ * generation. Fails closed on any RPC error (operator simply doesn't free the
+ * window — never serves on an unverified receipt).
+ */
+export async function verifyReceipt(p: {
+  consumer: string;
+  operator: string;
+  cumulative: bigint;
+  signature: string;
+}): Promise<ReceiptVerification> {
+  let id: bigint, key: KeyEntry, reservation: Reservation;
+  try {
+    [id, key, reservation] = await Promise.all([
+      chainId(),
+      readConsumerKey(p.consumer),
+      readReservation(p.consumer, p.operator),
+    ]);
+  } catch (err) {
+    return { ok: false, reason: `could not read on-chain state: ${(err as Error).message}`, cycle: 0n };
+  }
+  if (key.sessionKey === "0x0000000000000000000000000000000000000000") {
+    return { ok: false, reason: "consumer has no registered session key", cycle: reservation.cycle };
+  }
+  const recovered = recoverReceiptSigner(
+    id,
+    {
+      consumer: p.consumer,
+      operator: p.operator,
+      cumulative: p.cumulative,
+      keyEpoch: key.keyEpoch,
+      cycle: reservation.cycle,
+    },
+    p.signature
+  );
+  if (recovered === null) {
+    return { ok: false, reason: "malformed receipt signature", cycle: reservation.cycle };
+  }
+  if (recovered !== key.sessionKey) {
+    return { ok: false, reason: "signature does not recover to the consumer's session key", cycle: reservation.cycle };
+  }
+  return { ok: true, cycle: reservation.cycle };
 }

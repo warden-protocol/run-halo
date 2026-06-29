@@ -447,6 +447,9 @@ export async function cmdConsume(args: Args): Promise<void> {
         facilitatorUrl: cfg.facilitator?.url ?? "https://facilitator.runhalo.xyz",
         rpcUrl: (process.env.BASE_RPC_URL || "https://mainnet.base.org").trim(),
         chainId: cfg.network === "base-sepolia" ? 84532 : 8453,
+        // Push signed receipts to the serving operator through the relay
+        // (operator-driven redeem, issue #369); self-redeem is the fallback.
+        relayUrl: relayBase,
         // Same target drives startup deposit AND mid-run auto-refill, so the
         // vault doesn't drain to a 402 (which would bounce the agent to a fallback).
         autoTopUpUsd: args.vaultDeposit,

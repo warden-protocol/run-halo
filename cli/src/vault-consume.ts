@@ -125,6 +125,10 @@ export interface VaultConfig {
   facilitatorUrl: string;
   rpcUrl: string;
   chainId: number;
+  /** Relay base URL — where signed receipts are PUSHED to the operator that
+   *  served the work (operator-driven redeem, issue #369). Empty ⇒ the consumer
+   *  falls back to submitting the redeem itself (legacy behaviour). */
+  relayUrl?: string;
   /** Reservation lifetime (s). */
   reserveTtlSec?: number;
   /** Reserve this many estimated-requests worth at once (batch). */
@@ -158,6 +162,7 @@ export class VaultConsumeClient {
       reserveTtlSec: 3600,
       reserveMultiple: 5n,
       autoTopUpUsd: 0,
+      relayUrl: "",
       ...cfg,
     };
     this.autoTopUpBase = BigInt(Math.round((cfg.autoTopUpUsd ?? 0) * 1_000_000));
@@ -280,6 +285,35 @@ export class VaultConsumeClient {
     if (!res.ok || !body.hash) throw new Error(body.error || `reserve failed (HTTP ${res.status})`);
     return body.hash;
   }
+  /**
+   * Push a signed cumulative receipt to the operator that served the work, via
+   * the relay (operator-driven redeem, issue #369). The operator verifies it
+   * against on-chain state and redeems it ITSELF — so served work is collected
+   * by the party owed the money, not left to the consumer's goodwill. Returns
+   * true when the relay accepted it (202) for delivery. No relay URL, an offline
+   * operator, or an old relay ⇒ false, and the caller self-redeems instead.
+   */
+  private async pushReceipt(operator: string, cumulative: bigint, signature: string): Promise<boolean> {
+    const relay = (this.cfg.relayUrl || "").replace(/\/+$/, "");
+    if (!relay) return false;
+    try {
+      const res = await fetch(`${relay}/v1/receipt`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-halo-operator": operator },
+        body: JSON.stringify({
+          consumer: this.consumer,
+          operator,
+          cumulative: cumulative.toString(),
+          signature,
+        }),
+        signal: AbortSignal.timeout(15_000),
+      });
+      return res.status === 202;
+    } catch {
+      return false;
+    }
+  }
+
   private async postRedeem(operator: string, cumulative: bigint, signature: string): Promise<string> {
     const res = await fetch(`${this.facBase()}/vault/redeem`, {
       method: "POST",
@@ -408,11 +442,16 @@ export class VaultConsumeClient {
     this.redeemQueue = this.redeemQueue.then(async () => {
       try {
         const sig = await this.signReceipt({ operator, cumulative, keyEpoch, cycle: ops.cycle });
-        await this.postRedeem(operator, cumulative, sig);
+        // Operator-driven redeem (issue #369): hand the receipt to the operator
+        // so the party owed the money collects it (with retry). Self-redeem only
+        // as a fallback when delivery isn't possible (no relay configured, an old
+        // relay, or the operator offline) — preserving the legacy guarantee.
+        const delivered = await this.pushReceipt(operator, cumulative, sig);
+        if (!delivered) await this.postRedeem(operator, cumulative, sig);
       } catch (e) {
         // Operator already served; the next (higher) cumulative receipt covers it.
         // eslint-disable-next-line no-console
-        console.warn(`  ⚠ vault redeem failed (operator served; next receipt covers it): ${errStr(e)}`);
+        console.warn(`  ⚠ vault redeem/receipt-push failed (operator served; next receipt covers it): ${errStr(e)}`);
       }
     });
   }
