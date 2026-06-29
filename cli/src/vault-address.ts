@@ -16,4 +16,4 @@
  * Closed-alpha mainnet vault (Base, chain 8453). Update on a vault migration.
  * v2 (protocol-fee) vault — EIP-712 domain name "Halo", version "2".
  */
-export const VAULT_ADDRESS = "0xaA9B6C415365431355507316951793068D7a45D4";
+export const VAULT_ADDRESS = "0x3907F660B257560883E891fbbB9F997Eff70E40E";
