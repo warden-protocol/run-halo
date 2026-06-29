@@ -70,6 +70,7 @@ halo — Halo operator + payer CLI
     --budget-warn-pct <0-1>    warn (X-Halo-Budget-Warning header) at this fraction of the budget (default 0.8)
     --vault                    use the HaloVault rail: pay the ACTUAL tokens each request used (settle-actual), not the prompt-blind flat exact-mode quote. Needs a vault deposit.
     --vault-deposit <usd>      auto-managed: top the vault up to this from the wallet's USDC on startup (needs a little ETH for the deposit tx)
+    --vault-reserve-multiple <n>  reserve this many requests' worth per operator (default 5); lower it when fanning out across many operators so reservations don't lock the whole deposit (#367)
   halo vault <status|deposit <usd>|withdraw>       manage the HaloVault balance for consume --vault (settle-actual billing)
   halo link                                        pair with a dashboard wallet
   halo status                                      show wallet + league stats
@@ -198,6 +199,10 @@ async function main(): Promise<void> {
         vault: flags.vault === true,
         vaultDeposit:
           typeof flags["vault-deposit"] === "string" ? Number(flags["vault-deposit"]) : undefined,
+        vaultReserveMultiple:
+          typeof flags["vault-reserve-multiple"] === "string"
+            ? Number(flags["vault-reserve-multiple"])
+            : undefined,
         detach: flags.detach === true,
       });
     case "vault":
