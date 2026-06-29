@@ -142,7 +142,7 @@ export class OperatorRedeemer {
  *  kick / 30s sweep re-attempts, and the credit window stays full until it
  *  collects. Retrying a genuinely-stale receipt only wastes RPC; dropping a
  *  collectible one loses money — so we fail toward retry. */
-function classifyRedeemError(err: string): "collected" | "uncollectable" | "transient" {
+export function classifyRedeemError(err: string): "collected" | "uncollectable" | "transient" {
   if (/StaleReceipt|ExceedsReservation/i.test(err)) return "collected";
   if (/BadSignature|NoSessionKey|does not recover/i.test(err)) return "uncollectable";
   return "transient";
