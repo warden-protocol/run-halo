@@ -19,6 +19,7 @@
  */
 import { Contract, JsonRpcProvider, MaxUint256, TypedDataDomain, Wallet, HDNodeWallet, parseUnits } from "ethers";
 import { VAULT_ADDRESS } from "./vault-address";
+import { classifyRedeemError } from "./vaultRedeemer";
 
 // Pinned, NOT env-overridable — must match the operator + facilitator. See
 // vault-address.ts. Re-exported so `halo vault` can display it.
@@ -49,6 +50,9 @@ const ERC20_ABI = [
 ];
 
 const READ_TIMEOUT_MS = 8_000;
+// How often the background loop re-attempts redeems that haven't confirmed
+// on-chain yet (issue #369 follow-up — keep retrying until collected).
+const REDEEM_RETRY_INTERVAL_MS = 20_000;
 
 function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   return Promise.race([
@@ -206,6 +210,16 @@ export class VaultConsumeClient {
   // it mines; after the cooldown a still-locked operator is retried.
   private readonly releaseAttemptedAt = new Map<string, number>();
   private redeemGraceCache: bigint | null = null;
+  // Persistent redeem retry (issue #369 follow-up): the highest cumulative
+  // receipt per `${operator}:${cycle}` not yet confirmed on-chain, kept with its
+  // signature until a redeem lands (ours OR the operator's). A background loop
+  // retries these forever — so a failed/dropped redeem (a 503 push to the wrong
+  // relay replica, a facilitator RPC blip, the burst tail) is never abandoned.
+  private readonly pendingRedeems = new Map<
+    string,
+    { operator: string; cumulative: bigint; signature: string; cycle: bigint }
+  >();
+  private redeemRetryTimer: ReturnType<typeof setInterval> | null = null;
 
   private readonly autoTopUpBase: bigint;
 
@@ -589,24 +603,87 @@ export class VaultConsumeClient {
     if (cumulative <= ops.redeemed) return;
     this.redeemQueue = this.redeemQueue.then(async () => {
       try {
-        const sig = await this.signReceipt({ operator, cumulative, keyEpoch, cycle: ops.cycle });
-        // Operator-driven redeem (issue #369): hand the receipt to the operator
-        // so the party owed the money collects it (with retry). Self-redeem only
-        // as a fallback when delivery isn't possible (no relay configured, an old
-        // relay, or the operator offline) — preserving the legacy guarantee.
-        const delivered = await this.pushReceipt(operator, cumulative, sig);
-        if (!delivered) await this.postRedeem(operator, cumulative, sig);
+        const signature = await this.signReceipt({ operator, cumulative, keyEpoch, cycle: ops.cycle });
+        // Record as the pending target for this (operator, cycle). Receipts are
+        // cumulative, so the highest one supersedes every earlier one — retrying
+        // it alone collects the whole backlog for this cycle.
+        this.pendingRedeems.set(key, { operator, cumulative, signature, cycle: ops.cycle });
+        // Operator-driven redeem (issue #369): hand the receipt to the operator so
+        // it can collect promptly itself (best-effort — unreliable across a
+        // multi-replica relay, so never relied on).
+        await this.pushReceipt(operator, cumulative, signature).catch(() => false);
+        // Guaranteed path: redeem via the facilitator ourselves, retrying until it
+        // lands. Independent of the relay/operator, so it works regardless of
+        // replica topology or operator restarts.
+        await this.attemptRedeem(key);
       } catch (e) {
-        // Operator already served; the next (higher) cumulative receipt covers it.
+        // Signing failed (rare) — the next receipt re-signs a higher cumulative.
         // eslint-disable-next-line no-console
-        console.warn(`  ⚠ vault redeem/receipt-push failed (operator served; next receipt covers it): ${errStr(e)}`);
+        console.warn(`  ⚠ vault receipt sign failed (next receipt covers it): ${errStr(e)}`);
       }
     });
+    this.startRedeemRetry();
   }
 
-  /** Await any in-flight background redeems (called on graceful shutdown). */
+  /**
+   * Submit the pending receipt for `key` to the facilitator. Removes it on
+   * success OR on a terminal revert (already collected, or the cycle moved on so
+   * it can never settle). Keeps it for a transient failure so the retry loop
+   * tries again. Never throws.
+   */
+  private async attemptRedeem(key: string): Promise<void> {
+    const p = this.pendingRedeems.get(key);
+    if (!p) return;
+    // Clear ONLY the receipt we actually submitted. The retry loop and the
+    // record queue both call attemptRedeem, so a higher cumulative can replace
+    // this entry while postRedeem is in flight; deleting by key alone would drop
+    // that newer, still-uncollected receipt (it supersedes `p`, so its delta
+    // would never be retried). Re-check identity before removing.
+    const clearIfCurrent = () => {
+      if (this.pendingRedeems.get(key) === p) this.pendingRedeems.delete(key);
+    };
+    try {
+      await this.postRedeem(p.operator, p.cumulative, p.signature);
+      clearIfCurrent(); // landed on-chain
+    } catch (e) {
+      const cls = classifyRedeemError(errStr(e));
+      if (cls === "collected") {
+        clearIfCurrent(); // operator (or a prior attempt) already collected it
+      } else if (cls === "uncollectable") {
+        // Deterministic verify failure — e.g. the cycle bumped (re-reservation),
+        // so this receipt can never settle. Stop retrying; loss is bounded.
+        clearIfCurrent();
+        // eslint-disable-next-line no-console
+        console.warn(`  ⚠ vault receipt uncollectable, abandoning (${errStr(e).slice(0, 80)})`);
+      }
+      // transient → keep in pendingRedeems; the retry loop will try again.
+    }
+  }
+
+  /** Background loop: keep re-attempting every pending redeem until it lands
+   *  (issue #369 follow-up). Idempotent; unref'd so it never holds the process. */
+  private startRedeemRetry(): void {
+    if (this.redeemRetryTimer) return;
+    this.redeemRetryTimer = setInterval(() => {
+      for (const key of [...this.pendingRedeems.keys()]) void this.attemptRedeem(key);
+    }, REDEEM_RETRY_INTERVAL_MS);
+    this.redeemRetryTimer.unref?.();
+  }
+
+  /** Drain pending redeems before exit (graceful shutdown): await the queue, then
+   *  make a best-effort final attempt at everything still pending. */
   async flushRedeems(): Promise<void> {
     await this.redeemQueue.catch(() => {});
+    await Promise.allSettled([...this.pendingRedeems.keys()].map((k) => this.attemptRedeem(k)));
+    if (this.redeemRetryTimer) {
+      clearInterval(this.redeemRetryTimer);
+      this.redeemRetryTimer = null;
+    }
+  }
+
+  /** Count of receipts still awaiting on-chain confirmation (for status/metrics). */
+  get pendingRedeemCount(): number {
+    return this.pendingRedeems.size;
   }
 
   // ── deposit / withdraw (on-chain, wallet pays gas) ─────────────────────────
