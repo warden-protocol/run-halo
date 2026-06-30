@@ -1257,7 +1257,7 @@ function actionableError(
   status: number,
   rawBody: string,
   ctx: { wallet: string; network: string; maxUsd: number; relay: string; confidential: boolean }
-): { error: { message: string; type: string; code?: string } } {
+): { error: { message: string; type: string; code?: string; walletAddress?: string; network?: string } } {
   let inner = "";
   try {
     const j = JSON.parse(rawBody) as { error?: { message?: string } | string };
@@ -1266,7 +1266,6 @@ function actionableError(
     inner = rawBody.slice(0, 200);
   }
   const low = inner.toLowerCase();
-  const fundLine = `Fund your consumer wallet with USDC on Base ${ctx.network === "base-sepolia" ? "Sepolia" : "mainnet"}: ${ctx.wallet}`;
 
   // No operator online for the model.
   if (status === 503 || low.includes("no operators")) {
@@ -1291,13 +1290,20 @@ function actionableError(
       },
     };
   }
-  // Payment failed — almost always an unfunded / underfunded wallet.
+  // Payment failed — almost always an unfunded / underfunded wallet. Put the FULL
+  // wallet address up FRONT (and as a structured `walletAddress` field) so it
+  // survives any downstream truncation of the longer detail: the user must be
+  // able to see/copy the complete address to fund it. The reason (`inner`) goes
+  // LAST, where it's safe to clip.
   if (status === 402 || low.includes("insufficient") || low.includes("balance") || low.includes("payment required")) {
+    const net = ctx.network === "base-sepolia" ? "Base Sepolia" : "Base mainnet";
     return {
       error: {
-        message: `Payment was rejected${inner ? ` (${inner})` : ""}. This usually means the wallet has no USDC. ${fundLine}`,
+        message: `Payment rejected — fund your consumer wallet with USDC on ${net}: ${ctx.wallet}${inner ? `  (${inner})` : ""}`,
         type: "halo_payment_required",
         code: "insufficient_funds",
+        walletAddress: ctx.wallet,
+        network: ctx.network,
       },
     };
   }
