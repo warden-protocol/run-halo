@@ -50,9 +50,9 @@ Halo has **two payment rails**, used for two different things.
 
 ### Inference is paid through the Vault
 
-Inference is **not** paid with a per-call x402 transfer. It settles through the **HaloVault**, an
-on-chain escrow on Base that lets a consumer pay for the *actual* tokens used while keeping the
-serving operator safe from non-payment — without a wallet signature on every request.
+Inference is settled through the **HaloVault**, an on-chain escrow on Base that lets a consumer 
+pay for the *actual* tokens used while keeping the serving operator safe from non-payment — without
+a wallet signature on every request.
 
 The flow between a **consumer**, an **operator**, and the **Halo facilitator**:
 
