@@ -314,6 +314,14 @@ Halo is in active alpha. What's next:
 - **Protocol governance** — the protocol fee (currently 10%) and other parameters move under
   on-chain governance rather than a fixed constant.
 - **Confidential compute** — broader TEE model/provider coverage for operator-blind inference.
+- **Verifiable inference (SPEX)** — [Statistical Proof of Execution](https://wardenprotocol.org/blog/introducing-spex-statistical-proof-of-execution):
+  a sampling-based protocol that gives probabilistic guarantees an operator actually ran the
+  requested model and returned a consistent, untampered result. A solver produces a cryptographic
+  proof of execution and a verifier randomly samples it against the output at a configurable
+  confidence level — bringing correctness guarantees to inference (even non-deterministic LLM
+  outputs) without re-running the whole computation.
+- **Image models** — generate images peer-to-peer through Halo, extending the network beyond
+  text/chat inference.
 
 Get started at [**app.runhalo.xyz**](https://app.runhalo.xyz) and follow
 [**@wardenprotocol**](https://x.com/wardenprotocol) for the latest.
