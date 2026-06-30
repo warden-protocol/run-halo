@@ -287,13 +287,16 @@ halo setup --provider openai --models gpt-4o-mini --no-wallet-passphrase \
   --consume-allow "gpt-4o-mini,meta-llama/llama-3.1-8b-instruct" \
   --consume-max-usdc 0.05 --consume-port 8799
 
-# 2. fund the printed wallet address with USDC on Base mainnet (this is what pays
-#    for inference — unlike the operator wallet, a consumer wallet MUST be funded).
+# 2. fund the printed wallet address on Base mainnet (unlike the operator wallet, a
+#    consumer wallet MUST be funded): USDC pays for inference, AND a little ETH for gas
+#    on the vault deposit tx that step 3's --vault-deposit submits (exact mode needs USDC only).
 
-# 3. run the local endpoint (reads the profile from setup; flags still override)
-halo consume
+# 3. run the local endpoint on the vault rail (the recommended billing rail —
+#    deposits once, then bills the ACTUAL tokens used; see "Billing rail" below)
+halo consume --vault --vault-deposit 5
 #   endpoint : http://127.0.0.1:8799/v1
 #   wallet   : 0x…  (Base)
+#   rail     : vault (deposit-backed, settles ACTUAL tokens)
 ```
 
 **Configuring consume at setup time** (skill-driven): pass `--consume` plus the
@@ -331,7 +334,7 @@ halo consume --detach --port 8799 --vault --vault-deposit 5   # starts once, sur
 macOS, systemd `--user` on Linux), owned by the OS, not the gateway:
 
 ```bash
-halo service install consume -- --port 8799 --budget-usdc 5
+halo service install consume -- --port 8799 --vault --vault-deposit 5 --budget-usdc 5
 halo service status consume      # MUST show a PID; an exit code = crash-looping →
 halo service logs consume        # prints the real reason (e.g. EPERM, passphrase, port)
 halo service uninstall consume
@@ -368,6 +371,11 @@ print(resp.choices[0].message.content)
 - `--max-usdc <n>` (default `0.10`) — **per-request spend ceiling in USD**. A request is
   refused (HTTP 402) if the operator asks for more. This is the consumer's primary cost guard —
   set it deliberately.
+- `--vault` — **bill on the HaloVault rail (recommended — use it for inference by default).**
+  Deposits USDC into the vault once, then settles the ACTUAL tokens used per request instead of a
+  flat per-request quote. Omitting it falls back to exact mode (see "Billing rail").
+- `--vault-deposit <usd>` — vault top-up target (e.g. `--vault-deposit 5`). Deposits on startup AND
+  auto-refills from the wallet mid-run so the vault won't 402. Always pass it together with `--vault`.
 - `--budget-usdc <n>` — **cumulative spend cap** for the run (0/unset = uncapped). A human on a
   frontend self-paces; an agent loops, retries and fans out tool calls, so per-request caps don't
   bound TOTAL spend — this does. See the budget section below.
@@ -395,10 +403,13 @@ incrementally.
 
 ### Billing rail + keeping it funded (avoid falling back off Halo)
 
-Two rails. **Exact mode (default)** signs an x402 payment per request; the quote is prompt-blind
-(priced on `max_tokens`), so every request settles at the same flat amount — predictable, no
-deposit. **Vault mode (`--vault`)** bills the ACTUAL tokens used (deposit once, settle-actual);
-turn it on for usage-accurate billing. Both fund from the same wallet.
+Two rails, both funded from the same wallet. **Vault mode (`--vault`) is the recommended rail —
+pass `--vault --vault-deposit <usd>` for inference.** It deposits USDC into the HaloVault once and
+bills the ACTUAL tokens used per request (deposit once, settle-actual); it's the rail Halo is
+standardizing on. **Exact mode** (what you get when you omit `--vault`) signs a separate x402
+payment per request at a flat, prompt-blind quote priced on `max_tokens` — no deposit, but it
+settles straight to the operator and bypasses the vault. Use exact only as an explicit fallback on
+dev / non-vault stacks.
 
 The #1 cause of an agent silently dropping to a non-Halo fallback is **running out of funds**:
 - Exact mode → the consumer wallet is out of **USDC**.
@@ -406,7 +417,8 @@ The #1 cause of an agent silently dropping to a non-Halo fallback is **running o
 
 Keep it on the rail:
 - **Vault: always pass `--vault-deposit <usd>`** (e.g. `--vault --vault-deposit 5`). That deposits
-  on startup AND **auto-refills from the wallet mid-run** when the vault runs low, so it won't 402.
+  on startup AND **auto-refills from the wallet mid-run** when the vault runs low, so it won't 402
+  as long as the wallet still has USDC (a drained wallet 402s either rail).
 - Keep the **wallet** funded — USDC for inference, plus ~$0.50 ETH on Base for deposit gas (vault).
 - When you DO see a funds error (`Fund your consumer wallet …` / `Vault can't cover …`), **tell the
   user to fund the wallet `0x…`** and stop — do NOT quietly switch to another provider. Surfacing
