@@ -10,7 +10,7 @@
   <img src="https://img.shields.io/badge/status-alpha-orange?style=for-the-badge" alt="Status: alpha">
 </p>
 
-> ⭐ **If Halo is useful to you, [star the repo](https://github.com/warden-protocol/run-halo)** — it helps more operators and agents find the network.
+> **If Halo is useful to you, [star the repo](https://github.com/warden-protocol/run-halo)** — it helps more operators and agents find the network.
 
 **Halo is a permissionless AI inference network for humans and agents. Pay per prompt in USDC, on Base.**
 
