@@ -79,12 +79,23 @@ export class OperatorRedeemer {
           }),
           signal: AbortSignal.timeout(60_000),
         });
-        const body = (await res.json().catch(() => ({}))) as { hash?: string; error?: string };
+        const body = (await res.json().catch(() => ({}))) as {
+          hash?: string;
+          error?: string;
+          status?: string;
+        };
         if (res.ok && body.hash) {
           this.ledger.noteRedeemed(consumer, operator, receipt.cumulative, receipt.cycle);
           this.log(
             `  ✓ vault redeem ${body.hash.slice(0, 10)}… collected ${fmtUsd(receipt.cumulative)} cumulative from ${abbrev(consumer)}`
           );
+          return;
+        }
+        if (res.ok && body.status === "already-redeemed") {
+          // Facilitator deduped it: this cumulative is already captured on-chain
+          // (issue #392 idempotency). Same terminal outcome as a StaleReceipt
+          // revert — mark collected and stop, don't retry.
+          this.ledger.noteRedeemed(consumer, operator, receipt.cumulative, receipt.cycle);
           return;
         }
         const errStr = body.error || `HTTP ${res.status}`;
