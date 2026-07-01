@@ -1044,8 +1044,10 @@ async function emitPairingCode(
 ): Promise<void> {
   // When setup preserved an existing wallet, we don't have the passphrase in
   // hand — prompt for it now. Skipped in the generate/import path because the
-  // user just typed it 30 seconds ago.
-  if (!passphrase) {
+  // user just typed it 30 seconds ago. Note `passphrase === ""` is a *known*
+  // empty passphrase (unattended mode) and must fall straight through to
+  // loadWallet — only `undefined` means "we don't have it".
+  if (passphrase === undefined) {
     const r = await prompts({
       type: "password",
       name: "p",
