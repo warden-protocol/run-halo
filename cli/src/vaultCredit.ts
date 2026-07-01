@@ -19,12 +19,26 @@
  *                (pessimistic: reserved at admit, trued-up to actual on settle)
  *   - `held`     highest receipt cumulative the operator holds for this cycle
  *
- * Invariant #3 (issue #369): an operator never floats more than `window` of
- * unsigned work. `admit()` enforces it — it refuses a request whose ceiling
- * would push `outstanding` past `window`. Because `admit()` does its
- * read-check-reserve SYNCHRONOUSLY (no `await` between reading `outstanding`
- * and adding to `inflight`), concurrent admits on Node's single thread can never
- * both pass on the same headroom — no lock needed, and no window undercount.
+ * Credit-window bound (issue #369; single-request rule relaxed in #395): the
+ * window caps the ACCUMULATION of un-receipted work across requests — NOT the
+ * size of a single request. `admit()` refuses a new request only when work is
+ * ALREADY outstanding AND its ceiling would push the total past `window`; a
+ * request arriving with nothing outstanding is ALWAYS admitted, even if its own
+ * ceiling exceeds `window` (e.g. a premium model whose one-request cost tops a
+ * small default window). That lone request is already hard-capped by the on-chain
+ * reservation — the serve gate verified `ceiling ≤ locked` (see
+ * cli/src/commands/serve.ts: `checkReservationCached` runs before `admit`) — so
+ * the operator never floats value beyond funds that exist on-chain. Worst-case
+ * un-receipted exposure (`outstanding`) is therefore bounded by max(`window`, one
+ * request's ceiling) — the window caps *accumulated* un-receipted work, and the
+ * single-request bypass is bounded instead by the on-chain reservation. (This
+ * bounds the EXPOSURE value, not the count of in-flight over-window requests: a
+ * consumer that over-signs a receipt can get a second admitted, but the receipt
+ * covers it, so `outstanding` stays within the bound.) Because `admit()` does its
+ * read-check-reserve SYNCHRONOUSLY (no
+ * `await` between reading `outstanding` and adding to `inflight`), concurrent
+ * admits on Node's single thread can never both pass on the same headroom — no
+ * lock needed, and no window undercount.
  *
  * Receipts are cumulative + monotonic per cycle, so one receipt covering
  * cumulative R makes the operator whole for everything up to R regardless of the
@@ -120,11 +134,14 @@ export class VaultCreditLedger {
   }
 
   /**
-   * Admit a request whose worst-case (ceiling) cost is `ceilingBase`, if doing
-   * so keeps floated un-receipted work within `windowBase`. On success the
-   * ceiling is RESERVED as in-flight; the caller MUST later call exactly one of
-   * `settleServed` (served ok) or `releaseInflight` (serve failed) with the SAME
-   * ceiling so the reservation is trued-up or returned.
+   * Admit a request whose worst-case (ceiling) cost is `ceilingBase`. Refused
+   * ONLY when work is already outstanding AND this ceiling would push the total
+   * past `windowBase`; a request arriving with nothing outstanding is always
+   * admitted (even if its ceiling alone exceeds `windowBase` — it is bounded
+   * instead by the on-chain reservation the serve gate already verified). On
+   * success the ceiling is RESERVED as in-flight; the caller MUST later call
+   * exactly one of `settleServed` (served ok) or `releaseInflight` (serve failed)
+   * with the SAME ceiling so the reservation is trued-up or returned.
    *
    * Synchronous on purpose: read-check-reserve is one atomic step on Node's
    * single thread, so concurrent admits can't both consume the same headroom.
@@ -152,15 +169,28 @@ export class VaultCreditLedger {
         outstanding: VaultCreditLedger.outstanding(e),
       };
     }
-    const projected = VaultCreditLedger.outstanding(e) + ceilingBase;
-    if (projected > windowBase) {
+    const outstanding = VaultCreditLedger.outstanding(e);
+    const projected = outstanding + ceilingBase;
+    // Refuse ONLY when there is ALREADY un-receipted work outstanding AND this
+    // request would push the total past the window. A request is NEVER blocked
+    // when nothing is outstanding (outstanding === 0n) — even if its ceiling
+    // alone exceeds the window: it's already bounded by the on-chain reservation
+    // (the serve gate verified ceiling ≤ locked), and the window's purpose is to
+    // cap ACCUMULATION of un-receipted work across requests, not to reject a
+    // single request larger than the window (e.g. a premium model like Claude
+    // Sonnet, whose one-request ceiling easily exceeds a small default window).
+    // Worst-case un-receipted exposure is then one request's ceiling — the
+    // irreducible floor — after which the next request waits for a receipt.
+    if (outstanding > 0n && projected > windowBase) {
       return {
         ok: false,
-        reason: `credit window exceeded (floating ${VaultCreditLedger.outstanding(e)} + ${ceilingBase} > ${windowBase}); awaiting a receipt for prior work`,
-        outstanding: VaultCreditLedger.outstanding(e),
+        reason: `credit window exceeded (floating ${outstanding} + ${ceilingBase} > ${windowBase}); awaiting a receipt for prior work`,
+        outstanding,
       };
     }
     e.inflight += ceilingBase;
+    // Report POST-reserve floated work, matching AdmitResult.outstanding's
+    // "currently floated" contract — this request's ceiling is now in-flight.
     return { ok: true, outstanding: VaultCreditLedger.outstanding(e) };
   }
 
@@ -280,9 +310,12 @@ export class VaultCreditLedger {
 
 /**
  * Resolve the operator's credit window (base units, 6-dp USDC). The window caps
- * worst-case loss to a ghosting consumer. Sized to cover normal agent
- * concurrency so the gate ~never refuses in steady state; the on-chain `locked`
- * reservation is the hard ceiling regardless (callers should min() with it).
+ * the ACCUMULATION of un-receipted work across requests; worst-case loss to a
+ * ghosting consumer is max(window, a single request's ceiling), since one request
+ * larger than the window is still admitted when nothing is outstanding (see
+ * admit()). Sized to cover normal agent concurrency so the gate ~never refuses in
+ * steady state; the on-chain `locked` reservation is the hard ceiling regardless
+ * (callers should min() with it — serve.ts does).
  *
  * Default: $0.10 (100_000 base). Tunable via HALO_VAULT_CREDIT_WINDOW_BASE.
  */

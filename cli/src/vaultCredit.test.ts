@@ -1,9 +1,15 @@
 /**
- * Credit-window ledger spec (issue #369). Run: `npx ts-node --test src/vaultCredit.test.ts`
+ * Credit-window ledger spec (issue #369).
+ * Run: `node --require ts-node/register --test src/vaultCredit.test.ts`
  *
- * The load-bearing property is invariant #3: floated un-receipted work
- * (`outstanding`) never exceeds the window, under any interleaving of
- * admit / settle / release / recordReceipt.
+ * The load-bearing property (issue #369; single-request rule relaxed in #395):
+ * the window caps the ACCUMULATION of un-receipted work, so floated `outstanding`
+ * never exceeds max(window, the largest single admitted ceiling), under any
+ * interleaving of admit / settle / release / recordReceipt. A single request may
+ * exceed the window only from a zero-outstanding state, bounded instead by the
+ * on-chain reservation. (This is a bound on the EXPOSURE value, not on the count
+ * of in-flight over-window requests — an over-signed receipt can admit a second;
+ * see the over-signed-receipt test.)
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -21,6 +27,83 @@ test("admits while within the window, refuses past it", () => {
   assert.equal(l.admit(C, O, CY, 600n, W).ok, true); // inflight 600
   assert.equal(l.admit(C, O, CY, 400n, W).ok, true); // inflight 1000 (==W)
   assert.equal(l.admit(C, O, CY, 1n, W).ok, false); // 1001 > W → refuse
+});
+
+test("a single request larger than the window is admitted when nothing is outstanding", () => {
+  // Premium model: one request's ceiling (1500) exceeds the window (1000). With
+  // no un-receipted prior work it MUST be admitted — it's already bounded by the
+  // on-chain reservation; the window only caps ACCUMULATION. (Regression: this
+  // used to refuse with "credit window exceeded (floating 0 + 1500 > 1000)".)
+  const l = new VaultCreditLedger();
+  assert.equal(l.admit(C, O, CY, 1500n, W).ok, true);
+  // But now 1500 is outstanding (> W) → the NEXT request waits for a receipt.
+  assert.equal(l.admit(C, O, CY, 1n, W).ok, false);
+  // Settle + receipt drains it → another large request is admitted again.
+  l.settleServed(C, O, CY, 1500n, 1500n);
+  l.recordReceipt(C, O, { cumulative: 1500n, signature: "0xsig", cycle: CY });
+  assert.equal(l.outstandingFor(C, O), 0n);
+  assert.equal(l.admit(C, O, CY, 1500n, W).ok, true);
+});
+
+test("while an over-window request is outstanding, EVERY follow-up admit waits until it drains", () => {
+  const l = new VaultCreditLedger();
+  assert.equal(l.admit(C, O, CY, 1500n, W).ok, true); // over-window, admitted from zero
+  // Not just a 1-unit follow-up: NOTHING is admitted while outstanding (1500) > W,
+  // regardless of the next request's size (including another over-window one).
+  for (const c of [1n, 100n, 999n, 1000n, 2000n, 5000n]) {
+    assert.equal(l.admit(C, O, CY, c, W).ok, false, `admit(${c}) must wait while 1500 is outstanding`);
+  }
+  // Drain via settle + receipt → serving resumes.
+  l.settleServed(C, O, CY, 1500n, 1500n);
+  l.recordReceipt(C, O, { cumulative: 1500n, signature: sig(1), cycle: CY });
+  assert.equal(l.outstandingFor(C, O), 0n);
+  assert.equal(l.admit(C, O, CY, 2000n, W).ok, true);
+});
+
+test("an over-window request that settles BELOW the window lets sub-window accumulation resume", () => {
+  const l = new VaultCreditLedger();
+  assert.equal(l.admit(C, O, CY, 1500n, W).ok, true); // ceiling 1500 > W, admitted from zero
+  l.settleServed(C, O, CY, 1500n, 300n); // actual only 300 → trued DOWN below W
+  assert.equal(l.outstandingFor(C, O), 300n);
+  // No over-window bypass now (outstanding is 300 > 0): a huge ceiling is refused.
+  assert.equal(l.admit(C, O, CY, 5000n, W).ok, false);
+  // Normal accumulation resumes against the 300 floor.
+  assert.equal(l.admit(C, O, CY, 701n, W).ok, false); // 300 + 701 > 1000
+  assert.equal(l.admit(C, O, CY, 700n, W).ok, true); // 300 + 700 == 1000
+});
+
+test("an over-signed receipt can admit a 2nd over-window request, but un-receipted EXPOSURE stays capped at one ceiling", () => {
+  // The ledger trusts any validly-signed receipt: recordReceipt (and the on-chain
+  // verifyReceipt) gate on signature + cycle, NOT on cumulative <= served. So a
+  // consumer CAN sign for more than served. That is consumer self-harm (over-pay,
+  // still on-chain-bounded by `locked`), never operator bleed — the receipt is
+  // collectible value that only LOWERS outstanding. This documents that the count
+  // of in-flight over-window requests is NOT bounded to one; only the un-receipted
+  // exposure (`outstanding`) is — which is the actual money invariant.
+  const l = new VaultCreditLedger();
+  assert.equal(l.admit(C, O, CY, 1500n, W).ok, true); // 1st over-window, from zero
+  assert.equal(l.outstandingFor(C, O), 1500n);
+  // Over-signed: cumulative 1500 while nothing has actually been served yet.
+  l.recordReceipt(C, O, { cumulative: 1500n, signature: sig(1), cycle: CY });
+  assert.equal(l.outstandingFor(C, O), 0n); // receipt covers the in-flight ceiling
+  // outstanding is 0 again → a 2nd over-window request admits while the 1st is
+  // still in flight: TWO over-window ceilings reserved at once (count > 1).
+  assert.equal(l.admit(C, O, CY, 1500n, W).ok, true);
+  assert.equal(l.snapshot(C, O)!.inflight, 3000n);
+  // But exposure stays capped at ONE ceiling (1500), not 3000 — the over-signed
+  // receipt backs the first. This is the real, provable money bound.
+  assert.equal(l.outstandingFor(C, O), 1500n);
+});
+
+test("outstanding clamps to 0 (never negative) when a receipt over-covers served + inflight", () => {
+  const l = new VaultCreditLedger();
+  l.admit(C, O, CY, 1500n, W); // inflight 1500, served 0
+  // A grossly over-signed receipt covers far more than served + inflight. The raw
+  // served + inflight − covered is negative, but exposure is reported as 0 — never
+  // a negative value that could confuse a downstream reader/metric.
+  l.recordReceipt(C, O, { cumulative: 9000n, signature: sig(1), cycle: CY });
+  assert.equal(l.outstandingFor(C, O), 0n);
+  assert.equal(l.snapshot(C, O)!.outstanding, 0n);
 });
 
 test("a receipt drains the window so serving resumes", () => {
@@ -52,6 +135,24 @@ test("on-chain redeemed baseline alone starts with zero exposure", () => {
   assert.equal(l.admit(C, O, CY, W, W).ok, true);
 });
 
+test("syncOnchain never lowers served when the on-chain redeemed read lags local serving", () => {
+  // The operator serves synchronously but redemption is async/consumer-driven, so
+  // the on-chain `redeemed` counter (synced before EVERY admit) legitimately TRAILS
+  // local `served`. syncOnchain must NOT overwrite served downward to that lower
+  // baseline — doing so would under-count outstanding and let the operator float a
+  // fresh window on top of still-unredeemed work.
+  const l = new VaultCreditLedger();
+  l.admit(C, O, CY, 900n, W);
+  l.settleServed(C, O, CY, 900n, 900n); // served 900, nothing redeemed yet
+  assert.equal(l.outstandingFor(C, O), 900n);
+  l.syncOnchain(C, O, CY, 500n); // on-chain redeemed (500) lags local served (900)
+  const snap = l.snapshot(C, O)!;
+  assert.equal(snap.served, 900n, "served is monotonic — a lagging on-chain read must not lower it");
+  assert.equal(snap.redeemed, 500n); // redeemed still advances to the on-chain baseline
+  assert.equal(l.outstandingFor(C, O), 400n); // 900 served − 500 redeemed
+  assert.equal(l.admit(C, O, CY, 700n, W).ok, false); // 400 + 700 > 1000 — still gated
+});
+
 test("ceiling is reserved at admit, trued-up to actual on settle", () => {
   const l = new VaultCreditLedger();
   l.admit(C, O, CY, 900n, W); // pessimistic reserve at ceiling
@@ -69,7 +170,7 @@ test("failed serve releases the reserved ceiling with no served value", () => {
   assert.equal(l.admit(C, O, CY, 1000n, W).ok, true);
 });
 
-test("INVARIANT: outstanding never exceeds the window across interleavings", () => {
+test("INVARIANT: outstanding <= max(window, largest single admitted ceiling) across interleavings", () => {
   const l = new VaultCreditLedger();
   // Deterministic PRNG (no Math.random) so failures reproduce.
   let s = 0x9e3779b9 >>> 0;
@@ -79,15 +180,32 @@ test("INVARIANT: outstanding never exceeds the window across interleavings", () 
   const inflight: bigint[] = []; // ceilings currently admitted
   let nextCum = 0n; // monotonic cumulative for receipts
   let servedTotal = 0n;
+  let maxAdmitted = 0n; // largest ceiling ever admitted (running max)
+
+  // The window caps ACCUMULATION of un-receipted work, so outstanding can exceed
+  // W only via a single over-window request admitted from a zero-outstanding
+  // state (#395) — never beyond the largest single admitted ceiling. This bounds
+  // the EXPOSURE value, not the COUNT of in-flight over-window requests: an
+  // over-signed receipt can admit a second (see the over-signed-receipt test),
+  // but the receipt covers it so outstanding stays within this bound regardless.
+  // This harness models a well-behaved consumer (receipts never exceed served).
+  const boundHolds = (where: string) => {
+    const cap = W > maxAdmitted ? W : maxAdmitted;
+    assert.ok(l.outstandingFor(C, O) <= cap, `outstanding ${l.outstandingFor(C, O)} > max(W, ${maxAdmitted}) ${where}`);
+  };
 
   for (let i = 0; i < 20000; i++) {
     const op = pick(0, 3);
     if (op === 0) {
-      const ceiling = BigInt(pick(1, 300));
+      // Ceilings span BELOW and ABOVE W (1000) so the new over-window admit path
+      // (#395) is actually exercised — not just the steady-state accumulation.
+      const ceiling = BigInt(pick(1, 1500));
       const r = l.admit(C, O, CY, ceiling, W);
-      // Whatever the verdict, the bound must hold immediately after.
-      assert.ok(l.outstandingFor(C, O) <= W, `outstanding ${l.outstandingFor(C, O)} > W after admit`);
-      if (r.ok) inflight.push(ceiling);
+      if (r.ok) {
+        inflight.push(ceiling);
+        if (ceiling > maxAdmitted) maxAdmitted = ceiling;
+      }
+      boundHolds(`after admit at step ${i}`);
     } else if (op === 1 && inflight.length > 0) {
       const ceiling = inflight.shift()!;
       const actual = BigInt(pick(0, Number(ceiling)));
@@ -103,8 +221,11 @@ test("INVARIANT: outstanding never exceeds the window across interleavings", () 
         l.recordReceipt(C, O, { cumulative: nextCum, signature: sig(i), cycle: CY });
       }
     }
-    assert.ok(l.outstandingFor(C, O) <= W, `outstanding ${l.outstandingFor(C, O)} > W at step ${i}`);
+    boundHolds(`at step ${i}`);
   }
+  // Guard the guard: the widened range must have actually admitted an
+  // over-window ceiling, else this fuzz would silently only test the old bound.
+  assert.ok(maxAdmitted > W, "fuzz never admitted an over-window ceiling — range too narrow to exercise #395");
 });
 
 test("a cycle bump resets the ledger (prior-cycle receipts are worthless here)", () => {
@@ -131,6 +252,10 @@ test("redeemable returns the highest unredeemed receipt, then nothing after note
   assert.equal(r?.signature, sig(2));
   l.noteRedeemed(C, O, 700n, CY);
   assert.equal(l.redeemable(C, O), null); // nothing left owed
+  // redeemed is monotonic within a cycle (invariant #5): a later, LOWER
+  // confirmation must not resurrect the already-collected 700 receipt.
+  l.noteRedeemed(C, O, 300n, CY);
+  assert.equal(l.redeemable(C, O), null, "a lower confirmation must not resurrect a collected receipt");
 });
 
 test("stale (lower-cycle) and non-advancing receipts are ignored", () => {

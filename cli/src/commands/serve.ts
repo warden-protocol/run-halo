@@ -1120,7 +1120,10 @@ export async function cmdServe(): Promise<void> {
               } else {
                 // Window = configured credit cap, never above the on-chain
                 // collectible (`locked`) — we won't float more than funds exist
-                // to back. Bounds loss to a ghosting consumer at this amount.
+                // to back. Caps the ACCUMULATION of un-receipted work; a lone
+                // request larger than the window is still admitted (bounded by
+                // `locked`), so worst-case ghosting loss is max(window, one
+                // request's ceiling) — see vaultCredit.ts admit().
                 // Recomputed from `chk` so a stale-cycle refresh below uses the
                 // refreshed reservation's `remaining`.
                 const creditWindow = (): bigint =>
