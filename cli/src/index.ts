@@ -71,6 +71,7 @@ halo — Halo operator + payer CLI
     --vault                    use the HaloVault rail: pay the ACTUAL tokens each request used (settle-actual), not the prompt-blind flat exact-mode quote. Needs a vault deposit.
     --vault-deposit <usd>      auto-managed: top the vault up to this from the wallet's USDC on startup (needs a little ETH for the deposit tx)
     --vault-reserve-multiple <n>  reserve this many requests' worth per operator (default 5); lower it when fanning out across many operators so reservations don't lock the whole deposit (#367)
+    --force                    override the stale-vault guard (#392): proceed with vault fund-moving paths even when this build's pinned vault differs from the facilitator's live one
   halo vault <status|deposit <usd>|withdraw>       manage the HaloVault balance for consume --vault (settle-actual billing)
   halo link                                        pair with a dashboard wallet
   halo status                                      show wallet + league stats
@@ -204,6 +205,7 @@ async function main(): Promise<void> {
             ? Number(flags["vault-reserve-multiple"])
             : undefined,
         detach: flags.detach === true,
+        force: flags.force === true,
       });
     case "vault":
       return cmdVault(rest);

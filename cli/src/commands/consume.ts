@@ -43,6 +43,7 @@ import {
 import { installProxyFromEnv } from "../proxy";
 import {
   VaultConsumeClient,
+  guardVaultFresh,
   priceTokens,
   estimateTokens,
   fmtUsd as fmtVaultUsd,
@@ -98,6 +99,10 @@ interface Args {
    *  init) and return immediately, so an agent/gateway that launches consume
    *  can't kill it on restart. Idempotent — no-ops if one's already serving. */
   detach?: boolean;
+  /** Override the confirmed-stale-vault guard (#392): proceed with fund-moving
+   *  paths even when the pinned VAULT_ADDRESS differs from the facilitator's live
+   *  vault. Escape hatch for intentional splits; normally you should rebuild. */
+  force?: boolean;
 }
 
 const MAX_BODY_BYTES = 5 * 1024 * 1024; // 5 MB — generous for large-context prompts
@@ -475,6 +480,16 @@ export async function cmdConsume(args: Args): Promise<void> {
         autoTopUpUsd: args.vaultDeposit,
       })
     : null;
+  if (vault) {
+    // Staleness guard (#392): a pinned VAULT_ADDRESS silently targets the OLD
+    // vault after a redeploy, so reserves/redeems hit the wrong contract. Gate
+    // the whole vault rail on a confirmed match — on a mismatch, refuse to start
+    // (--force overrides). Fails open for old facilitators / network blips.
+    const fac = cfg.facilitator?.url ?? "https://facilitator.runhalo.xyz";
+    if (!(await guardVaultFresh(fac, { force: args.force }))) {
+      process.exit(1);
+    }
+  }
   if (vault && args.vaultDeposit && args.vaultDeposit > 0) {
     // Auto-managed: top the vault up to the target from the wallet's USDC on
     // startup so the first request has reservable funds. Fails loud (and the
