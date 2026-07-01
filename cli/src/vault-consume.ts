@@ -18,6 +18,8 @@
  * contracts/src/HaloVault.sol byte-for-byte or the on-chain verify reverts.
  */
 import { Contract, JsonRpcProvider, MaxUint256, TypedDataDomain, Wallet, HDNodeWallet, parseUnits } from "ethers";
+import { readFileSync, writeFileSync, mkdirSync, renameSync } from "node:fs";
+import { dirname } from "node:path";
 import { VAULT_ADDRESS } from "./vault-address";
 import { classifyRedeemError } from "./vaultRedeemer";
 
@@ -239,6 +241,10 @@ export interface VaultConfig {
    *  this balance) instead of failing — so the agent doesn't fall back off Halo.
    *  0/unset = never auto-deposit. */
   autoTopUpUsd?: number;
+  /** File path to persist the pending-redeem queue, so a RESTART resumes settling
+   *  instead of abandoning the served tail (issue #369 follow-up). Unset ⇒ the
+   *  queue is in-memory only (lost on restart). */
+  pendingStorePath?: string;
 }
 
 /**
@@ -285,6 +291,7 @@ export class VaultConsumeClient {
       reserveMultiple: 5n,
       autoTopUpUsd: 0,
       relayUrl: "",
+      pendingStorePath: "",
       ...cfg,
     };
     this.autoTopUpBase = BigInt(Math.round((cfg.autoTopUpUsd ?? 0) * 1_000_000));
@@ -667,6 +674,7 @@ export class VaultConsumeClient {
         // cumulative, so the highest one supersedes every earlier one — retrying
         // it alone collects the whole backlog for this cycle.
         this.pendingRedeems.set(key, { operator, cumulative, signature, cycle: ops.cycle });
+        this.persistPending(); // durable: survive a restart (issue #369 follow-up)
         // Operator-driven redeem (issue #369): hand the receipt to the operator so
         // it can collect promptly itself (best-effort — unreliable across a
         // multi-replica relay, so never relied on).
@@ -699,7 +707,10 @@ export class VaultConsumeClient {
     // that newer, still-uncollected receipt (it supersedes `p`, so its delta
     // would never be retried). Re-check identity before removing.
     const clearIfCurrent = () => {
-      if (this.pendingRedeems.get(key) === p) this.pendingRedeems.delete(key);
+      if (this.pendingRedeems.get(key) === p) {
+        this.pendingRedeems.delete(key);
+        this.persistPending();
+      }
     };
     try {
       await this.postRedeem(p.operator, p.cumulative, p.signature);
@@ -743,6 +754,81 @@ export class VaultConsumeClient {
   /** Count of receipts still awaiting on-chain confirmation (for status/metrics). */
   get pendingRedeemCount(): number {
     return this.pendingRedeems.size;
+  }
+
+  /** Persist the pending-redeem queue to disk (best-effort) so a restart can
+   *  resume settling. Signatures are public redeem authorizations (submitted
+   *  on-chain anyway), not secrets. No-op when no store path is configured.
+   *
+   *  Atomic: write a temp file then rename over the target, so a crash mid-write
+   *  (the very restart this feature guards) can never leave a truncated file that
+   *  resume would then discard — the target is always the old or new queue,
+   *  never a partial one. */
+  private persistPending(): void {
+    const f = this.cfg.pendingStorePath;
+    if (!f) return;
+    try {
+      const arr = [...this.pendingRedeems.entries()].map(([key, v]) => ({
+        key,
+        operator: v.operator,
+        cumulative: v.cumulative.toString(),
+        signature: v.signature,
+        cycle: v.cycle.toString(),
+      }));
+      mkdirSync(dirname(f), { recursive: true });
+      const tmp = `${f}.tmp`;
+      writeFileSync(tmp, JSON.stringify(arr), "utf-8");
+      renameSync(tmp, f); // atomic replace on the same filesystem
+    } catch {
+      /* durability is best-effort — never break a serve on a write error */
+    }
+  }
+
+  /**
+   * Reload the pending-redeem queue persisted by a prior process and resume
+   * settling it (issue #369 follow-up). Call once at startup. Stale entries
+   * (cycle moved on since) fail their next redeem with a terminal revert and are
+   * dropped — so the file self-heals. No-op when no store path / nothing pending.
+   */
+  resumePendingRedeems(): void {
+    const f = this.cfg.pendingStorePath;
+    if (!f) return;
+    let raw: string;
+    try {
+      raw = readFileSync(f, "utf-8");
+    } catch {
+      return; // no prior pending file — nothing to resume (normal fresh start)
+    }
+    let arr: Array<{ key: string; operator: string; cumulative: string; signature: string; cycle: string }>;
+    try {
+      arr = JSON.parse(raw);
+    } catch (e) {
+      // The file exists but is corrupt — don't silently abandon its receipts.
+      // (Atomic persist makes this rare, but a hand-edit or partial legacy write
+      //  could still get here.) Surface it so an operator knows funds may be owed.
+      // eslint-disable-next-line no-console
+      console.warn(`  ⚠ pending vault-redeem file unreadable, cannot resume (${errStr(e).slice(0, 80)}): ${f}`);
+      return;
+    }
+    if (!Array.isArray(arr) || arr.length === 0) return;
+    for (const e of arr) {
+      try {
+        this.pendingRedeems.set(e.key, {
+          operator: e.operator,
+          cumulative: BigInt(e.cumulative),
+          signature: e.signature,
+          cycle: BigInt(e.cycle),
+        });
+      } catch {
+        /* skip a malformed entry */
+      }
+    }
+    if (this.pendingRedeems.size === 0) return;
+    // eslint-disable-next-line no-console
+    console.log(`  ↻ resuming ${this.pendingRedeems.size} pending vault redeem(s) from a prior session`);
+    this.startRedeemRetry();
+    // Attempt immediately rather than waiting for the first retry tick.
+    for (const key of [...this.pendingRedeems.keys()]) void this.attemptRedeem(key);
   }
 
   // ── deposit / withdraw (on-chain, wallet pays gas) ─────────────────────────
