@@ -478,6 +478,9 @@ export async function cmdConsume(args: Args): Promise<void> {
         // Same target drives startup deposit AND mid-run auto-refill, so the
         // vault doesn't drain to a 402 (which would bounce the agent to a fallback).
         autoTopUpUsd: args.vaultDeposit,
+        // Persist the pending-redeem queue per wallet so a restart resumes
+        // settling the served tail instead of abandoning it (issue #369 follow-up).
+        pendingStorePath: path.join(configDir(), `vault-pending-${wallet.address.toLowerCase()}.json`),
       })
     : null;
   if (vault) {
@@ -489,6 +492,9 @@ export async function cmdConsume(args: Args): Promise<void> {
     if (!(await guardVaultFresh(fac, { force: args.force }))) {
       process.exit(1);
     }
+    // Resume any redeems a prior process left pending (restart-durable settlement).
+    // After the freshness gate, so a stale vault never replays receipts.
+    vault.resumePendingRedeems();
   }
   if (vault && args.vaultDeposit && args.vaultDeposit > 0) {
     // Auto-managed: top the vault up to the target from the wallet's USDC on
