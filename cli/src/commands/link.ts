@@ -22,12 +22,29 @@ function generateCode(): string {
 export async function cmdLink(): Promise<void> {
   const cfg = loadConfig();
 
-  const { passphrase } = await prompts({
-    type: "password",
-    name: "passphrase",
-    message: "Keystore passphrase",
-  });
-  if (!passphrase) process.exit(130);
+  // Passphrase resolution mirrors consume/serve/vault. An empty passphrase is a
+  // valid, supported keystore (unattended mode / `--no-wallet-passphrase`), so
+  // it must unlock and print the code — not exit early. We therefore skip the
+  // prompt entirely when noPassphrase is set, and in the prompt path we only
+  // bail on a real cancel (Ctrl-C/Esc → onCancel), NOT on an empty submit
+  // (Enter with no input → passphrase ""). If a non-empty passphrase was in
+  // fact required, loadWallet throws a clear decryption error below.
+  let passphrase = "";
+  if (cfg.operator.noPassphrase) {
+    passphrase = "";
+  } else if (typeof process.env.HALO_PASSPHRASE === "string") {
+    passphrase = process.env.HALO_PASSPHRASE;
+  } else {
+    const r = await prompts(
+      {
+        type: "password",
+        name: "passphrase",
+        message: "Keystore passphrase (leave blank if none)",
+      },
+      { onCancel: () => process.exit(130) }
+    );
+    passphrase = r.passphrase ?? "";
+  }
 
   const wallet = await loadWallet(cfg.operator.keystorePath, passphrase);
 
