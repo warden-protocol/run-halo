@@ -443,7 +443,11 @@ export class VaultConsumeClient {
       body: JSON.stringify({ consumer: this.consumer, operator, cumulative: cumulative.toString(), signature }),
       signal: AbortSignal.timeout(60_000),
     });
-    const body = (await res.json().catch(() => ({}))) as { hash?: string; error?: string };
+    const body = (await res.json().catch(() => ({}))) as { hash?: string; error?: string; status?: string };
+    // Idempotent no-op: the facilitator already captured this cumulative on-chain
+    // (issue #392). Terminal success — no tx to report, so the caller clears the
+    // pending receipt rather than retrying.
+    if (res.ok && body.status === "already-redeemed") return "";
     if (!res.ok || !body.hash) throw new Error(body.error || `redeem failed (HTTP ${res.status})`);
     return body.hash;
   }
