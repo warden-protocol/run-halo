@@ -12,7 +12,7 @@
 import prompts from "prompts";
 import { loadConfig } from "../config";
 import { loadWallet } from "../wallet";
-import { VaultConsumeClient, VAULT_ADDRESS, fmtUsd } from "../vault-consume";
+import { VaultConsumeClient, VAULT_ADDRESS, fmtUsd, guardVaultFresh } from "../vault-consume";
 
 export async function cmdVault(rawArgs: string[]): Promise<void> {
   const sub = rawArgs[0];
@@ -29,9 +29,11 @@ export async function cmdVault(rawArgs: string[]): Promise<void> {
     if (!r.passphrase) process.exit(130);
     passphrase = r.passphrase;
   }
+  const force = rawArgs.includes("--force");
   const wallet = await loadWallet(cfg.operator.keystorePath, passphrase);
+  const facilitatorUrl = cfg.facilitator?.url ?? "https://facilitator.runhalo.xyz";
   const client = new VaultConsumeClient(wallet, {
-    facilitatorUrl: cfg.facilitator?.url ?? "https://facilitator.runhalo.xyz",
+    facilitatorUrl,
     rpcUrl: (process.env.BASE_RPC_URL || "https://mainnet.base.org").trim(),
     chainId: cfg.network === "base-sepolia" ? 84532 : 8453,
   });
@@ -51,11 +53,15 @@ export async function cmdVault(rawArgs: string[]): Promise<void> {
       return;
     }
     case "deposit": {
-      const amount = Number(rawArgs[1]);
+      // First non-flag arg after the subcommand is the amount, so `--force` can
+      // sit anywhere (e.g. `deposit 5 --force` or `deposit --force 5`).
+      const amount = Number(rawArgs.slice(1).find((a) => !a.startsWith("-")));
       if (!Number.isFinite(amount) || amount <= 0) {
         console.error("usage: halo vault deposit <usd>   (e.g. halo vault deposit 5)");
         process.exit(1);
       }
+      // Staleness gate (#392): refuse to move USDC into a stale pinned vault.
+      if (!(await guardVaultFresh(facilitatorUrl, { force }))) process.exit(1);
       console.log(`  depositing $${amount.toFixed(2)} into the vault (approve + deposit; needs a little ETH for gas)…`);
       try {
         const tx = await client.deposit(amount);
