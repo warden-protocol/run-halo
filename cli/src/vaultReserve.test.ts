@@ -3,7 +3,7 @@
  *   node --require ts-node/register --test src/vaultReserve.test.ts
  *
  * The property that fixes #367: a single reservation never sinks more than a
- * slice (1/slots) of free balance into batching, yet always covers the request —
+ * slice (1/liquiditySlots) of free balance into batching, yet always covers the request —
  * so a wide fan-out can't lock the whole deposit, and requests still serve.
  */
 import test from "node:test";
@@ -15,7 +15,7 @@ const base = {
   locked: 0n,
   withdrawable: 100_000n,
   reserveMultiple: 5n,
-  slots: 8n,
+  liquiditySlots: 8n,
   live: false,
 };
 
@@ -24,7 +24,7 @@ test("ample balance → full batch (reserveMultiple × estCost)", () => {
   assert.equal(computeReserveAmount({ ...base, withdrawable: 100_000n }), 500n);
 });
 
-test("tight balance → capped at 1/slots of free, not the whole deposit (#367)", () => {
+test("tight balance → capped at 1/liquiditySlots of free, not the whole deposit (#367)", () => {
   // free 800, cap = 800/8 = 100; target 500 > cap → reserve only 100.
   assert.equal(computeReserveAmount({ ...base, withdrawable: 800n }), 100n);
 });

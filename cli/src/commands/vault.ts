@@ -10,9 +10,25 @@
  * wallet pays a little gas); per-request reserve/redeem are gasless (facilitator).
  */
 import prompts from "prompts";
+import { classifySessionKey } from "@halo/vault-core";
 import { loadConfig } from "../config";
 import { loadWallet } from "../wallet";
-import { VaultConsumeClient, VAULT_ADDRESS, fmtUsd, guardVaultFresh } from "../vault-consume";
+import {
+  VaultConsumeClient,
+  VAULT_ADDRESS,
+  fmtUsd,
+  guardVaultFresh,
+  resolveSessionSigner,
+  type SessionKeyMode,
+} from "../vault-consume";
+
+/** Read `--flag value` or `--flag=value` from a raw arg list. */
+function flagValue(args: string[], name: string): string | undefined {
+  const eq = args.find((a) => a.startsWith(`${name}=`));
+  if (eq) return eq.slice(name.length + 1);
+  const i = args.indexOf(name);
+  return i >= 0 ? args[i + 1] : undefined;
+}
 
 export async function cmdVault(rawArgs: string[]): Promise<void> {
   const sub = rawArgs[0];
@@ -30,26 +46,65 @@ export async function cmdVault(rawArgs: string[]): Promise<void> {
     passphrase = r.passphrase;
   }
   const force = rawArgs.includes("--force");
+  // Session-key scheme (#426), must match how `halo consume --vault` was run so
+  // status classifies — and deposit registers — the SAME key.
+  const sessionKeyRaw = flagValue(rawArgs, "--session-key");
+  if (sessionKeyRaw && sessionKeyRaw !== "wallet" && sessionKeyRaw !== "browser") {
+    console.error(`  ✗ --session-key must be "wallet" or "browser" (got "${sessionKeyRaw}").`);
+    process.exit(1);
+  }
+  const sessionKeyMode: SessionKeyMode = sessionKeyRaw === "browser" ? "browser" : "wallet";
   const wallet = await loadWallet(cfg.operator.keystorePath, passphrase);
   const facilitatorUrl = cfg.facilitator?.url ?? "https://facilitator.runhalo.xyz";
-  const client = new VaultConsumeClient(wallet, {
-    facilitatorUrl,
-    rpcUrl: (process.env.BASE_RPC_URL || "https://mainnet.base.org").trim(),
-    chainId: cfg.network === "base-sepolia" ? 84532 : 8453,
-  });
+  const sessionSigner = await resolveSessionSigner(wallet, sessionKeyMode);
+  const client = new VaultConsumeClient(
+    wallet,
+    {
+      facilitatorUrl,
+      rpcUrl: (process.env.BASE_RPC_URL || "https://mainnet.base.org").trim(),
+      chainId: cfg.network === "base-sepolia" ? 84532 : 8453,
+    },
+    sessionSigner
+  );
 
   switch (sub) {
     case "status": {
       const s = await client.readVaultState();
+      // Classify the on-chain session key against the key this CLI SIGNS with in
+      // the selected mode (#426): the wallet itself (default), or the derived
+      // browser sub-wallet (--session-key browser). Anything else means
+      // `halo consume --vault` would serve work it can never redeem.
+      const expected = await client.sessionAddress();
+      const skStatus = classifySessionKey(s.sessionKey, expected);
+      const browser = sessionKeyMode === "browser";
+      const skNote =
+        skStatus === "match"
+          ? browser
+            ? " (browser-derived key — shared with the Halo web app)"
+            : " (this wallet)"
+          : skStatus === "unregistered"
+            ? browser
+              ? " (none yet — your first deposit registers the browser-derived key)"
+              : " (none yet — your first deposit registers this wallet)"
+            : " ⚠ NOT the key this CLI signs with — receipts can't redeem against it";
       console.log(`halo vault`);
       console.log(`  vault       : ${VAULT_ADDRESS}  (${cfg.network})`);
       console.log(`  consumer    : ${wallet.address}`);
       console.log(`  balance     : $${fmtUsd(s.balance)}`);
       console.log(`  locked      : $${fmtUsd(s.lockedTotal)} (reserved to operators)`);
       console.log(`  withdrawable: $${fmtUsd(s.withdrawable)}`);
-      console.log(
-        `  session key : ${s.sessionKey}${s.sessionKey.toLowerCase() === wallet.address.toLowerCase() ? " (this wallet)" : ""}`
-      );
+      console.log(`  signs with  : ${expected}${browser ? " (browser-derived; --session-key browser)" : " (this wallet)"}`);
+      console.log(`  session key : ${s.sessionKey}${skNote}`);
+      if (skStatus === "mismatch") {
+        console.log(
+          `\n  ⚠ The registered session key is NOT the key this CLI signs with, so\n` +
+            `    \`halo consume --vault${browser ? " --session-key browser" : ""}\` would serve work it can never collect\n` +
+            `    (redeem reverts BadSignature). Common causes: mixing the Halo browser app and the\n` +
+            `    CLI on one wallet, or the wrong --session-key mode. Try the other mode\n` +
+            `    (--session-key ${browser ? "wallet" : "browser"}), use a DEDICATED wallet, or rotate the key via\n` +
+            `    setSessionKey(${expected}) (needs locked == $0).`
+        );
+      }
       return;
     }
     case "deposit": {
@@ -87,7 +142,7 @@ export async function cmdVault(rawArgs: string[]): Promise<void> {
       return;
     }
     default:
-      console.error("usage: halo vault <status|deposit <usd>|withdraw>");
+      console.error("usage: halo vault [--session-key <wallet|browser>] <status|deposit <usd>|withdraw>");
       process.exit(1);
   }
 }

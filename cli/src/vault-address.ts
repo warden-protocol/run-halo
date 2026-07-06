@@ -10,10 +10,10 @@
  * silently split the network across two vaults (consumer reserves in A, operator
  * checks B → every request rejected) or point a deposit at an attacker-controlled
  * contract. Migrating to a new (e.g. audited) vault is a COORDINATED code release
- * that changes this one line — alongside the facilitator secret + a frontend
+ * that changes vault-core/consensus.json — alongside the facilitator secret + a frontend
  * rebuild — never a runtime flag flip.
  *
  * Closed-alpha mainnet vault (Base, chain 8453). Update on a vault migration.
  * v2 (protocol-fee) vault — EIP-712 domain name "Halo", version "2".
  */
-export const VAULT_ADDRESS = "0x3907F660B257560883E891fbbB9F997Eff70E40E";
+export { VAULT_ADDRESS } from "@halo/vault-core";

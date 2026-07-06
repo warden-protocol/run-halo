@@ -46,9 +46,21 @@ import {
   guardVaultFresh,
   priceTokens,
   estimateTokens,
+  completionCeilingTokens,
+  resolveSessionSigner,
   fmtUsd as fmtVaultUsd,
   type OpsState,
+  type SessionKeyMode,
 } from "../vault-consume";
+import {
+  MAX_VAULT_RESERVATION_ATTEMPTS,
+  matchesModel,
+  meterVaultResponse,
+  requiredVaultReservationBase,
+  selectVaultOperatorFromList,
+  withReservationMargin,
+  type VaultOperatorSelectionReason,
+} from "@halo/vault-core";
 
 interface Args {
   port?: number;
@@ -95,6 +107,10 @@ interface Args {
    *  operators so reservations don't lock the whole deposit (#367); a single
    *  reservation is also auto-capped at a slice of the free balance regardless. */
   vaultReserveMultiple?: number;
+  /** Vault session-key scheme: "wallet" (default — the CLI wallet IS the session
+   *  key) or "browser" (derive the SAME in-browser sub-wallet the Halo web app
+   *  registers, so ONE wallet works on both surfaces). See #426. */
+  sessionKey?: string;
   /** Self-daemonize: re-spawn the server detached (own session, reparented to
    *  init) and return immediately, so an agent/gateway that launches consume
    *  can't kill it on restart. Idempotent — no-ops if one's already serving. */
@@ -129,7 +145,7 @@ async function selectE2EOperator(
       }>;
     };
     const candidates = operators
-      .filter((o) => o.encryptionPubkey && o.models.some((m) => m === model || m.includes(model) || model.includes(m)))
+      .filter((o) => o.encryptionPubkey && o.models.some((m) => matchesModel(m, model)))
       .sort((a, b) => {
         const pa = a.pricing?.[model] ?? Number.POSITIVE_INFINITY;
         const pb = b.pricing?.[model] ?? Number.POSITIVE_INFINITY;
@@ -148,10 +164,17 @@ interface VaultOperatorPin {
   encryptionPubkey: string | null;
 }
 
+interface VaultOperatorSelectionResult {
+  pin: VaultOperatorPin | null;
+  reason: VaultOperatorSelectionReason;
+}
+
 /**
- * Pick the cheapest priced operator for `model` to RESERVE against in vault mode.
- * Vault needs a price (to size the reservation + meter) and pins ONE operator so
- * the reservation, the request, and the receipt all line up. Filters to TEE
+ * Pick the cheapest priced VAULT-CAPABLE operator for `model` to RESERVE against in
+ * vault mode. Vault needs a price (to size the reservation + meter) and pins ONE
+ * operator so the reservation, the request, and the receipt all line up. Only
+ * operators advertising `vaultPayments` qualify — the relay filters vault routing to
+ * them with no legacy fallback, so a legacy pin would 503 at the relay. Filters to TEE
  * operators when `teeOnly` (confidential). Returns null when none qualify.
  */
 async function selectVaultOperator(
@@ -160,11 +183,11 @@ async function selectVaultOperator(
   teeOnly: boolean,
   maxPriceUsdPerMtok?: number,
   requireAddress?: string
-): Promise<VaultOperatorPin | null> {
+): Promise<VaultOperatorSelectionResult> {
   try {
     const url = `${relayBase}/v1/operators` + (teeOnly ? "?tee=1" : "");
     const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
-    if (!res.ok) return null;
+    if (!res.ok) return { pin: null, reason: "no_operator" };
     const { operators } = (await res.json()) as {
       operators: Array<{
         address: string;
@@ -173,46 +196,27 @@ async function selectVaultOperator(
         pricing?: Record<string, number>;
         tee?: boolean;
         teeModels?: string[];
+        vaultPayments?: boolean;
       }>;
     };
-    const servesTee = (o: { teeModels?: string[]; tee?: boolean }): boolean =>
-      o.teeModels && o.teeModels.length > 0
-        ? o.teeModels.some((m) => m === model || m.includes(model) || model.includes(m))
-        : o.tee === true;
-    const priced = operators
-      .filter((o) => !teeOnly || servesTee(o))
-      .map((o) => {
-        const key =
-          o.models.find((m) => m === model) || o.models.find((m) => m.includes(model) || model.includes(m));
-        const per1k = key && o.pricing ? o.pricing[key] : undefined;
-        return per1k != null
-          ? { address: o.address, priceUsdPerMtok: per1k * 1000, encryptionPubkey: o.encryptionPubkey ?? null }
-          : null;
-      })
-      .filter((x): x is VaultOperatorPin => x !== null)
-      .filter((x) => maxPriceUsdPerMtok === undefined || x.priceUsdPerMtok <= maxPriceUsdPerMtok);
-    if (priced.length === 0) return null;
-    // Honor an explicit operator pin (X-Halo-Operator) when the caller forced
-    // one: return THAT operator's pin if it serves+prices the model, so a caller
-    // can deliberately target any operator (e.g. a settlement sweep funding every
-    // operator, not just the cheapest). null when the pinned operator doesn't
-    // qualify, so the caller surfaces a clear 503 instead of silently rerouting.
-    if (requireAddress) {
-      const want = requireAddress.toLowerCase();
-      return priced.find((x) => x.address.toLowerCase() === want) ?? null;
-    }
-    // Spread across operators TIED at the cheapest price instead of always
-    // pinning the first. Vault mode pins ONE operator (so the reservation,
-    // request, and receipt line up) and bypasses the relay's balanced routing —
-    // so without this, several equally-priced operators serving one model (e.g.
-    // a confidential model on multiple TEE operators) all starve but one, and
-    // only that one ever redeems. (#364)
-    const best = Math.min(...priced.map((x) => x.priceUsdPerMtok));
-    const PRICE_EPS = 1e-9;
-    const cheapest = priced.filter((x) => x.priceUsdPerMtok <= best + PRICE_EPS);
-    return cheapest[Math.floor(Math.random() * cheapest.length)];
+    const selection = selectVaultOperatorFromList(operators, model, {
+      teeOnly,
+      maxPriceUsdPerMtok,
+      requireAddress,
+      randomizeCheapestTies: !requireAddress,
+    });
+    if (!selection.selected) return { pin: null, reason: selection.reason };
+    const { operator, priceUsdPerMtok } = selection.selected;
+    return {
+      pin: {
+        address: operator.address,
+        priceUsdPerMtok,
+        encryptionPubkey: operator.encryptionPubkey ?? null,
+      },
+      reason: selection.reason,
+    };
   } catch {
-    return null;
+    return { pin: null, reason: "no_operator" };
   }
 }
 
@@ -223,7 +227,7 @@ async function selectVaultOperator(
  * with vault headers (operator gates + serves, reporting ACTUAL cost), then
  * advances + redeems the cumulative receipt in the background.
  */
-async function vaultSend(
+export async function vaultSend(
   client: VaultConsumeClient,
   url: string,
   body: unknown,
@@ -235,7 +239,7 @@ async function vaultSend(
     estTokens: number;
   }
 ): Promise<{ status: number; headers: Headers; body: string; paid: boolean; chargedBase?: string }> {
-  const estCost = priceTokens(opts.priceUsdPerMtok, opts.estTokens);
+  const estCost = withReservationMargin(priceTokens(opts.priceUsdPerMtok, opts.estTokens));
   let ops: OpsState;
   let keyEpoch: bigint;
   ({ ops, keyEpoch } = await client.ensureReservation(opts.operator, estCost));
@@ -246,26 +250,41 @@ async function vaultSend(
     // Vault-critical headers win over any forwarded ones.
     "x-halo-payment-mode": "vault",
     "x-halo-operator": opts.operator,
-    "x-halo-vault-consumer": client.consumer,
+    "x-halo-vault-consumer": await client.consumer(),
   };
   if (!("x-halo-max-price" in headers) && !("X-Halo-Max-Price" in headers)) {
     headers["x-halo-max-price"] = String(opts.priceUsdPerMtok);
   }
 
-  const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body), signal: opts.signal });
-  const text = await res.text();
-
-  // The operator reports the ACTUAL metered cost in PAYMENT-RESPONSE (base64 JSON).
-  let cost = 0n;
-  const pr = res.headers.get("PAYMENT-RESPONSE");
-  if (pr) {
-    try {
-      const d = JSON.parse(Buffer.from(pr, "base64").toString("utf-8")) as { amountUsdc?: string };
-      if (d.amountUsdc && /^\d+$/.test(d.amountUsdc)) cost = BigInt(d.amountUsdc);
-    } catch {
-      /* no parseable settlement — treat as unpaid */
-    }
+  const requestBody = JSON.stringify(body);
+  const send = () =>
+    fetch(url, { method: "POST", headers, body: requestBody, signal: opts.signal });
+  let res = await send();
+  let text = await res.text();
+  // Reserve-and-replay on a reservation-gate rejection, up to
+  // MAX_VAULT_RESERVATION_ATTEMPTS total — the operator's gate price can advance
+  // more than once, so a single retry can 402 again on funds the vault could
+  // cover. Mirrors sdk/src/vault.ts payInference.
+  for (
+    let attempt = 1;
+    attempt < MAX_VAULT_RESERVATION_ATTEMPTS && res.status === 402;
+    attempt++
+  ) {
+    const required = requiredVaultReservationBase(text);
+    if (required === null) break;
+    ({ ops, keyEpoch } = await client.ensureReservation(opts.operator, required));
+    res = await send();
+    text = await res.text();
   }
+
+  // Meter with the shared, content-type-independent rule the SDK/frontend use:
+  // settlement (PAYMENT-RESPONSE header OR a halo-settlement body frame) →
+  // reported body usage → unmeterable. A prior copy read ONLY the header, so an
+  // operator that served real work but omitted/garbled PAYMENT-RESPONSE (with
+  // usage still in the body) was paid $0 — the invariant-#4 "charge zero for real
+  // work" bug. meterVaultResponse restores parity with the SDK.
+  const meter = meterVaultResponse(res.headers, text, opts.priceUsdPerMtok);
+  const cost = meter.cost;
   if (res.ok && cost > 0n) client.recordAndRedeem(opts.operator, ops, keyEpoch, cost);
 
   return {
@@ -273,7 +292,10 @@ async function vaultSend(
     headers: res.headers,
     body: text,
     paid: res.ok && cost > 0n,
-    chargedBase: cost > 0n ? cost.toString() : undefined,
+    // Gate on res.ok too (mirrors sdk/src/vault.ts payInference): a non-2xx response
+    // can still carry a PAYMENT-RESPONSE with amountUsdc > 0, but nothing is redeemed
+    // for it, so chargedBase must track `paid` — never report a charge that never landed.
+    chargedBase: res.ok && cost > 0n ? cost.toString() : undefined,
   };
 }
 
@@ -462,26 +484,43 @@ export async function cmdConsume(args: Args): Promise<void> {
   // exact-mode quote. Opt-in via --vault. Deposit once; reserve per operator;
   // pay the metered cost via background receipts. ──────────────────────────────
   const vaultMode = args.vault === true;
+  // Session-key scheme for the vault rail (#426 cross-surface). "wallet" (default):
+  // the CLI wallet IS the session key. "browser": derive the SAME in-browser
+  // sub-wallet the Halo web app registers, so one wallet works on both surfaces.
+  if (args.sessionKey && args.sessionKey !== "wallet" && args.sessionKey !== "browser") {
+    console.error(`  ✗ --session-key must be "wallet" or "browser" (got "${args.sessionKey}").`);
+    process.exit(1);
+  }
+  if (args.sessionKey === "browser" && !vaultMode) {
+    console.error(`  ⚠ --session-key browser only applies to the vault rail; add --vault (ignored otherwise).`);
+  }
+  const sessionKeyMode: SessionKeyMode = args.sessionKey === "browser" ? "browser" : "wallet";
+  const vaultSessionSigner = vaultMode ? await resolveSessionSigner(wallet, sessionKeyMode) : undefined;
+  const vaultSessionKeyAddr = vaultSessionSigner ? await vaultSessionSigner.getAddress() : null;
   const vault = vaultMode
-    ? new VaultConsumeClient(wallet, {
-        facilitatorUrl: cfg.facilitator?.url ?? "https://facilitator.runhalo.xyz",
-        rpcUrl: (process.env.BASE_RPC_URL || "https://mainnet.base.org").trim(),
-        chainId: cfg.network === "base-sepolia" ? 84532 : 8453,
-        // Push signed receipts to the serving operator through the relay
-        // (operator-driven redeem, issue #369); self-redeem is the fallback.
-        relayUrl: relayBase,
-        // Optional override for the reservation batch size (#367). Omitted (not
-        // undefined) when unset so the client's default (5) isn't clobbered.
-        ...(args.vaultReserveMultiple && args.vaultReserveMultiple > 0
-          ? { reserveMultiple: BigInt(Math.floor(args.vaultReserveMultiple)) }
-          : {}),
-        // Same target drives startup deposit AND mid-run auto-refill, so the
-        // vault doesn't drain to a 402 (which would bounce the agent to a fallback).
-        autoTopUpUsd: args.vaultDeposit,
-        // Persist the pending-redeem queue per wallet so a restart resumes
-        // settling the served tail instead of abandoning it (issue #369 follow-up).
-        pendingStorePath: path.join(configDir(), `vault-pending-${wallet.address.toLowerCase()}.json`),
-      })
+    ? new VaultConsumeClient(
+        wallet,
+        {
+          facilitatorUrl: cfg.facilitator?.url ?? "https://facilitator.runhalo.xyz",
+          rpcUrl: (process.env.BASE_RPC_URL || "https://mainnet.base.org").trim(),
+          chainId: cfg.network === "base-sepolia" ? 84532 : 8453,
+          // Push signed receipts to the serving operator through the relay
+          // (operator-driven redeem, issue #369); self-redeem is the fallback.
+          relayUrl: relayBase,
+          // Optional override for the reservation batch size (#367). Omitted (not
+          // undefined) when unset so the client's default (5) isn't clobbered.
+          ...(args.vaultReserveMultiple && args.vaultReserveMultiple > 0
+            ? { reserveMultiple: BigInt(Math.floor(args.vaultReserveMultiple)) }
+            : {}),
+          // Same target drives startup deposit AND mid-run auto-refill, so the
+          // vault doesn't drain to a 402 (which would bounce the agent to a fallback).
+          autoTopUpUsd: args.vaultDeposit,
+          // Persist the pending-redeem queue per wallet so a restart resumes
+          // settling the served tail instead of abandoning it (issue #369 follow-up).
+          pendingStorePath: path.join(configDir(), `vault-pending-${wallet.address.toLowerCase()}.json`),
+        },
+        vaultSessionSigner
+      )
     : null;
   if (vault) {
     // Staleness guard (#392): a pinned VAULT_ADDRESS silently targets the OLD
@@ -511,6 +550,39 @@ export async function cmdConsume(args: Args): Promise<void> {
     } catch (e) {
       console.error(`  ⚠ vault auto-deposit failed: ${errMsg(e)}`);
       console.error(`    Fund ${wallet.address} with USDC + a little ETH on Base, or run: halo vault deposit <usd>`);
+    }
+  }
+  if (vault) {
+    // Session-key preflight (#426). The CLI signs receipts DIRECTLY with the
+    // wallet key, so the on-chain session key MUST be this wallet or every
+    // receipt reverts BadSignature and the operator serves work it can never
+    // collect. Fail CLOSED at startup with an actionable message instead of
+    // silently getting unpayable work served. Runs AFTER the startup deposit so a
+    // just-registered (zero → this wallet) key reads as a match. (The SDK client
+    // also re-checks fail-closed before each reservation; this is the early,
+    // legible failure — a read blip here can never let a mismatch slip through.)
+    try {
+      const sk = await vault.checkSessionKey();
+      if (sk.status === "mismatch") {
+        const browser = sessionKeyMode === "browser";
+        console.error(
+          `\n  ✗ VAULT SESSION-KEY MISMATCH — refusing to start the vault rail.\n` +
+            `    Wallet ${wallet.address} has session key ${sk.registered} registered on-chain,\n` +
+            `    but this CLI signs with ${sk.expected}${browser ? " (browser-derived; --session-key browser)" : " (this wallet)"}.\n` +
+            `    Receipts this CLI signs would revert (BadSignature) and the operator would\n` +
+            `    serve work it can never be paid for. Common causes: mixing the Halo browser app\n` +
+            `    and the CLI on one wallet, or the wrong --session-key mode.\n` +
+            `    Fix: try the other mode (--session-key ${browser ? "wallet" : "browser"}), use a\n` +
+            `    DEDICATED wallet for the CLI, or rotate the key with setSessionKey(${sk.expected})\n` +
+            `    (needs no active reservations).\n`
+        );
+        process.exit(1);
+      }
+    } catch (e) {
+      console.error(
+        `  ⚠ could not verify the vault session key at startup (${errMsg(e)}); ` +
+          `the client re-checks fail-closed before it serves.`
+      );
     }
   }
 
@@ -814,7 +886,18 @@ export async function cmdConsume(args: Args): Promise<void> {
     const vaultEstTokens = vault
       ? estimateTokens(
           (parsed as { messages?: unknown }).messages,
-          typeof parsed.max_tokens === "number" ? parsed.max_tokens : 1024
+          // Size the completion budget with reasoning headroom (#421): a small
+          // max_tokens does not bound a reasoning model's reasoning tokens, so
+          // reserving on max_tokens alone systematically under-reserves and the
+          // operator undercollects. Shared with the operator's serve gate so the
+          // reservation covers what the gate prices (invariant #5/#7).
+          completionCeilingTokens(
+            typeof parsed.model === "string" ? parsed.model : "",
+            typeof parsed.max_tokens === "number" ? parsed.max_tokens : 1024,
+            typeof parsed.max_completion_tokens === "number"
+              ? parsed.max_completion_tokens
+              : undefined
+          )
         )
       : 0;
     let vaultPin: VaultOperatorPin | null = null;
@@ -824,8 +907,21 @@ export async function cmdConsume(args: Args): Promise<void> {
       // settlement sweep targeting every operator), honor it; otherwise fall back
       // to the default cheapest-tier selection.
       const pinned = (forwardHeaders["x-halo-operator"] || "").trim() || undefined;
-      vaultPin = m ? await selectVaultOperator(relayBase, m, wantConfidential, undefined, pinned) : null;
+      const selection = m
+        ? await selectVaultOperator(relayBase, m, wantConfidential, undefined, pinned)
+        : { pin: null, reason: "no_operator" as VaultOperatorSelectionReason };
+      vaultPin = selection.pin;
       if (!vaultPin) {
+        const message =
+          selection.reason === "pinned_not_vault_capable"
+            ? `pinned operator ${pinned} serves "${m}" but is not vault-capable. Upgrade that operator to announce vaultPayments, or drop X-Halo-Operator to choose a vault-capable operator.`
+            : selection.reason === "pinned_free_model"
+              ? `pinned operator ${pinned} advertises "${m}" as free. A zero-price model cannot produce a redeemable vault receipt; use a metered model or a non-vault rail.`
+              : selection.reason === "free_model"
+                ? `model "${m}" is advertised as free. A zero-price model cannot produce a redeemable vault receipt; use a metered model or a non-vault rail.`
+                : pinned
+                  ? `pinned operator ${pinned} is unavailable, outside the price limit, or not advertising a usable price for "${m}"${wantConfidential ? " (confidential)" : ""}. Drop X-Halo-Operator to use the cheapest eligible operator.`
+                  : `no priced${wantConfidential ? " confidential" : ""} operator is online for "${m}". Vault mode needs a positively-priced vault-capable operator for this model.`;
         return sendJson(
           res,
           503,
@@ -833,9 +929,7 @@ export async function cmdConsume(args: Args): Promise<void> {
             503,
             JSON.stringify({
               error: {
-                message: pinned
-                  ? `pinned operator ${pinned} is not advertising a price for "${m}"${wantConfidential ? " (confidential)" : ""} right now — it can't be reserved against. Drop X-Halo-Operator to use the cheapest available operator.`
-                  : `no priced${wantConfidential ? " confidential" : ""} operator is online for "${m}". Vault mode needs an operator advertising a price for this model.`,
+                message,
               },
             }),
             errCtx
@@ -1052,6 +1146,11 @@ export async function cmdConsume(args: Args): Promise<void> {
     console.log(
       `  rail     : ${vault ? "vault (settle ACTUAL tokens; deposit-backed)" : `exact (sign-per-request, up to $${(Number(maxAmountBase) / 1_000_000).toFixed(2)}/req)`}`
     );
+    if (vault) {
+      console.log(
+        `  session  : ${vaultSessionKeyAddr ? `browser-derived ${vaultSessionKeyAddr} (shared with the Halo web app)` : "wallet (this wallet signs receipts)"}`
+      );
+    }
     console.log(
       `  budget   : ${budget.budgetBase > 0n ? `$${usd(budget.budgetBase)} cumulative (warn at ${Math.round(budget.warnPct * 100)}%)` : "uncapped (set --budget-usdc to bound an agent)"}`
     );

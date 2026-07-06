@@ -37,9 +37,20 @@ import {
   OpenAIChatRequest,
 } from "../anthropic-adapter";
 import { upstreamRatePer1KUsd, upstreamContextLength, estimatePromptTokens } from "../pricing";
-import { checkReservationCached, noteServed, verifyReceipt, invalidateGate, ReservationCheck, VAULT_ADDRESS } from "../vault";
+import {
+  checkReservationCached,
+  collectibleServeAmount,
+  noteServed,
+  readReservation,
+  verifyReceipt,
+  invalidateGate,
+  ReservationCheck,
+  getVaultAddress,
+  setActiveVaultAddress,
+} from "../vault";
 import { VaultCreditLedger, creditWindowBase, AdmitResult } from "../vaultCredit";
 import { OperatorRedeemer } from "../vaultRedeemer";
+import { completionCeilingTokens, formatUsdcBase } from "@halo/vault-core";
 import { isAddress } from "ethers";
 import { decryptSecret, isEncryptedSecret } from "../secret";
 import { sanitizeChatRequest, sanitizeMessages } from "../sanitize";
@@ -72,6 +83,7 @@ interface InferenceRequestMessage {
 const UPSTREAM_TIMEOUT_MS = 90_000;
 // Re-ping local models inside Ollama's default 5-min keep_alive window.
 const MODEL_WARM_INTERVAL_MS = 4 * 60_000;
+const VAULT_CAPABILITY_RETRY_MS = 60_000;
 
 interface UpstreamUsage {
   total_tokens: number;
@@ -554,6 +566,11 @@ export async function cmdServe(): Promise<void> {
   installProxyFromEnv(); // honor HTTP(S)_PROXY for upstream/relay/facilitator calls
   const cfg = loadConfig();
 
+  // Point vault reads + receipt verification at the configured vault (defaults to
+  // the consensus-pinned address). Throws on a malformed override so a typo fails
+  // here rather than silently rejecting every vault request at serve time.
+  setActiveVaultAddress(cfg.vaultAddress);
+
   // File logging + PID file. Both survive terminal close and process exit
   // so post-hoc diagnosis works (Hermes / doctor / `tail -f`). Rotation is
   // size-based: when the active log crosses LOG_ROTATE_BYTES we move it to
@@ -580,6 +597,9 @@ export async function cmdServe(): Promise<void> {
     passphrase = r.passphrase;
   }
 
+  if (cfg.vaultAddress) {
+    console.log(`  ⚠ vault override active — gating on ${getVaultAddress()} (from config, not the pinned default)`);
+  }
   console.log("  loading wallet...");
   const wallet = await loadWallet(cfg.operator.keystorePath, passphrase);
   if (wallet.address.toLowerCase() !== cfg.operator.address.toLowerCase()) {
@@ -587,6 +607,33 @@ export async function cmdServe(): Promise<void> {
       `keystore address ${wallet.address} does not match config ${cfg.operator.address}`
     );
   }
+
+  // Probe vault-read capability in parallel with the rest of startup so a slow
+  // RPC never delays the relay connection. Using the operator as both keys is a
+  // harmless read: an empty reservation still proves RPC + pinned-vault access.
+  // A failed probe is retried while connected; success re-announces on the live
+  // socket, so a transient boot failure does not latch until process restart.
+  let vaultPayments = false;
+  let vaultProbeInFlight: Promise<boolean> | null = null;
+  const probeVaultCapability = (): Promise<boolean> => {
+    if (vaultPayments) return Promise.resolve(true);
+    if (vaultProbeInFlight) return vaultProbeInFlight;
+    const probe = readReservation(cfg.operator.address, cfg.operator.address)
+      .then(() => {
+        vaultPayments = true;
+        return true;
+      })
+      .catch((err) => {
+        logError("vault capability probe failed; will retry in background", err);
+        return false;
+      })
+      .finally(() => {
+        if (vaultProbeInFlight === probe) vaultProbeInFlight = null;
+      });
+    vaultProbeInFlight = probe;
+    return probe;
+  };
+  void probeVaultCapability();
 
   // Resolve the plaintext upstream API key(s) for this serve session. Two
   // on-disk shapes are supported per provider:
@@ -877,7 +924,10 @@ export async function cmdServe(): Promise<void> {
         if (msg.type === "connected" && "peerId" in msg) {
           const peerId = (msg as { peerId: string }).peerId;
           const announceMsg = `halo-announce:${cfg.operator.address.toLowerCase()}:${peerId}`;
-          try {
+          const sendAnnouncement = async (
+            capability: boolean,
+            promotion: boolean
+          ): Promise<void> => {
             const signature = await wallet.signMessage(announceMsg);
             const providers = configProviders(cfg);
             const announceModels = allConfiguredModels(cfg);
@@ -910,6 +960,13 @@ export async function cmdServe(): Promise<void> {
                   // True when ANY provider speaks the OpenAI wire; per-request
                   // serving still re-checks the model's own provider.
                   streaming: providers.some((p) => wireFormatFor(p.slug) !== "anthropic"),
+                  // Rollout capability marker: the relay routes vault-mode requests
+                  // ONLY to operators that announce on-chain reservation verification —
+                  // there is NO legacy fallback (a vault reservation is bound on-chain
+                  // to a specific operator, so a legacy operator can't honor it). While
+                  // a model has no eligible operator, vault requests for it 503
+                  // (no_vault_operator); non-vault requests are unaffected.
+                  vaultPayments: capability,
                   label: cfg.operator.label,
                   dataRetention: cfg.operator.dataRetention ?? "unknown",
                   encryptionPubkey: encryptionKeys.publicKeyHex,
@@ -919,15 +976,42 @@ export async function cmdServe(): Promise<void> {
                 },
               })
             );
-            console.log(
-              `  ✓ announced as ${abbrevAddr(cfg.operator.address)} (${providers.map((p) => p.slug).join("+")}, ${announceModels.length} models${teeModels.length ? `, ${new Set(teeModels).size} confidential` : ""})`
-            );
-            announced = true;
-            reconnectAttempt = 0;
+            if (promotion) {
+              console.log("  ✓ vault RPC recovered; re-announced vaultPayments capability");
+            } else {
+              console.log(
+                `  ✓ announced as ${abbrevAddr(cfg.operator.address)} (${providers.map((p) => p.slug).join("+")}, ${announceModels.length} models${teeModels.length ? `, ${new Set(teeModels).size} confidential` : ""})`
+              );
+              announced = true;
+              reconnectAttempt = 0;
+            }
+          };
+
+          const initialVaultCapability = vaultPayments;
+          try {
+            await sendAnnouncement(initialVaultCapability, false);
           } catch (err) {
             logError("announce signature failed", err);
             ws.close(4000, "announce sign failed");
             return;
+          }
+          if (!initialVaultCapability) {
+            void (async () => {
+              while (!shuttingDown && !wsClosed) {
+                if (await probeVaultCapability()) {
+                  if (ws.readyState !== WebSocket.OPEN || wsClosed) return;
+                  try {
+                    await sendAnnouncement(true, true);
+                    return;
+                  } catch (err) {
+                    logError("vault capability re-announce failed; will retry", err);
+                  }
+                }
+                await new Promise((resolve) =>
+                  setTimeout(resolve, VAULT_CAPABILITY_RETRY_MS)
+                );
+              }
+            })();
           }
           if (!heartbeatStarted) {
             heartbeatStarted = true;
@@ -1015,22 +1099,32 @@ export async function cmdServe(): Promise<void> {
           }
         }
 
+        const requestedModel =
+          typeof req.body.model === "string" ? req.body.model : allConfiguredModels(cfg)[0] || "unknown";
         // Completion ceiling drives the prompt-blind 402 quote. The consumer
         // sends max_tokens on BOTH the challenge probe and the retry, so this
         // value is identical across the two calls and the quote stays stable.
+        // NB: this feeds the x402/exact quote too, where the consumer pays the
+        // QUOTE (not actual) — so it must stay the raw request budget. The vault
+        // gate applies its own reasoning-headroom ceiling below (#421); it can,
+        // because vault settles ACTUAL (never the quote).
         const estimatedCompletionTokens =
           typeof req.body.max_tokens === "number" ? req.body.max_tokens : 500;
-        const requestedModel =
-          typeof req.body.model === "string" ? req.body.model : allConfiguredModels(cfg)[0] || "unknown";
         let out: { status: number; headers: Record<string, string>; body: unknown };
 
         // Payment-mode detection. Budget mode (Permit2 pre-authorization) and
         // per-request mode (EIP-3009 single-use) coexist; the consumer's
         // x-halo-payment-mode header (default "exact") picks. See
         // docs/BUDGET_MODE.md.
+        // Normalize identically to the relay (trim + lowercase) so a whitespace
+        // variant like "vault " can't fall through to the exact/x402 path after
+        // the relay already routed it as vault. The relay normalizes before
+        // forwarding too; this is defense-in-depth for any non-relay caller.
         const paymentMode = (
-          req.headers["x-halo-payment-mode"] || "exact"
-        ).toLowerCase();
+          (req.headers["x-halo-payment-mode"] as string) || "exact"
+        )
+          .trim()
+          .toLowerCase();
 
         // Confidential (TEE) E2EE request: the consumer encrypted the content to
         // the upstream enclave's key (NEAR). We forward the E2EE headers + the
@@ -1061,7 +1155,7 @@ export async function cmdServe(): Promise<void> {
             // ceiling and hasn't expired — so we never serve value we can't
             // collect. No x402 verify/settle on this path.
             const consumerAddr = (req.headers["x-halo-vault-consumer"] || "").toLowerCase();
-            const fmtUsd = (b: bigint) => `$${(Number(b) / 1e6).toFixed(4)}`;
+            const fmtUsd = (b: bigint) => formatUsdcBase(b, { withDollarSign: true });
             if (!isAddress(consumerAddr)) {
               out = {
                 status: 400,
@@ -1087,11 +1181,28 @@ export async function cmdServe(): Promise<void> {
                 }
               }
               // Cost ceiling = exact prompt tokens + the completion ceiling.
+              // Size the completion ceiling with reasoning headroom (#421): a small
+              // max_tokens does not bound a reasoning model's reasoning tokens, so
+              // gating on max_tokens alone under-prices the ceiling and the operator
+              // undercollects. SHARED with the consumer's reserve sizing
+              // (@halo/vault-core `completionCeilingTokens`) so the reservation covers
+              // this gate price without a reserve-and-replay round trip (invariant
+              // #5/#7). Vault-only: unlike the x402/exact quote above, the vault path
+              // settles ACTUAL (capped to this ceiling), so headroom never overcharges
+              // — it only reserves/locks more (reclaimable). Deterministic in the
+              // request body, so the challenge-probe and retry quotes still match.
+              const vaultCompletionCeiling = completionCeilingTokens(
+                requestedModel,
+                estimatedCompletionTokens,
+                typeof req.body.max_completion_tokens === "number"
+                  ? req.body.max_completion_tokens
+                  : undefined
+              );
               const ceilingCost = await priceRequest({
                 cfg,
                 model: requestedModel,
                 promptTokens: estimatePromptTokens((req.body as { messages?: unknown }).messages),
-                completionTokens: estimatedCompletionTokens,
+                completionTokens: vaultCompletionCeiling,
               });
               let chk: ReservationCheck;
               try {
@@ -1113,7 +1224,7 @@ export async function cmdServe(): Promise<void> {
                       type: "vault_reservation_insufficient",
                       requiredUsdcBase: ceilingCost.toString(),
                       remainingUsdcBase: chk.remaining.toString(),
-                      vault: VAULT_ADDRESS,
+                      vault: getVaultAddress(),
                     },
                   },
                 };
@@ -1248,13 +1359,34 @@ export async function cmdServe(): Promise<void> {
                     body: encryptIfNeeded(upstream.data),
                   };
                 } else {
-                  const actualAmount = await priceRequest({
+                  // Price the actual usage, then cap it to THIS request's gated
+                  // ceiling (issue #421). `ceilingCost` is what the serve gate
+                  // verified against the reservation and what the credit ledger
+                  // reserved as in-flight (`admit`), so capping here keeps
+                  // `settleServed` symmetric with the admission — it never books
+                  // more `served` than was gated. A small `max_tokens` gate never
+                  // bounds a reasoning model's reasoning tokens, so the priced
+                  // actual can exceed the ceiling; awarding the uncapped price would
+                  // over-count the credit ledger and strand a permanent txHash:null
+                  // indexer row (the consumer's cumulative receipt is itself capped
+                  // to locked+redeemed). `ceilingCost <= chk.remaining` (the gate
+                  // required it to admit), so the cap is always collectible on-chain
+                  // too. Mirrors the budget (witnessCap) and x402
+                  // (computeActualAmount) paths, which cap actual settlement to the
+                  // per-request ceiling.
+                  const uncappedAmount = await priceRequest({
                     cfg,
                     model: requestedModel,
                     promptTokens: upstream.usage.prompt_tokens,
                     completionTokens: upstream.usage.completion_tokens,
                     cachedPromptTokens: upstream.usage.cached_prompt_tokens,
                   });
+                  const actualAmount = collectibleServeAmount(uncappedAmount, ceilingCost);
+                  if (uncappedAmount > actualAmount) {
+                    console.warn(
+                      `  ⚠ vault-served at a loss on ${req.requestId}: actual cost ${fmtUsd(uncappedAmount)} (${upstream.usage.completion_tokens} completion tok) exceeds this request's reserved ceiling ${fmtUsd(ceilingCost)}; collecting ${fmtUsd(actualAmount)} — the model's output ran past the reserved headroom for "${requestedModel}" (raise the reservation ceiling for this model)`
+                    );
+                  }
                   // Confidential path: fetch the TEE response signature with the
                   // operator's key and forward it (key never leaves the operator).
                   // Resolve the model's own provider (multi-provider operators).
@@ -1442,7 +1574,7 @@ export async function cmdServe(): Promise<void> {
               // COMPLETION can still push actual over the cap after the fact;
               // that case is logged as a loss at settle time below.)
               const witnessCap = BigInt(budgetPayload.policy.maxPerSettlement);
-              const fmtUsd = (b: bigint) => `$${(Number(b) / 1e6).toFixed(4)}`;
+              const fmtUsd = (b: bigint) => formatUsdcBase(b, { withDollarSign: true });
               const inputFloor = await priceRequest({
                 cfg,
                 model: requestedModel,

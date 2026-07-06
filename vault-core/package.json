@@ -1,0 +1,36 @@
+{
+  "name": "@halo/vault-core",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "./dist/cjs/index.js",
+  "module": "./dist/esm/index.js",
+  "types": "./dist/esm/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/esm/index.d.ts",
+      "import": "./dist/esm/index.js",
+      "require": "./dist/cjs/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "generate": "node scripts/gen-consensus.mjs",
+    "check:consensus": "node scripts/gen-consensus.mjs --check",
+    "build": "npm run check:consensus && tsc -p tsconfig.esm.json && tsc -p tsconfig.cjs.json && node scripts/write-cjs-package.mjs",
+    "typecheck": "npm run check:consensus && tsc -p tsconfig.esm.json --noEmit",
+    "test": "npm run build && node --test test/*.test.cjs",
+    "prepare": "test -d dist || npm run build"
+  },
+  "dependencies": {
+    "ethers": "6.17.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

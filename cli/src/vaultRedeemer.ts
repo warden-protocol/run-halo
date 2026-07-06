@@ -18,6 +18,9 @@
  * Off the serve path entirely — the answer never waits on this.
  */
 import { VaultCreditLedger } from "./vaultCredit";
+import { classifyRedeemError, formatUsdcBase } from "@halo/vault-core";
+
+export { classifyRedeemError } from "@halo/vault-core";
 
 const REDEEM_ATTEMPTS = 4;
 const REDEEM_BACKOFF_MS = 750;
@@ -153,14 +156,8 @@ export class OperatorRedeemer {
  *  kick / 30s sweep re-attempts, and the credit window stays full until it
  *  collects. Retrying a genuinely-stale receipt only wastes RPC; dropping a
  *  collectible one loses money — so we fail toward retry. */
-export function classifyRedeemError(err: string): "collected" | "uncollectable" | "transient" {
-  if (/StaleReceipt|ExceedsReservation/i.test(err)) return "collected";
-  if (/BadSignature|NoSessionKey|does not recover/i.test(err)) return "uncollectable";
-  return "transient";
-}
-
 function fmtUsd(base: bigint): string {
-  return `$${(Number(base) / 1_000_000).toFixed(4)}`;
+  return formatUsdcBase(base, { withDollarSign: true });
 }
 function abbrev(addr: string): string {
   return `${addr.slice(0, 6)}…${addr.slice(-4)}`;
