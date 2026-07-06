@@ -26,6 +26,12 @@ echo "  cloning halo…"
 git clone --depth 1 https://github.com/warden-protocol/run-halo.git "$TMP"
 
 echo "  building CLI…"
+# The CLI bundles two local workspace packages (@halo/vault-core, halo-sdk).
+# Build them in dependency order first: each needs its own deps installed
+# before its prepare/build runs, which a bare `npm install` in cli/ can't do
+# (npm runs a file: dep's prepare before installing that dep's dependencies).
+( cd "$TMP/vault-core" && npm install --silent && npm run build --silent )
+( cd "$TMP/sdk"        && npm install --silent && npm run build --silent )
 cd "$TMP/cli"
 npm install --silent
 npm run build --silent
