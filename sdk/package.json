@@ -14,9 +14,12 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test test/*.test.js",
+    "prepare": "test -d dist || npm run build",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
+    "@halo/vault-core": "file:../vault-core",
     "ethers": "6.17.0"
   },
   "devDependencies": {

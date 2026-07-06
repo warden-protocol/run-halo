@@ -14,30 +14,49 @@
  * it must match the consumer + facilitator); RPC from BASE_RPC_URL (falls back to
  * the public Base endpoint).
  */
-import { Contract, JsonRpcProvider, TypedDataDomain, verifyTypedData } from "ethers";
-import { VAULT_ADDRESS } from "./vault-address";
+import { Contract, JsonRpcProvider, verifyTypedData } from "ethers";
+import {
+  RECEIPT_TYPES,
+  VAULT_ABI,
+  VAULT_ADDRESS,
+  vaultDomain,
+} from "@halo/vault-core";
 
 // Re-export so existing `import { VAULT_ADDRESS } from "../vault"` keeps working.
-export { VAULT_ADDRESS };
+export { VAULT_ADDRESS } from "@halo/vault-core";
 const RPC_URL = (process.env.BASE_RPC_URL || "https://mainnet.base.org").trim();
 
-const VAULT_ABI = [
-  "function ops(address,address) view returns (uint256 locked,uint256 redeemed,uint64 expiry,uint64 created,uint64 cycle)",
-  "function sessionKey(address) view returns (address)",
-  "function keyEpoch(address) view returns (uint256)",
-];
+// Active vault address for THIS process. Defaults to the consensus-pinned
+// VAULT_ADDRESS; an operator may override it once at startup from config
+// (`cfg.vaultAddress`) to gate against a non-prod deployment (e.g. a dev vault
+// on the same chain). Config-only, never env — see vault-address.ts for why a
+// per-process knob is a footgun. A mismatch between the operator's vault and the
+// consumer's silently rejects every request, so the override fails loudly on a
+// malformed address rather than falling back silently.
+let activeVault: string = VAULT_ADDRESS;
 
-// EIP-712 (MUST match HaloVault.sol + the consumer's vault-consume.ts byte for
-// byte, or a valid receipt fails to recover and the operator drops real money).
-const RECEIPT_TYPES = {
-  Receipt: [
-    { name: "consumer", type: "address" },
-    { name: "operator", type: "address" },
-    { name: "cumulative", type: "uint256" },
-    { name: "keyEpoch", type: "uint256" },
-    { name: "cycle", type: "uint64" },
-  ],
-};
+/** The vault address this process reads and verifies receipts against. */
+export function getVaultAddress(): string {
+  return activeVault;
+}
+
+/**
+ * Override the active vault address from config. Absent/empty → keep the pinned
+ * default. Throws on a malformed address so a typo aborts startup instead of
+ * splitting the network across two vaults.
+ */
+export function setActiveVaultAddress(addr?: string | null): void {
+  if (!addr) {
+    activeVault = VAULT_ADDRESS;
+    return;
+  }
+  if (!/^0x[0-9a-fA-F]{40}$/.test(addr)) {
+    throw new Error(
+      `invalid vaultAddress in config: "${addr}" (must be a 20-byte 0x hex address)`
+    );
+  }
+  activeVault = addr;
+}
 
 let provider: JsonRpcProvider | null = null;
 function rpc(): JsonRpcProvider {
@@ -74,7 +93,7 @@ export interface Reservation {
 }
 
 async function readReservationOnce(consumer: string, operator: string): Promise<Reservation> {
-  const c = new Contract(VAULT_ADDRESS, VAULT_ABI, rpc());
+  const c = new Contract(activeVault, VAULT_ABI, rpc());
   const r = await c.ops(consumer, operator);
   const locked = BigInt(r.locked ?? r[0]);
   const redeemed = BigInt(r.redeemed ?? r[1]);
@@ -159,6 +178,37 @@ export async function checkReservation(
 ): Promise<ReservationCheck> {
   const r = await readReservation(consumer, operator);
   return evaluate(r, requiredBase, nowSec);
+}
+
+/**
+ * Cap a served amount to THIS request's gated ceiling (issue #421). `ceilingBase`
+ * is the per-request cost ceiling the serve gate verified against the on-chain
+ * reservation and that the credit ledger reserved as in-flight (`admit`). The gate
+ * guarantees `ceilingBase <= remaining` (`remaining` == `locked`, already net of
+ * redemptions), so a capped amount is always collectible on-chain AND keeps
+ * `settleServed(ceiling, actual)` symmetric with the admission — it never books
+ * more `served` than was gated (which would break the credit-window bound,
+ * invariant #9).
+ *
+ * Why the vault serve path needs this: it prices the ACTUAL usage after serving,
+ * and reasoning models emit reasoning tokens that a small `max_tokens` ceiling
+ * never bounded — so the priced actual can land far ABOVE the ceiling. The
+ * consumer's cumulative receipt is itself capped to `locked + redeemed`
+ * (`advanceCumulativeReceipt`), so an operator that reports/awards the uncapped
+ * price credits itself value it can never redeem: the credit ledger over-counts
+ * `served`, and the indexer row is stranded `txHash: null` forever once the cycle
+ * closes (the reconciler only stamps a serve once on-chain `redeemed` covers it).
+ * Capping here keeps the operator's accounting honest and mirrors the budget/x402
+ * paths, which cap actual settlement to the per-request ceiling
+ * (`x402-server.ts` `computeActualAmount`; budget-mode `witnessCap`). It does NOT
+ * recover the burned compute — sizing the reserve + gate ceiling to cover
+ * reasoning tokens (so `actual <= ceiling` by construction) is the separate fix.
+ */
+export function collectibleServeAmount(actualBase: bigint, ceilingBase: bigint): bigint {
+  if (actualBase < 0n || ceilingBase < 0n) {
+    throw new Error("collectibleServeAmount: amounts must be non-negative");
+  }
+  return actualBase < ceilingBase ? actualBase : ceilingBase;
 }
 
 // ── Gate cache ───────────────────────────────────────────────────────────────
@@ -262,10 +312,6 @@ async function chainId(): Promise<bigint> {
   return chainIdCache;
 }
 
-function vaultDomain(id: bigint): TypedDataDomain {
-  return { name: "Halo", version: "2", chainId: id, verifyingContract: VAULT_ADDRESS };
-}
-
 // Session key + keyEpoch change only on an explicit rotation, so a short cache
 // keeps receipt verification off the per-receipt RPC path without trusting stale
 // data across a rotation.
@@ -277,7 +323,7 @@ async function readConsumerKey(consumer: string): Promise<KeyEntry> {
   const k = consumer.toLowerCase();
   const cached = keyCache.get(k);
   if (cached && Date.now() - cached.at < KEY_CACHE_TTL_MS) return cached;
-  const c = new Contract(VAULT_ADDRESS, VAULT_ABI, rpc());
+  const c = new Contract(activeVault, VAULT_ABI, rpc());
   const [sk, ep] = await withTimeout(
     Promise.all([c.sessionKey(consumer), c.keyEpoch(consumer)]),
     READ_TIMEOUT_MS,
@@ -309,7 +355,7 @@ export function recoverReceiptSigner(
 ): string | null {
   try {
     return verifyTypedData(
-      vaultDomain(chainIdValue),
+      vaultDomain(chainIdValue, activeVault),
       RECEIPT_TYPES,
       {
         consumer: p.consumer,

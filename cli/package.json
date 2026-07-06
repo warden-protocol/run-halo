@@ -14,10 +14,11 @@
     "access": "public"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "esbuild src/index.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/index.js --external:ethers --external:ws --external:undici --external:prompts --external:dotenv --external:@noble/curves --external:@noble/hashes --external:nearai-cloud-verifier",
     "start": "node dist/index.js",
     "dev": "ts-node src/index.ts",
     "typecheck": "tsc --noEmit",
+    "test": "node --require ts-node/register --test src/vaultAdversarial.test.ts src/vaultConsumeRetry.test.ts src/vaultCredit.test.ts src/vaultRedeemDurable.test.ts src/vaultRedeemRetry.test.ts src/vaultRedeemer.test.ts src/vaultReserve.test.ts src/vaultServeCap.test.ts",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
@@ -27,13 +28,16 @@
     "ethers": "6.17.0",
     "nearai-cloud-verifier": "0.0.1-alpha.1",
     "prompts": "2.4.2",
-    "undici": "^6.21.0",
+    "undici": "^8.5.0",
     "ws": "8.21.0"
   },
   "devDependencies": {
+    "@halo/vault-core": "file:../vault-core",
     "@types/node": "^20.0.0",
     "@types/prompts": "^2.4.9",
     "@types/ws": "^8.5.12",
+    "esbuild": "^0.24.0",
+    "halo-sdk": "file:../sdk",
     "ts-node": "^10.9.2",
     "typescript": "^5.5.0"
   },

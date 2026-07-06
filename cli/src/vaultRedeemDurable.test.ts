@@ -37,14 +37,19 @@ function mockFacilitator(handler: (n: number) => { status: number; body: unknown
   );
 }
 
-const client = (facUrl: string, store: string) =>
-  new VaultConsumeClient(Wallet.createRandom(), {
+const client = (facUrl: string, store: string) => {
+  const c = new VaultConsumeClient(Wallet.createRandom(), {
     facilitatorUrl: facUrl,
     rpcUrl: "http://127.0.0.1:1",
     chainId: 8453,
     relayUrl: "",
     pendingStorePath: store,
   });
+  // Stale-cycle guard reads on-chain ops() before posting; no live RPC here, so
+  // return current-cycle state (no-op guard) and drive drops via the facilitator.
+  c.readOps = async () => OPS;
+  return c;
+};
 
 test("a pending redeem persists to disk and a fresh client resumes + settles it", async () => {
   const store = path.join(os.tmpdir(), `halo-pending-${process.pid}-${Date.now()}.json`);
@@ -96,6 +101,7 @@ test("no store path → in-memory only, no file written (back-compat)", async ()
       relayUrl: "",
       // no pendingStorePath
     });
+    c.readOps = async () => OPS; // no-op stale-cycle guard (no live RPC)
     c.recordAndRedeem(OP, OPS, 0n, 1_000n);
     await c.flushRedeems();
     assert.equal(c.pendingRedeemCount, 1, "still retries in memory");

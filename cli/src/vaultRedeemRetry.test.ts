@@ -42,14 +42,19 @@ function mockFacilitator(handler: (n: number) => { status: number; body: unknown
 }
 
 function client(facUrl: string): VaultConsumeClient {
-  // relayUrl "" → pushReceipt returns false instantly (no relay); rpcUrl unused
-  // on the redeem path. A random wallet signs real EIP-712 receipts.
-  return new VaultConsumeClient(Wallet.createRandom(), {
+  // relayUrl "" → pushReceipt returns false instantly (no relay). A random wallet
+  // signs real EIP-712 receipts.
+  const c = new VaultConsumeClient(Wallet.createRandom(), {
     facilitatorUrl: facUrl,
     rpcUrl: "http://127.0.0.1:1",
     chainId: 8453,
     relayUrl: "",
   });
+  // The stale-cycle guard in attemptRedeem reads on-chain ops() before posting;
+  // there's no live RPC here, so return current-cycle state to make it a no-op
+  // and let each test drive abandonment via the facilitator's response.
+  c.readOps = async () => OPS;
+  return c;
 }
 
 test("a successful redeem clears the pending receipt", async () => {

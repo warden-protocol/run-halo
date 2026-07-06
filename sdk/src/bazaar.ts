@@ -201,8 +201,15 @@ export function pickAccept(
 }
 
 export interface X402JsonResult<T> {
-  /** Parsed JSON (or raw text cast to T) from the resource, or null. */
+  /** Parsed JSON (or raw text cast to T) from the resource on a 2xx, else null.
+   *  Deliberately null on any non-2xx so a caller can't mistake a payment-gate/error
+   *  body for a successful resource result — inspect `status`/`paid` for those. */
   data: T | null;
+  /** Parsed body (JSON, or raw text) of a NON-2xx response, for diagnostics — e.g. a
+   *  relay's `vault_payment_required` or a `{error:"unknown model"}`. Kept separate
+   *  from `data` (which stays null on errors) so an error body is never read as a
+   *  success. undefined on a 2xx or when the body couldn't be parsed. */
+  errorBody?: unknown;
   /** True only when a payment was made and the retry succeeded. */
   paid: boolean;
   /** Amount charged, in USDC base units (from the live 402). */
@@ -229,20 +236,30 @@ export async function callX402Json<T = unknown>(
     options
   );
 
+  // Only a 2xx body is the resource result. An un-payable 402 (e.g. a relay vault
+  // gate's `vault_payment_required`) or any other HTTP error now comes back from
+  // fetchWithX402 as a normal Response rather than a throw; surfacing its error
+  // body as `data` would let a caller that reads `data` and ignores `status`/`paid`
+  // mistake a payment-gate error for a successful result. Leave `data` null on
+  // non-2xx — but still parse the body into `errorBody` so a caller CAN explain the
+  // failure (an agent tool reporting "unknown model" / "no vault operator") instead
+  // of being left with only a bare status code.
   let data: T | null = null;
+  let errorBody: unknown;
   const contentType = response.headers.get("content-type") ?? "";
   try {
-    if (contentType.includes("application/json")) {
-      data = (await response.json()) as T;
-    } else {
-      data = (await response.text()) as unknown as T;
-    }
+    const parsed = contentType.includes("application/json")
+      ? await response.json()
+      : await response.text();
+    if (response.ok) data = parsed as T;
+    else errorBody = parsed;
   } catch {
-    data = null;
+    /* unparseable body — leave both unset */
   }
 
   return {
     data,
+    errorBody,
     paid,
     paymentAmount,
     status: response.status,

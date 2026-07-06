@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import path from "path";
 import type { EncryptedSecret } from "./secret";
+import { matchesModel } from "@halo/vault-core";
 
 /**
  * One upstream inference provider an operator fronts. A single operator may
@@ -99,6 +100,14 @@ export interface HaloConfig {
     failoverUrls?: string[];
   };
   /**
+   * Optional override for the HaloVault contract address this operator gates
+   * against. Absent → the consensus-pinned VAULT_ADDRESS (production). Set this
+   * ONLY to point at a non-prod deployment (e.g. a dev vault) whose facilitator
+   * and consumers use the same address — it MUST match, or every vault request
+   * is rejected. Deliberately config-only (never an env flag): see vault-address.ts.
+   */
+  vaultAddress?: string;
+  /**
    * Optional consumer profile: persisted defaults for `halo consume` (the local
    * OpenAI-compatible endpoint that pays per request from this wallet). Set by
    * `halo setup` when the user opts to consume; absent when they only operate.
@@ -166,7 +175,7 @@ export function configProviders(cfg: HaloConfig): ProviderConfig[] {
 export function providerForModel(providers: ProviderConfig[], model: string): ProviderConfig {
   return (
     providers.find((p) => p.models.includes(model)) ||
-    providers.find((p) => p.models.some((m) => m.includes(model) || model.includes(m))) ||
+    providers.find((p) => p.models.some((advertised) => matchesModel(advertised, model))) ||
     providers[0]
   );
 }

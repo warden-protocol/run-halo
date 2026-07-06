@@ -136,6 +136,14 @@ export function encodePaymentSignature(payload: X402PaymentPayload): string {
  *
  * Returns paid=true only when the retry succeeds. HTTP errors from the retry
  * are surfaced as a normal Response so the caller can inspect them.
+ *
+ * CONTRACT (changed in #384 — breaking for callers written against the older
+ * behavior): a `402` WITHOUT a `PAYMENT-REQUIRED` header — e.g. the relay's
+ * `vault_payment_required` gate — is NOT an x402 challenge this client can pay, so it
+ * now RESOLVES as `{ response, paid: false }` instead of throwing. Callers MUST inspect
+ * `response.ok` / `response.status` (and `paid`) and must not assume a resolved result
+ * means success; the resolved `response.body` may be a payment-gate error envelope.
+ * (An `onPaymentRequired` that returns false still throws "Payment declined by caller".)
  */
 export async function fetchWithX402(
   input: string | URL,
@@ -150,7 +158,11 @@ export async function fetchWithX402(
 
   const header = first.headers.get("PAYMENT-REQUIRED");
   if (!header) {
-    throw new Error("402 received without PAYMENT-REQUIRED header");
+    // A 402 without a PAYMENT-REQUIRED header isn't an x402 challenge we can pay
+    // (e.g. a relay vault gate's `vault_payment_required`). Per this function's
+    // contract, surface it as a normal Response — paid=false, body intact — so
+    // the caller can inspect the status/body instead of getting an opaque throw.
+    return { response: first, paid: false };
   }
 
   // Drain so the underlying connection can be reused.
