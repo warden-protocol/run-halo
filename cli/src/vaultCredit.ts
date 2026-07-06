@@ -12,12 +12,22 @@
  * This module is that bound: a per-(consumer, operator) credit window, tracked
  * for the CURRENT reservation cycle.
  *
- *   outstanding = served + inflight − max(heldReceiptCumulative, redeemed)
+ *   outstanding = served + inflight − min(max(held, redeemed), collectable)
  *
- *   - `served`   cumulative ACTUAL cost the operator has served this cycle
- *   - `inflight` sum of the CEILINGS of admitted-but-not-yet-settled requests
- *                (pessimistic: reserved at admit, trued-up to actual on settle)
- *   - `held`     highest receipt cumulative the operator holds for this cycle
+ *   - `served`      cumulative ACTUAL cost the operator has served this cycle
+ *   - `inflight`    sum of the CEILINGS of admitted-but-not-yet-settled requests
+ *                   (pessimistic: reserved at admit, trued-up to actual on settle)
+ *   - `held`        highest receipt cumulative the operator holds for this cycle
+ *   - `collectable` the on-chain redeem ceiling this cycle = `redeemed + locked`
+ *                   (the MOST a receipt can ever redeem — `redeem` pays
+ *                   `cumulative − redeemed`, clamped to `locked`). Coverage —
+ *                   whether from `held` or from a cumulative the redeem driver
+ *                   marked `redeemed` — frees the window only up to this ceiling:
+ *                   cumulative beyond it reverts on `redeem` (ExceedsReservation
+ *                   tail) and is UN-collectable, so it must NOT count as coverage
+ *                   or the operator over-serves work it can never collect (issue
+ *                   #437). Mirrors the consumer's own receipt cap (@halo/vault-core
+ *                   `advanceCumulativeReceipt`, ceiling = `locked + redeemed`).
  *
  * Credit-window bound (issue #369; single-request rule relaxed in #395): the
  * window caps the ACCUMULATION of un-receipted work across requests — NOT the
@@ -41,11 +51,13 @@
  * lock needed, and no window undercount.
  *
  * Receipts are cumulative + monotonic per cycle, so one receipt covering
- * cumulative R makes the operator whole for everything up to R regardless of the
- * order requests completed in (addition commutes). A reservation top-up keeps the
- * same cycle (HaloVault.reserve only bumps cycle from locked==0), so a held
- * receipt stays valid across a burst; only a fresh generation (cycle++) resets
- * this ledger.
+ * cumulative R makes the operator whole for everything up to min(R, collectable)
+ * regardless of the order requests completed in (addition commutes) — the tail of
+ * R above the on-chain reservation is uncollectable and does not count (#437). A
+ * reservation top-up keeps the same cycle (HaloVault.reserve only bumps cycle from
+ * locked==0) and RAISES `collectable`, so a held receipt stays valid across a
+ * burst and a previously-uncollectable tail becomes redeemable once the consumer
+ * tops up; only a fresh generation (cycle++) resets this ledger.
  *
  * In-memory + per-process: the operator's exposure is its own runtime state. A
  * restart seeds the ledger from the on-chain `redeemed` counter before admitting
@@ -73,6 +85,13 @@ interface Entry {
   receipt: HeldReceipt | null;
   /** Highest cumulative we've CONFIRMED redeemed on-chain (this cycle). */
   redeemed: bigint;
+  /** On-chain collectable ceiling this cycle = `redeemed + locked` (the highest
+   *  cumulative a receipt can ever redeem). Monotonic non-decreasing within a
+   *  cycle (grows only on a consumer top-up); caps how much a held receipt frees
+   *  the credit window (#437). `-1` until the first on-chain read has been synced,
+   *  meaning "ceiling unknown → don't cap" (a fresh read via syncOnchain always
+   *  precedes admission on the serve path, so coverage is bounded when it matters). */
+  ceiling: bigint;
 }
 
 export interface AdmitResult {
@@ -103,7 +122,7 @@ export class VaultCreditLedger {
     const k = key(consumer, operator);
     let e = this.entries.get(k);
     if (!e) {
-      e = { cycle, served: 0n, inflight: 0n, held: 0n, receipt: null, redeemed: 0n };
+      e = { cycle, served: 0n, inflight: 0n, held: 0n, receipt: null, redeemed: 0n, ceiling: -1n };
       this.entries.set(k, e);
       return e;
     }
@@ -114,23 +133,54 @@ export class VaultCreditLedger {
       e.held = 0n;
       e.receipt = null;
       e.redeemed = 0n;
+      // A fresh generation has its own on-chain reservation; the prior cycle's
+      // collectable ceiling is meaningless here. Reset to "unknown" until the
+      // next syncOnchain reads this cycle's redeemed + locked.
+      e.ceiling = -1n;
     }
     return e;
   }
 
   private static outstanding(e: Entry): bigint {
-    const covered = e.held > e.redeemed ? e.held : e.redeemed;
+    // Coverage = the highest cumulative the operator holds a receipt for OR has
+    // confirmed redeemed — but it can NEVER exceed what is collectable on-chain this
+    // cycle. `redeem` pays `cumulative − redeemed` clamped to `locked`, so the
+    // ceiling `redeemed + locked` is the hard cap on how much a receipt makes the
+    // operator whole. `held` can run past it (a receipt signed beyond the
+    // reservation); that uncollectable tail must NOT free the window or the operator
+    // over-serves work it can never collect (issue #437). So cap the final coverage
+    // at `ceiling`. (`redeemed` is kept ≤ ceiling by noteRedeemed, so it's the `held`
+    // term the cap actually bites.) `ceiling < 0` means no chain read yet → leave
+    // uncapped (a fresh read precedes admission on the serve path, so coverage is
+    // bounded whenever it gates).
+    let covered = e.held > e.redeemed ? e.held : e.redeemed;
+    if (e.ceiling >= 0n && covered > e.ceiling) covered = e.ceiling;
     const o = e.served + e.inflight - covered;
     return o > 0n ? o : 0n;
   }
 
-  /** Synchronize the durable cumulative baseline read from `ops()`. This must
-   * run before admission. Both values are monotonic within a cycle. */
-  syncOnchain(consumer: string, operator: string, cycle: bigint, redeemed: bigint): void {
+  /** Synchronize the durable on-chain baseline read from `ops()`: `redeemed` (the
+   * cumulative captured this cycle) and `locked` (reserved-and-unredeemed funds).
+   * This must run before admission. `redeemed` is monotonic within a cycle; the
+   * collectable ceiling `redeemed + locked` is too (it grows only on a top-up), so
+   * both are tracked as running maxima and a stale/cached read can never lower them. */
+  syncOnchain(
+    consumer: string,
+    operator: string,
+    cycle: bigint,
+    redeemed: bigint,
+    locked: bigint
+  ): void {
     const e = this.entryFor(consumer, operator, cycle);
     if (cycle < e.cycle) return;
     if (redeemed > e.redeemed) e.redeemed = redeemed;
     if (redeemed > e.served) e.served = redeemed;
+    // Collectable ceiling = the most a receipt can ever redeem this cycle. Take the
+    // max observed so a lagging cached read (whose `locked` is discounted by serving
+    // since the read) never shrinks a ceiling a fresher read already established; a
+    // genuine top-up raises `locked` and lifts it on the next read (#437).
+    const ceiling = redeemed + locked;
+    if (ceiling > e.ceiling) e.ceiling = ceiling;
   }
 
   /**
@@ -245,16 +295,37 @@ export class VaultCreditLedger {
     return true;
   }
 
+  /** How much of the held receipt is collectable on-chain RIGHT NOW: its cumulative
+   *  capped at the ceiling (`redeem` clamps `pay` to `locked`). Compared against
+   *  `redeemed`, a positive gap means there's value to submit; zero means fully
+   *  collected OR the ceiling is currently exhausted. Ceiling unknown (`< 0`, no
+   *  chain read yet) ⇒ assume the full cumulative is collectable (legacy behavior). */
+  private static collectableCumulative(e: Entry): bigint {
+    if (!e.receipt) return 0n;
+    return e.ceiling >= 0n && e.held > e.ceiling ? e.ceiling : e.held;
+  }
+
   /** The receipt the redeem driver should submit next: the highest held one that
-   *  hasn't been confirmed redeemed on-chain yet. Null when nothing is owed. */
+   *  still has collectable headroom on-chain (cumulative, capped at the ceiling,
+   *  exceeds what's redeemed). Null when nothing is collectable right now — which
+   *  retires a fully-collected OR ceiling-clamped receipt so the sweep doesn't spin
+   *  resubmitting it (each resubmit would revert ExceedsReservation), yet
+   *  REACTIVATES it if a same-cycle top-up later lifts the ceiling (issue #437). */
   redeemable(consumer: string, operator: string): HeldReceipt | null {
     const e = this.entries.get(key(consumer, operator));
     if (!e || !e.receipt) return null;
-    return e.receipt.cumulative > e.redeemed ? e.receipt : null;
+    return VaultCreditLedger.collectableCumulative(e) > e.redeemed ? e.receipt : null;
   }
 
-  /** Mark a cumulative as confirmed redeemed on-chain (idempotent, monotonic),
-   *  so the redeem driver won't resubmit an already-settled receipt. */
+  /** Record a redeem the driver submitted (idempotent, monotonic per cycle). The
+   *  driver passes the receipt's FULL cumulative, but an over-ceiling receipt only
+   *  captured up to `locked` on-chain, so the TRUE on-chain `redeemed` advanced only
+   *  to min(cumulative, ceiling). Store that ACTUAL collected amount — not the full
+   *  cumulative — so (a) coverage reflects real collection and (b) `redeemable`
+   *  re-exposes the tail if a same-cycle top-up later lifts the ceiling (issue #437's
+   *  recoverable path: reserve() more → held receipt becomes collectable again →
+   *  rows back-fill), instead of the receipt being permanently retired. `redeemable`
+   *  gates resubmission on collectable headroom, so capping here never spins. */
   noteRedeemed(consumer: string, operator: string, cumulative: bigint, cycle: bigint): void {
     const e = this.entryFor(consumer, operator, cycle);
     // Stale-cycle guard: a delayed redeem (or a StaleReceipt/uncollectable
@@ -264,15 +335,22 @@ export class VaultCreditLedger {
     // the window of un-receipted work this cycle. The old cumulative doesn't
     // authorize current-cycle work on-chain anyway.
     if (cycle < e.cycle) return;
-    if (cumulative > e.redeemed) e.redeemed = cumulative;
+    // On-chain a redeem captures min(cumulative, ceiling) − redeemed (pay clamped to
+    // locked), so `redeemed` advances to at most the collectable ceiling. Keeping it
+    // ≤ ceiling (rather than the full cumulative) is what lets a later top-up
+    // reactivate the still-uncollected tail via redeemable() (#437).
+    const collected = e.ceiling >= 0n && cumulative > e.ceiling ? e.ceiling : cumulative;
+    if (collected > e.redeemed) e.redeemed = collected;
   }
 
-  /** Every (consumer, operator) pair that still holds a receipt not yet confirmed
-   *  redeemed on-chain — drives the periodic redeem sweep. */
+  /** Every (consumer, operator) pair whose held receipt still has collectable
+   *  headroom on-chain — drives the periodic redeem sweep. Uses the same
+   *  ceiling-aware test as `redeemable`, so a receipt clamped by the ceiling drops
+   *  out (no sweep spin) and re-appears once a top-up lifts the ceiling (#437). */
   pairsWithRedeemable(): Array<{ consumer: string; operator: string }> {
     const out: Array<{ consumer: string; operator: string }> = [];
     for (const [k, e] of this.entries) {
-      if (e.receipt && e.receipt.cumulative > e.redeemed) {
+      if (e.receipt && VaultCreditLedger.collectableCumulative(e) > e.redeemed) {
         const [consumer, operator] = k.split(":");
         out.push({ consumer, operator });
       }
@@ -286,13 +364,17 @@ export class VaultCreditLedger {
     return e ? VaultCreditLedger.outstanding(e) : 0n;
   }
 
-  /** Snapshot for logging/metrics. */
+  /** Snapshot for logging/metrics. `ceiling` is the on-chain collectable cap
+   *  (`redeemed + locked`, or `-1` before the first read); `held` above it is
+   *  uncollectable float — the exact quantity issue #437 had to reconstruct by
+   *  hand from a null-txHash trace. */
   snapshot(consumer: string, operator: string): {
     cycle: bigint;
     served: bigint;
     inflight: bigint;
     held: bigint;
     redeemed: bigint;
+    ceiling: bigint;
     outstanding: bigint;
   } | null {
     const e = this.entries.get(key(consumer, operator));
@@ -303,6 +385,7 @@ export class VaultCreditLedger {
       inflight: e.inflight,
       held: e.held,
       redeemed: e.redeemed,
+      ceiling: e.ceiling,
       outstanding: VaultCreditLedger.outstanding(e),
     };
   }

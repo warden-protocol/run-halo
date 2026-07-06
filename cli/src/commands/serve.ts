@@ -770,6 +770,11 @@ export async function cmdServe(): Promise<void> {
       console.warn(`  ⚠ rejecting vault receipt from ${abbrevAddr(consumer)}: ${v.reason}`);
       return false;
     }
+    // Seed the collectable ceiling from this FRESH (uncached) on-chain read before
+    // recording, so a receipt whose cumulative runs past the reservation frees the
+    // credit window only up to what it can actually redeem (`redeemed + locked`),
+    // never the uncollectable tail (#437).
+    creditLedger.syncOnchain(consumer, cfg.operator.address, v.cycle, v.redeemed, v.locked);
     if (creditLedger.recordReceipt(consumer, cfg.operator.address, { cumulative, signature, cycle: v.cycle })) {
       redeemer.kick(consumer, cfg.operator.address);
     }
@@ -1240,8 +1245,10 @@ export async function cmdServe(): Promise<void> {
                 const creditWindow = (): bigint =>
                   creditWindowBase() < chk.remaining ? creditWindowBase() : chk.remaining;
                 // Align process-local cumulative accounting with the durable
-                // on-chain baseline before the synchronous admission check.
-                creditLedger.syncOnchain(consumerAddr, cfg.operator.address, chk.cycle, chk.redeemed);
+                // on-chain baseline before the synchronous admission check —
+                // `redeemed` and `locked` (== chk.remaining) together bound the
+                // collectable ceiling a held receipt may free the window to (#437).
+                creditLedger.syncOnchain(consumerAddr, cfg.operator.address, chk.cycle, chk.redeemed, chk.remaining);
                 creditAdmit = creditLedger.admit(
                   consumerAddr,
                   cfg.operator.address,
@@ -1263,7 +1270,7 @@ export async function cmdServe(): Promise<void> {
                     chk = { ok: false, reason: "could not refresh on-chain reservation", remaining: 0n, cycle: 0n, redeemed: 0n };
                   }
                   if (chk.ok) {
-                    creditLedger.syncOnchain(consumerAddr, cfg.operator.address, chk.cycle, chk.redeemed);
+                    creditLedger.syncOnchain(consumerAddr, cfg.operator.address, chk.cycle, chk.redeemed, chk.remaining);
                     creditAdmit = creditLedger.admit(
                       consumerAddr,
                       cfg.operator.address,

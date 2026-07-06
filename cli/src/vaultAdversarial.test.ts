@@ -110,14 +110,18 @@ test("GHOST: operator refuses to serve past the window with no receipts, resumes
   assert.equal(l.admit(C, OP, 1n, 1000n, W).ok, true);
 });
 
-test("BOUND: even a huge (over-signed) receipt only grants its own worth of room", () => {
+test("BOUND: a huge but COLLECTABLE over-signed receipt only grants its own worth of room", () => {
   const C = "0x1111111111111111111111111111111111111111";
   const W = 1000n;
   const l = new VaultCreditLedger();
-  // Consumer over-signs cumulative = 10×W (it's their own authorization to pay).
+  // Consumer has 10×W reserved-and-collectable on-chain this cycle, and over-signs
+  // cumulative = 10×W (prepaying within its own reservation — its authorization to
+  // pay). Because the receipt is WITHIN the collectable ceiling, every unit really
+  // is backed, so worst-case uncollected stays ≤ W. (A receipt PAST the ceiling is
+  // the operator-bleed case guarded separately — see the #437 BLEED test.)
+  l.syncOnchain(C, OP, 1n, 0n, 10_000n); // redeemed 0, locked 10000 → ceiling 10000
   l.recordReceipt(C, OP, { cumulative: 10_000n, signature: "0xsig", cycle: 1n });
-  // The operator can now serve up to held + W before refusing — and every unit
-  // is backed by the consumer's signature, so worst-case uncollected stays ≤ W.
+  // The operator can now serve up to held + W before refusing.
   let served = 0n;
   while (l.admit(C, OP, 1n, 100n, W).ok) {
     l.settleServed(C, OP, 1n, 100n, 100n);
@@ -126,6 +130,31 @@ test("BOUND: even a huge (over-signed) receipt only grants its own worth of room
   }
   assert.equal(served, 11_000n, "served up to held(10000) + W(1000), then refused");
   assert.ok(l.outstandingFor(C, OP) <= W, "un-receipted exposure never exceeds W");
+});
+
+test("BLEED (#437): a receipt PAST the collectable ceiling can't unlock unbounded serving", () => {
+  // The mirror of the BOUND test: here the consumer signs a huge cumulative it has
+  // NOT reserved (locked is only 1×W this cycle). Coverage is capped at the ceiling,
+  // so the over-ceiling receipt does NOT reopen the window — the operator serves at
+  // most one window past what's collectable, not the receipt's full (fictional) worth.
+  const C = "0x1111111111111111111111111111111111111111";
+  const W = 1000n;
+  const l = new VaultCreditLedger();
+  l.syncOnchain(C, OP, 1n, 0n, 1000n); // only 1000 collectable this cycle (ceiling 1000)
+  // Consumer over-signs 10× what it reserved. Pre-#437 this masked the tail and the
+  // loop below would run to ~11000; with the ceiling cap it can't.
+  l.recordReceipt(C, OP, { cumulative: 10_000n, signature: "0xsig", cycle: 1n });
+  let served = 0n;
+  while (l.admit(C, OP, 1n, 100n, W).ok) {
+    l.settleServed(C, OP, 1n, 100n, 100n);
+    served += 100n;
+    if (served > 20_000n) break; // safety
+  }
+  // Coverage is pinned at the 1000 ceiling, so serving stops one window past it —
+  // NOT at held(10000) + W. The uncollectable float never exceeds the window.
+  assert.equal(served, 2_000n, "served only ceiling(1000) + W(1000), then refused — no bleed to 11000");
+  assert.ok(l.outstandingFor(C, OP) <= W, "uncollectable exposure stays bounded by the window");
+  assert.equal(l.snapshot(C, OP)!.held, 10_000n, "the receipt is still kept for redeem (collects the 1000 ceiling)");
 });
 
 // ── Facilitator failure handling ─────────────────────────────────────────────
