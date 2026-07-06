@@ -80,7 +80,7 @@ test("capped serve keeps the credit ledger symmetric with the admission (and wou
   // WITH the cap (the fix): settleServed books only the gated ceiling as `served`,
   // so outstanding never exceeds what admit reserved (or the on-chain reservation).
   const withCap = new VaultCreditLedger();
-  withCap.syncOnchain(C, O, CY, 0n);
+  withCap.syncOnchain(C, O, CY, 0n, locked);
   assert.equal(withCap.admit(C, O, CY, ceiling, window).ok, true);
   const capped = collectibleServeAmount(uncapped, ceiling);
   assert.equal(capped, 105n);
@@ -95,7 +95,7 @@ test("capped serve keeps the credit ledger symmetric with the admission (and wou
   // the gated ceiling and the on-chain collectible `locked`. This is exactly the
   // over-count the cap prevents; asserting it fails-open here guards the regression.
   const noCap = new VaultCreditLedger();
-  noCap.syncOnchain(C, O, CY, 0n);
+  noCap.syncOnchain(C, O, CY, 0n, locked);
   assert.equal(noCap.admit(C, O, CY, ceiling, window).ok, true);
   noCap.settleServed(C, O, CY, ceiling, uncapped);
   const outstandingUncapped = noCap.outstandingFor(C, O);

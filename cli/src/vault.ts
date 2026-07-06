@@ -339,6 +339,13 @@ export interface ReceiptVerification {
   reason?: string;
   /** On-chain cycle the receipt was verified against (for ledger recording). */
   cycle: bigint;
+  /** On-chain cumulative already redeemed this cycle (0 when unread). Seeds the
+   *  credit ledger's collectable baseline alongside `locked`. */
+  redeemed: bigint;
+  /** Reserved-and-unredeemed funds this cycle (`ops().locked`, 0 when unread).
+   *  With `redeemed` it gives the collectable ceiling the operator caps a held
+   *  receipt's window-coverage at, straight from a FRESH (uncached) read (#437). */
+  locked: bigint;
 }
 
 /**
@@ -393,10 +400,10 @@ export async function verifyReceipt(p: {
       readReservation(p.consumer, p.operator),
     ]);
   } catch (err) {
-    return { ok: false, reason: `could not read on-chain state: ${(err as Error).message}`, cycle: 0n };
+    return { ok: false, reason: `could not read on-chain state: ${(err as Error).message}`, cycle: 0n, redeemed: 0n, locked: 0n };
   }
   if (key.sessionKey === "0x0000000000000000000000000000000000000000") {
-    return { ok: false, reason: "consumer has no registered session key", cycle: reservation.cycle };
+    return { ok: false, reason: "consumer has no registered session key", cycle: reservation.cycle, redeemed: reservation.redeemed, locked: reservation.locked };
   }
   const recovered = recoverReceiptSigner(
     id,
@@ -410,10 +417,10 @@ export async function verifyReceipt(p: {
     p.signature
   );
   if (recovered === null) {
-    return { ok: false, reason: "malformed receipt signature", cycle: reservation.cycle };
+    return { ok: false, reason: "malformed receipt signature", cycle: reservation.cycle, redeemed: reservation.redeemed, locked: reservation.locked };
   }
   if (recovered !== key.sessionKey) {
-    return { ok: false, reason: "signature does not recover to the consumer's session key", cycle: reservation.cycle };
+    return { ok: false, reason: "signature does not recover to the consumer's session key", cycle: reservation.cycle, redeemed: reservation.redeemed, locked: reservation.locked };
   }
-  return { ok: true, cycle: reservation.cycle };
+  return { ok: true, cycle: reservation.cycle, redeemed: reservation.redeemed, locked: reservation.locked };
 }

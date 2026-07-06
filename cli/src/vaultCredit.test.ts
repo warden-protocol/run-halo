@@ -72,15 +72,18 @@ test("an over-window request that settles BELOW the window lets sub-window accum
   assert.equal(l.admit(C, O, CY, 700n, W).ok, true); // 300 + 700 == 1000
 });
 
-test("an over-signed receipt can admit a 2nd over-window request, but un-receipted EXPOSURE stays capped at one ceiling", () => {
-  // The ledger trusts any validly-signed receipt: recordReceipt (and the on-chain
-  // verifyReceipt) gate on signature + cycle, NOT on cumulative <= served. So a
-  // consumer CAN sign for more than served. That is consumer self-harm (over-pay,
-  // still on-chain-bounded by `locked`), never operator bleed — the receipt is
-  // collectible value that only LOWERS outstanding. This documents that the count
-  // of in-flight over-window requests is NOT bounded to one; only the un-receipted
-  // exposure (`outstanding`) is — which is the actual money invariant.
+test("an over-signed but COLLECTABLE receipt can admit a 2nd over-window request, but un-receipted EXPOSURE stays capped at one ceiling", () => {
+  // The ledger trusts any validly-signed receipt whose cumulative is still WITHIN
+  // the on-chain collectable ceiling (`redeemed + locked`): recordReceipt gates on
+  // signature + cycle, and coverage is capped at the ceiling (#437). Signing for
+  // more than served — but under the reservation — is consumer self-harm (over-pay),
+  // never operator bleed: the receipt is collectible value that only LOWERS
+  // outstanding. (A receipt BEYOND the ceiling is a different story — see the
+  // "beyond the collectable ceiling" test.) This documents that the count of
+  // in-flight over-window requests is NOT bounded to one; only the un-receipted
+  // exposure (`outstanding`) is — the actual money invariant.
   const l = new VaultCreditLedger();
+  l.syncOnchain(C, O, CY, 0n, 5000n); // on-chain: 5000 collectable this cycle (covers the 1500 receipt)
   assert.equal(l.admit(C, O, CY, 1500n, W).ok, true); // 1st over-window, from zero
   assert.equal(l.outstandingFor(C, O), 1500n);
   // Over-signed: cumulative 1500 while nothing has actually been served yet.
@@ -97,13 +100,151 @@ test("an over-signed receipt can admit a 2nd over-window request, but un-receipt
 
 test("outstanding clamps to 0 (never negative) when a receipt over-covers served + inflight", () => {
   const l = new VaultCreditLedger();
+  l.syncOnchain(C, O, CY, 0n, 9000n); // 9000 collectable → the receipt below is fully backed
   l.admit(C, O, CY, 1500n, W); // inflight 1500, served 0
-  // A grossly over-signed receipt covers far more than served + inflight. The raw
-  // served + inflight − covered is negative, but exposure is reported as 0 — never
-  // a negative value that could confuse a downstream reader/metric.
+  // A grossly over-signed (but collectable) receipt covers far more than served +
+  // inflight. The raw served + inflight − covered is negative, but exposure is
+  // reported as 0 — never a negative value that could confuse a downstream reader.
   l.recordReceipt(C, O, { cumulative: 9000n, signature: sig(1), cycle: CY });
   assert.equal(l.outstandingFor(C, O), 0n);
   assert.equal(l.snapshot(C, O)!.outstanding, 0n);
+});
+
+test("ISSUE #437: a receipt BEYOND the collectable ceiling does not free the credit window", () => {
+  // On-chain this cycle: 1000 reserved-and-collectable (redeemed 0, locked 1000).
+  // The operator serves 1000 (fully covered by a 1000 receipt), then over-serves ONE
+  // more 300 request that the cached serve gate let through, and the consumer signs a
+  // 1300 receipt WITHOUT topping up. That last 300 is uncollectable: redeem pays
+  // min(1300 − 0, 1000) = 1000 and reverts the tail (ExceedsReservation). The 1300
+  // receipt must free the window only up to the 1000 ceiling, leaving the 300 tail
+  // outstanding — so the operator STOPS instead of piling on more un-redeemable float.
+  const bigW = 100_000n; // isolate the ceiling: window is not the gating factor here
+  const run = (syncCeiling: boolean): VaultCreditLedger => {
+    const l = new VaultCreditLedger();
+    if (syncCeiling) l.syncOnchain(C, O, CY, 0n, 1000n); // ceiling = redeemed + locked = 1000
+    l.admit(C, O, CY, 1000n, bigW);
+    l.settleServed(C, O, CY, 1000n, 1000n); // served 1000
+    l.recordReceipt(C, O, { cumulative: 1000n, signature: sig(1), cycle: CY }); // held 1000 (collectable)
+    l.admit(C, O, CY, 300n, bigW); // over-serve one more (cached gate lagged drawn-down locked)
+    l.settleServed(C, O, CY, 300n, 300n); // served 1300
+    l.recordReceipt(C, O, { cumulative: 1300n, signature: sig(2), cycle: CY }); // held 1300 (300 over ceiling)
+    return l;
+  };
+
+  const fixed = run(true);
+  assert.equal(fixed.outstandingFor(C, O), 300n, "the uncollectable tail (1300 − 1000) stays outstanding");
+  const snap = fixed.snapshot(C, O)!;
+  assert.equal(snap.held, 1300n, "the true signed receipt is still kept — redeem collects the max (1000)");
+  assert.equal(snap.ceiling, 1000n);
+  // A window sized to the reservation now refuses the next request — no more bleed.
+  assert.equal(fixed.admit(C, O, CY, 701n, 1000n).ok, false, "300 + 701 > 1000 → await a top-up");
+
+  // Pre-#437 behavior (no on-chain ceiling known → held counted in full) is the bug:
+  // the over-ceiling receipt masks the tail, outstanding reads 0, the window reopens,
+  // and the operator keeps serving work it can never collect.
+  const buggy = run(false);
+  assert.equal(buggy.outstandingFor(C, O), 0n, "without the ceiling, the 1300 receipt masks the uncollectable tail");
+  assert.equal(buggy.admit(C, O, CY, 701n, 1000n).ok, true, "the bug: window looks free, over-serving continues");
+});
+
+test("ISSUE #437: a same-cycle top-up lifts the ceiling and reactivates the uncollectable tail", () => {
+  const l = new VaultCreditLedger();
+  const bigW = 100_000n;
+  l.syncOnchain(C, O, CY, 0n, 1000n); // ceiling 1000
+  l.admit(C, O, CY, 1300n, bigW);
+  l.settleServed(C, O, CY, 1300n, 1300n); // served 1300 — over the 1000 reservation
+  l.recordReceipt(C, O, { cumulative: 1300n, signature: sig(1), cycle: CY }); // held 1300
+  assert.equal(l.outstandingFor(C, O), 300n, "300 uncollectable → window held closed");
+
+  // Consumer reserve()s +500 in the SAME cycle (reserve only bumps cycle from
+  // locked==0, so a top-up keeps this cycle and RAISES locked): ceiling 1000 → 1500.
+  l.syncOnchain(C, O, CY, 0n, 1500n);
+  assert.equal(l.snapshot(C, O)!.ceiling, 1500n);
+  assert.equal(l.outstandingFor(C, O), 0n, "the 1300 receipt is now fully collectable → window reopens");
+
+  // Monotonic ceiling: a later stale/cached read with a smaller locked must NOT
+  // shrink it (that would resurrect the tail and wrongly refuse a funded request).
+  l.syncOnchain(C, O, CY, 0n, 200n);
+  assert.equal(l.snapshot(C, O)!.ceiling, 1500n, "a stale lower read never lowers the ceiling");
+  assert.equal(l.outstandingFor(C, O), 0n);
+});
+
+test("ISSUE #437: a redeem shifts locked→redeemed without lowering the ceiling", () => {
+  // redeem pays `pay`, then locked −= pay, redeemed += pay: the collectable ceiling
+  // (redeemed + locked) is invariant across a redeem. Syncing the post-redeem read
+  // must therefore leave the ceiling — and thus coverage — unchanged.
+  const l = new VaultCreditLedger();
+  l.syncOnchain(C, O, CY, 0n, 1000n); // redeemed 0, locked 1000 → ceiling 1000
+  l.admit(C, O, CY, 1000n, 100_000n);
+  l.settleServed(C, O, CY, 1000n, 1000n);
+  l.recordReceipt(C, O, { cumulative: 1000n, signature: sig(1), cycle: CY });
+  assert.equal(l.outstandingFor(C, O), 0n);
+  // Operator redeems 600 on-chain: redeemed 600, locked 400 → ceiling still 1000.
+  l.syncOnchain(C, O, CY, 600n, 400n);
+  const snap = l.snapshot(C, O)!;
+  assert.equal(snap.ceiling, 1000n);
+  assert.equal(snap.redeemed, 600n);
+  assert.equal(l.outstandingFor(C, O), 0n, "coverage unchanged — the receipt still covers the served 1000");
+});
+
+test("ISSUE #437: noteRedeemed with a receipt's FULL cumulative can't reopen the window past the ceiling", () => {
+  // The redeem driver (OperatorRedeemer) marks the receipt's full cumulative
+  // redeemed on a successful redeem — but an over-ceiling receipt only captured
+  // `locked` on-chain (redeem clamps pay to locked). If `covered` trusted that
+  // over-counted `redeemed`, the window would reopen on the uncollectable tail,
+  // recreating #437. Coverage is capped at the ceiling, so it can't.
+  const l = new VaultCreditLedger();
+  l.syncOnchain(C, O, CY, 0n, 1000n); // 1000 collectable this cycle (ceiling 1000)
+  l.admit(C, O, CY, 1300n, 100_000n);
+  l.settleServed(C, O, CY, 1300n, 1300n); // served 1300 (over the 1000 reservation)
+  l.recordReceipt(C, O, { cumulative: 1300n, signature: sig(1), cycle: CY }); // held 1300
+  assert.equal(l.outstandingFor(C, O), 300n, "300 tail uncollectable → window closed");
+
+  // Redeem lands: on-chain captures only 1000 (== locked). The driver passes the
+  // receipt's full 1300, but the ledger stores the ACTUAL collected (min(1300,1000)).
+  l.noteRedeemed(C, O, 1300n, CY);
+  assert.equal(l.snapshot(C, O)!.redeemed, 1000n, "records ACTUAL collected (min(cumulative, ceiling)), not the full 1300");
+  assert.equal(l.redeemable(C, O), null, "ceiling exhausted → not offered (no resubmit spin)");
+
+  // Coverage stays capped at the 1000 ceiling: the 300 tail is still outstanding and
+  // the window does NOT reopen. (Before the final cap this read 0 → over-serve.)
+  assert.equal(l.outstandingFor(C, O), 300n, "window stays closed after redeem — no re-open on the uncollectable tail");
+  assert.equal(l.admit(C, O, CY, 701n, 1000n).ok, false, "still refuses past the window");
+
+  // A later on-chain read confirms 1000 redeemed; still 300 outstanding, still closed.
+  l.syncOnchain(C, O, CY, 1000n, 0n);
+  assert.equal(l.outstandingFor(C, O), 300n);
+});
+
+test("ISSUE #437: a redeemed-then-topped-up receipt reactivates so the tail is collected", () => {
+  // The recoverable path #437 documents: after a clamped redeem the consumer
+  // reserve()s more IN THE SAME CYCLE, making the previously-uncollectable tail
+  // collectable on-chain. The held receipt must REACTIVATE (become redeemable and
+  // get swept) rather than being permanently retired.
+  const l = new VaultCreditLedger();
+  l.syncOnchain(C, O, CY, 0n, 1000n); // ceiling 1000
+  l.admit(C, O, CY, 1300n, 100_000n);
+  l.settleServed(C, O, CY, 1300n, 1300n); // served 1300 (over the 1000 reservation)
+  l.recordReceipt(C, O, { cumulative: 1300n, signature: sig(1), cycle: CY }); // held 1300
+
+  // First redeem: captures 1000 (== locked). Ceiling now exhausted → retired, and
+  // the sweep leaves it alone (no ExceedsReservation spin).
+  assert.equal(l.redeemable(C, O)?.cumulative, 1300n, "offered while there's collectable headroom");
+  l.noteRedeemed(C, O, 1300n, CY);
+  assert.equal(l.redeemable(C, O), null, "retired once the ceiling is exhausted");
+  assert.deepEqual(l.pairsWithRedeemable(), [], "sweep won't spin on the ceiling-clamped receipt");
+  assert.equal(l.outstandingFor(C, O), 300n, "300 tail still owed");
+
+  // Consumer tops up +500 (reserve() keeps the cycle, lifts locked): ceiling → 1500.
+  l.syncOnchain(C, O, CY, 1000n, 500n);
+  assert.equal(l.redeemable(C, O)?.cumulative, 1300n, "REACTIVATED: redeemable again once the ceiling covers it");
+  assert.deepEqual(l.pairsWithRedeemable(), [{ consumer: C, operator: O }], "the sweep will now resubmit it");
+
+  // Collecting the tail brings redeemed to 1300 → fully collected, window reopens.
+  l.noteRedeemed(C, O, 1300n, CY);
+  assert.equal(l.snapshot(C, O)!.redeemed, 1300n, "now fully collected (1300 ≤ ceiling 1500)");
+  assert.equal(l.redeemable(C, O), null, "nothing left — retired for good");
+  assert.equal(l.outstandingFor(C, O), 0n, "tail recovered — outstanding clears, row back-fills");
 });
 
 test("a receipt drains the window so serving resumes", () => {
@@ -121,7 +262,7 @@ test("restart baseline prevents old cumulative receipts from granting fresh cred
   const l = new VaultCreditLedger();
   // Process starts midway through a cycle after 10k has already been redeemed.
   l.recordReceipt(C, O, { cumulative: 10_000n, signature: sig(1), cycle: CY });
-  l.syncOnchain(C, O, CY, 10_000n);
+  l.syncOnchain(C, O, CY, 10_000n, 0n); // 10k redeemed, nothing left locked → ceiling 10k
   assert.equal(l.outstandingFor(C, O), 0n);
   assert.equal(l.admit(C, O, CY, W, W).ok, true);
   l.settleServed(C, O, CY, W, W);
@@ -130,7 +271,7 @@ test("restart baseline prevents old cumulative receipts from granting fresh cred
 
 test("on-chain redeemed baseline alone starts with zero exposure", () => {
   const l = new VaultCreditLedger();
-  l.syncOnchain(C, O, CY, 10_000n);
+  l.syncOnchain(C, O, CY, 10_000n, 0n);
   assert.equal(l.outstandingFor(C, O), 0n);
   assert.equal(l.admit(C, O, CY, W, W).ok, true);
 });
@@ -145,7 +286,7 @@ test("syncOnchain never lowers served when the on-chain redeemed read lags local
   l.admit(C, O, CY, 900n, W);
   l.settleServed(C, O, CY, 900n, 900n); // served 900, nothing redeemed yet
   assert.equal(l.outstandingFor(C, O), 900n);
-  l.syncOnchain(C, O, CY, 500n); // on-chain redeemed (500) lags local served (900)
+  l.syncOnchain(C, O, CY, 500n, 0n); // on-chain redeemed (500) lags local served (900)
   const snap = l.snapshot(C, O)!;
   assert.equal(snap.served, 900n, "served is monotonic — a lagging on-chain read must not lower it");
   assert.equal(snap.redeemed, 500n); // redeemed still advances to the on-chain baseline
