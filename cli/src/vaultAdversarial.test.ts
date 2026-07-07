@@ -82,7 +82,7 @@ test("REPLAY: a receipt signed for another chain recovers to a different address
   const sessionKey = Wallet.createRandom();
   const value = { consumer: sessionKey.address, operator: OP, cumulative: 500n, keyEpoch: 0n, cycle: 1n };
   const sig = await sessionKey.signTypedData(DOMAIN, TYPES, value);
-  const onOtherChain = recoverReceiptSigner(84532n, value, sig); // base-sepolia domain
+  const onOtherChain = recoverReceiptSigner(1n, value, sig); // a different chain's domain
   assert.notEqual(onOtherChain, sessionKey.address.toLowerCase(), "domain chainId blocks cross-chain replay");
 });
 

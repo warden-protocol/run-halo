@@ -19,9 +19,8 @@ import { fetchWithX402, type X402PayOptions } from "./x402-client";
 export const DEFAULT_BAZAAR_BASE_URL =
   "https://api.cdp.coinbase.com/platform/v2/x402/discovery";
 
-/** CAIP-2 network IDs for the chains Halo supports. */
+/** CAIP-2 network ID for Base mainnet (the only chain Halo supports). */
 export const BASE_MAINNET_CAIP2 = "eip155:8453";
-export const BASE_SEPOLIA_CAIP2 = "eip155:84532";
 
 export interface BazaarAccept {
   /** "exact" (sign = charge) or "upto" (sign a ceiling). */

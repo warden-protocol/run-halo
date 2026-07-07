@@ -8,7 +8,7 @@ export async function cmdStatus(): Promise<void> {
   console.log(`\n  Halo operator`);
   console.log(`  ──────────────────────`);
   console.log(`  Address:   ${cfg.operator.address}`);
-  console.log(`  Network:   ${cfg.network}`);
+  console.log(`  Network:   Base mainnet`);
   console.log(
     `  Provider${providers.length > 1 ? "s" : " "}: ${providers.map((p) => `${p.slug} (${p.models.length})`).join(", ")}`
   );

@@ -11,7 +11,7 @@
  */
 import prompts from "prompts";
 import { classifySessionKey } from "@halo/vault-core";
-import { loadConfig } from "../config";
+import { loadConfig, BASE_CHAIN_ID } from "../config";
 import { loadWallet } from "../wallet";
 import {
   VaultConsumeClient,
@@ -62,7 +62,7 @@ export async function cmdVault(rawArgs: string[]): Promise<void> {
     {
       facilitatorUrl,
       rpcUrl: (process.env.BASE_RPC_URL || "https://mainnet.base.org").trim(),
-      chainId: cfg.network === "base-sepolia" ? 84532 : 8453,
+      chainId: BASE_CHAIN_ID,
     },
     sessionSigner
   );
@@ -88,7 +88,7 @@ export async function cmdVault(rawArgs: string[]): Promise<void> {
               : " (none yet — your first deposit registers this wallet)"
             : " ⚠ NOT the key this CLI signs with — receipts can't redeem against it";
       console.log(`halo vault`);
-      console.log(`  vault       : ${VAULT_ADDRESS}  (${cfg.network})`);
+      console.log(`  vault       : ${VAULT_ADDRESS}  (Base mainnet)`);
       console.log(`  consumer    : ${wallet.address}`);
       console.log(`  balance     : $${fmtUsd(s.balance)}`);
       console.log(`  locked      : $${fmtUsd(s.lockedTotal)} (reserved to operators)`);
@@ -125,7 +125,7 @@ export async function cmdVault(rawArgs: string[]): Promise<void> {
         console.log(`  balance now : $${fmtUsd(s.balance)} (withdrawable $${fmtUsd(s.withdrawable)})`);
       } catch (e) {
         console.error(`  ✗ deposit failed: ${e instanceof Error ? e.message : String(e)}`);
-        console.error(`    Ensure ${wallet.address} holds USDC and ~$0.50 of ETH on ${cfg.network}.`);
+        console.error(`    Ensure ${wallet.address} holds USDC and ~$0.50 of ETH on Base mainnet.`);
         process.exit(1);
       }
       return;

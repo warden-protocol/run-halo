@@ -14,7 +14,7 @@
  * actual token cost (≤ max), so the user is charged only for tokens consumed.
  * If inference fails or the operator crashes before settle, no money moves.
  */
-import { HaloConfig, configProviders, providerForModel } from "./config";
+import { HaloConfig, configProviders, providerForModel, BASE_CHAIN_ID, BASE_NETWORK } from "./config";
 import {
   Facilitator,
   PaymentPayload,
@@ -24,11 +24,6 @@ import {
 import { upstreamUsdcCost } from "./pricing";
 
 const USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
-const USDC_BASE_SEPOLIA = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
-
-export function usdcAddress(network: string): string {
-  return network === "base-sepolia" ? USDC_BASE_SEPOLIA : USDC_BASE;
-}
 
 function b64decode(s: string): string {
   if (typeof Buffer !== "undefined") return Buffer.from(s, "base64").toString("utf-8");
@@ -170,7 +165,7 @@ export function buildPaymentRequirements(
   amountUsdcBase: bigint,
   facilitatorAddress: string | null = null
 ): PaymentRequirements {
-  const chainId = cfg.network === "base-sepolia" ? 84532 : 8453;
+  const chainId = BASE_CHAIN_ID;
   const scheme = facilitatorAddress ? "upto" : "exact";
   const extra: Record<string, unknown> = {
     chainId,
@@ -181,7 +176,7 @@ export function buildPaymentRequirements(
   }
   return {
     scheme,
-    network: cfg.network,
+    network: BASE_NETWORK,
     maxAmountRequired: amountUsdcBase.toString(),
     resource: requestPath,
     payTo: cfg.operator.address,
@@ -192,7 +187,7 @@ export function buildPaymentRequirements(
     // settle failed with "authorization expired". 300s covers the full window
     // (matching upto) with margin.
     maxTimeoutSeconds: 300,
-    asset: usdcAddress(cfg.network),
+    asset: USDC_BASE,
     description: `Halo inference · ${cfg.provider.slug}`,
     mimeType: "application/json",
     extra,

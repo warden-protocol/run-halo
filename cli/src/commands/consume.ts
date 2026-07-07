@@ -21,7 +21,7 @@ import prompts from "prompts";
 import { spawn } from "node:child_process";
 import { openSync } from "node:fs";
 import path from "node:path";
-import { loadConfig, configDir } from "../config";
+import { loadConfig, configDir, BASE_NETWORK, BASE_CHAIN_ID } from "../config";
 import { loadWallet } from "../wallet";
 import { payAndFetch, X402Error } from "../x402-consume";
 import {
@@ -478,7 +478,7 @@ export async function cmdConsume(args: Args): Promise<void> {
   const relayBase = cfg.relayUrl.replace(/\/+$/, "");
   const completionsUrl = `${relayBase}/v1/chat/completions`;
   const modelsUrl = `${relayBase}/v1/models`;
-  const ctx = { wallet, network: cfg.network } as const;
+  const ctx = { wallet } as const;
 
   // ── HaloVault rail (RFC v2): settle ACTUAL tokens, not the prompt-blind flat
   // exact-mode quote. Opt-in via --vault. Deposit once; reserve per operator;
@@ -503,7 +503,7 @@ export async function cmdConsume(args: Args): Promise<void> {
         {
           facilitatorUrl: cfg.facilitator?.url ?? "https://facilitator.runhalo.xyz",
           rpcUrl: (process.env.BASE_RPC_URL || "https://mainnet.base.org").trim(),
-          chainId: cfg.network === "base-sepolia" ? 84532 : 8453,
+          chainId: BASE_CHAIN_ID,
           // Push signed receipts to the serving operator through the relay
           // (operator-driven redeem, issue #369); self-redeem is the fallback.
           relayUrl: relayBase,
@@ -656,7 +656,7 @@ export async function cmdConsume(args: Args): Promise<void> {
       return sendJson(res, 200, {
         status: "ok",
         wallet: wallet.address,
-        network: cfg.network,
+        network: BASE_NETWORK,
         confidential,
       });
     }
@@ -709,7 +709,7 @@ export async function cmdConsume(args: Args): Promise<void> {
       }
       return sendJson(res, 200, {
         address: wallet.address,
-        network: cfg.network,
+        network: BASE_NETWORK,
         league: stats,
         sessionBudget: {
           capped: budget.budgetBase > 0n,
@@ -874,7 +874,7 @@ export async function cmdConsume(args: Args): Promise<void> {
     // caller never thinks a plaintext request was confidential.
     const errCtx = {
       wallet: wallet.address,
-      network: cfg.network,
+      network: BASE_NETWORK,
       maxUsd: Number(maxAmountBase) / 1_000_000,
       relay: relayBase,
       confidential: wantConfidential,
@@ -1141,7 +1141,7 @@ export async function cmdConsume(args: Args): Promise<void> {
   server.listen(port, host, () => {
     console.log(`halo consume`);
     console.log(`  endpoint : http://${host}:${port}/v1`);
-    console.log(`  wallet   : ${wallet.address}  (${cfg.network})`);
+    console.log(`  wallet   : ${wallet.address}  (Base mainnet)`);
     console.log(`  relay    : ${relayBase}`);
     console.log(
       `  rail     : ${vault ? "vault (settle ACTUAL tokens; deposit-backed)" : `exact (sign-per-request, up to $${(Number(maxAmountBase) / 1_000_000).toFixed(2)}/req)`}`
@@ -1416,7 +1416,7 @@ function actionableError(
   // able to see/copy the complete address to fund it. The reason (`inner`) goes
   // LAST, where it's safe to clip.
   if (status === 402 || low.includes("insufficient") || low.includes("balance") || low.includes("payment required")) {
-    const net = ctx.network === "base-sepolia" ? "Base Sepolia" : "Base mainnet";
+    const net = "Base mainnet";
     return {
       error: {
         message: `Payment rejected — fund your consumer wallet with USDC on ${net}: ${ctx.wallet}${inner ? `  (${inner})` : ""}`,

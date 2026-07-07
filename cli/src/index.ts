@@ -37,7 +37,6 @@ halo — Halo operator + payer CLI
     --flat <n>                 flat pricing: USD per 1K tokens (e.g. 0.0005)
     --add-provider             ADD this provider to an existing operator (front several gateways at once, e.g. openrouter + near) instead of replacing it
     --fallback-cents <n>       fallback price per request in cents (default 1)
-    --network <base|base-sepolia>
     --label <name>             label shown in the League
     --with-pairing             after setup, also print a dashboard pairing code
     --rotate-wallet            DESTRUCTIVE: replace existing wallet with a new one (default: keep existing)
@@ -122,10 +121,6 @@ async function main(): Promise<void> {
         fallbackCents:
           typeof flags["fallback-cents"] === "string"
             ? Number(flags["fallback-cents"])
-            : undefined,
-        network:
-          flags.network === "base" || flags.network === "base-sepolia"
-            ? flags.network
             : undefined,
         label: typeof flags.label === "string" ? flags.label : undefined,
         withPairing: flags["with-pairing"] === true,
