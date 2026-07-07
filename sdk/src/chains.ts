@@ -22,22 +22,13 @@ export const CHAINS: Record<number, ChainConfig> = {
     usdcDomainName: "USD Coin",
     usdcDomainVersion: "2",
   },
-  84532: {
-    name: "Base Sepolia",
-    chainId: 84532,
-    usdcToken: "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
-    usdcDomainName: "USDC",
-    usdcDomainVersion: "2",
-  },
 };
 
 export const NETWORK_TO_CHAIN_ID: Record<string, number> = {
   base: 8453,
   "base-mainnet": 8453,
-  "base-sepolia": 84532,
   // CAIP-2 forms, as returned by the x402 Bazaar catalog and some facilitators.
   "eip155:8453": 8453,
-  "eip155:84532": 84532,
 };
 
 export function getChain(chainId: number): ChainConfig {

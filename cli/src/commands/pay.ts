@@ -39,7 +39,7 @@ export async function cmdPay(args: Args): Promise<void> {
   };
 
   try {
-    const res = await payAndFetch(url, body, { wallet, network: cfg.network }, {
+    const res = await payAndFetch(url, body, { wallet }, {
       onPaying: ({ amountBase, payTo }) =>
         console.log(`\n  signed ${amountBase} USDC base units → ${payTo}`),
     });

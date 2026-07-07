@@ -13,6 +13,7 @@
  * server maps it to an HTTP error.
  */
 import { ethers } from "ethers";
+import { BASE_CHAIN_ID } from "./config";
 
 export class X402Error extends Error {
   constructor(
@@ -26,7 +27,6 @@ export class X402Error extends Error {
 
 const USDC_BY_CHAIN: Record<number, string> = {
   8453: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-  84532: "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
 };
 
 /** Default per-request ceiling we'll sign for. $1 in USDC base units. */
@@ -91,8 +91,6 @@ function isConnRetryable(err: unknown): boolean {
 export interface PayContext {
   /** Wallet that signs and pays — the consumer identity. */
   wallet: ethers.Signer & { address: string };
-  /** Expected chain, from config. Signing is rejected if the server disagrees. */
-  network: "base" | "base-sepolia";
 }
 
 export interface PayAndFetchOptions {
@@ -264,8 +262,8 @@ async function signExactPayment(
   ctx: PayContext,
   maxAmountBase: bigint
 ): Promise<string> {
-  const chainId = pr.extra?.chainId ?? (pr.network === "base-sepolia" ? 84532 : 8453);
-  const expectedChain = ctx.network === "base-sepolia" ? 84532 : 8453;
+  const chainId = pr.extra?.chainId ?? BASE_CHAIN_ID;
+  const expectedChain = BASE_CHAIN_ID;
   if (chainId !== expectedChain) {
     throw new X402Error(`chainId mismatch: server ${chainId}, config ${expectedChain}`, "chain_mismatch");
   }
@@ -283,7 +281,7 @@ async function signExactPayment(
     );
   }
 
-  const domainName = pr.extra?.domainName ?? (chainId === 84532 ? "USDC" : "USD Coin");
+  const domainName = pr.extra?.domainName ?? "USD Coin";
   const domainVersion = pr.extra?.domainVersion ?? "2";
   const now = Math.floor(Date.now() / 1000);
   const validAfter = now - 60;

@@ -33,11 +33,10 @@ export interface SetupFlags {
    * one operator front several gateways at once (e.g. add NEAR confidential
    * models alongside an existing OpenRouter setup) — each request routes to the
    * provider that serves the requested model. Requires an existing config; the
-   * wallet, network, and other providers are preserved untouched. The provider's
+   * wallet and other providers are preserved untouched. The provider's
    * own pricing (margin/flat) is stored per-provider.
    */
   addProvider?: boolean;
-  network?: "base" | "base-sepolia";
   label?: string;
   withPairing?: boolean;
   /**
@@ -615,7 +614,6 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
 
   // When re-running setup with an existing config, default infra settings to
   // whatever the operator already had — never silently reset them.
-  const networkDefault = existingConfig?.network ?? "base";
   const relayDefault = existingConfig?.relayUrl ?? DEFAULT_RELAY_URL;
   const indexerDefault = existingConfig?.indexerUrl ?? DEFAULT_INDEXER_URL;
   // Facilitator URL + key are always reset to protocol defaults (see below).
@@ -625,28 +623,6 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
 
   const dataRetention: "none" | "24h" | "7d" | "unknown" =
     flags.dataRetention ?? retentionDefault;
-
-  let network: "base" | "base-sepolia";
-  if (flags.network) {
-    network = flags.network;
-  } else if (driven) {
-    network = networkDefault;
-  } else {
-    const r = await prompts(
-      {
-        type: "select",
-        name: "network",
-        message: "Network",
-        choices: [
-          { title: "Base mainnet", value: "base" },
-          { title: "Base Sepolia (testnet)", value: "base-sepolia" },
-        ],
-        initial: networkDefault === "base-sepolia" ? 1 : 0,
-      },
-      cancel
-    );
-    network = r.network;
-  }
 
   let relayUrl = relayDefault;
   let indexerUrl = indexerDefault;
@@ -719,7 +695,7 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
       : await resolveApiKeyStorage(apiKey, flags, passphrase, driven);
 
   // ── Multi-provider: append this provider to an existing operator ──────────
-  // Preserves the wallet, network, and every other provider; only adds (or
+  // Preserves the wallet and every other provider; only adds (or
   // updates, if the same slug) one entry. The new provider keeps its own
   // pricing block so a confidential gateway can carry a different margin than
   // a commodity one. Each inference then routes to whichever provider serves
@@ -768,7 +744,6 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
 
   const cfg: HaloConfig = {
     version: 1,
-    network,
     relayUrl,
     indexerUrl,
     consume,
@@ -803,7 +778,7 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
   console.log(`  Halo operator configured`);
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   console.log(`  Address:     ${address}`);
-  console.log(`  Network:     ${network}`);
+  console.log(`  Network:     Base mainnet`);
   console.log(`  Provider:    ${slug} (${models.length} models)`);
   if (apiKey) {
     console.log(

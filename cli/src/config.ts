@@ -41,7 +41,6 @@ export interface ProviderConfig {
 
 export interface HaloConfig {
   version: 1;
-  network: "base" | "base-sepolia";
   relayUrl: string;
   indexerUrl: string;
   operator: {
@@ -202,3 +201,12 @@ export const DEFAULT_INDEXER_URL = "https://indexer.runhalo.xyz";
 // other facilitators remain valid via `--facilitator-url` if an operator
 // wants their own settlement path.
 export const DEFAULT_FACILITATOR_URL = "https://facilitator.runhalo.xyz";
+
+/**
+ * Base mainnet. Halo is mainnet-only — no network switching, no testnet. The
+ * chain id and x402 network name are hardcoded here (never read from config or
+ * env) so signing domains, USDC selection, and settlement can never drift onto
+ * another chain.
+ */
+export const BASE_CHAIN_ID = 8453;
+export const BASE_NETWORK = "base";
