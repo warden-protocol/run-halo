@@ -27,6 +27,7 @@ RUN npm run build
 WORKDIR /app/cli
 COPY cli/package*.json cli/tsconfig.json ./
 RUN npm ci --silent
+COPY cli/scripts ./scripts
 COPY cli/src ./src
 RUN npm run build
 
