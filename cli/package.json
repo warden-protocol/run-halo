@@ -14,11 +14,16 @@
     "access": "public"
   },
   "scripts": {
+    "generate:version": "node scripts/generate-version.js",
+    "prebuild": "npm run generate:version",
     "build": "esbuild src/index.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/index.js --external:ethers --external:ws --external:undici --external:prompts --external:dotenv --external:@noble/curves --external:@noble/hashes --external:nearai-cloud-verifier",
     "start": "node dist/index.js",
+    "predev": "npm run generate:version",
     "dev": "ts-node src/index.ts",
+    "pretypecheck": "npm run generate:version",
     "typecheck": "tsc --noEmit",
-    "test": "node --require ts-node/register --test src/vaultAdversarial.test.ts src/vaultConsumeRetry.test.ts src/vaultCredit.test.ts src/vaultRedeemDurable.test.ts src/vaultRedeemRetry.test.ts src/vaultRedeemer.test.ts src/vaultReserve.test.ts src/vaultServeCap.test.ts",
+    "pretest": "npm run generate:version",
+    "test": "node --require ts-node/register --test src/*.test.ts",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {

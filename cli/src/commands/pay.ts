@@ -44,6 +44,8 @@ export async function cmdPay(args: Args): Promise<void> {
         console.log(`\n  signed ${amountBase} USDC base units → ${payTo}`),
     });
     console.log(`\n  status: ${res.status}`);
+    const deprecationWarning = res.headers.get("X-Halo-Deprecation-Warning");
+    if (deprecationWarning) console.warn(`  ⚠ ${deprecationWarning}`);
     if (res.settlement !== undefined) console.log(`  settlement:`, res.settlement);
     console.log(`\n  response:\n${res.body}\n`);
   } catch (err) {
