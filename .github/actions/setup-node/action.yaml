@@ -1,0 +1,43 @@
+---
+# .github/actions/setup-node/action.yaml
+#
+# Composite action: install Node.js with npm dependency cache.
+# Used by the release workflow today; intended for reuse by future
+# CI workflows (typecheck / lint / test / audit) so each per-package
+# job gets a properly scoped npm cache.
+#
+# Usage:
+#   - uses: ./.github/actions/setup-node
+#     with:
+#       node-version: "20"
+#       package: cli
+
+name: Setup Node with npm cache
+description: >
+  Install a pinned Node.js version and restore the npm cache keyed on
+  the package's package-lock.json. Wraps actions/setup-node@v4.
+
+inputs:
+  node-version:
+    description: Node.js version to install (passed to actions/setup-node).
+    required: false
+    # Node 22 (LTS): Node 20 reached end-of-life (Apr 2026).
+    default: "22"
+  package:
+    description: >
+      Package subdirectory name (e.g. cli, sdk, vault-core).
+      Used to key the npm cache on that package's package-lock.json so each
+      package gets an isolated cache entry.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Node.js ${{ inputs.node-version }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+        # Cache key: hash of the package-specific lockfile.
+        # This means a lockfile change busts only that package's cache.
+        cache: npm
+        cache-dependency-path: ${{ inputs.package }}/package-lock.json
