@@ -1458,8 +1458,11 @@ export async function cmdServe(): Promise<void> {
                   // headroom so the gate cache never approves past coverage.
                   noteServed(consumerAddr, cfg.operator.address, actualAmount);
                   // True up the credit window: replace this request's reserved
-                  // ceiling with its ACTUAL served cost (issue #369).
-                  creditLedger.settleServed(consumerAddr, cfg.operator.address, chk.cycle, ceilingCost, actualAmount);
+                  // ceiling with its ACTUAL served cost (issue #369). The returned
+                  // post-settle cumulative is this serve's on-chain checkpoint —
+                  // emitted on the event so the indexer matches it to the redeem that
+                  // pays it WITHOUT summing amounts (drift-immune; issue #379).
+                  const servedCumulative = creditLedger.settleServed(consumerAddr, cfg.operator.address, chk.cycle, ceilingCost, actualAmount);
                   creditAdmitted = null;
                   console.log(
                     `  ✓ vault-served ${req.requestId} for ${abbrevAddr(consumerAddr)} — ${fmtUsd(actualAmount)} (${upstream.usage.total_tokens} tok); awaiting redeem`
@@ -1478,6 +1481,13 @@ export async function cmdServe(): Promise<void> {
                     timestamp: Date.now(),
                     txHash: null,
                     mode: "vault" as const,
+                    // On-chain cumulative AFTER this serve — lets the indexer attach
+                    // the paying redeem by interval containment, not by summing
+                    // amounts (issue #379). Informational, not signed. `null` on a
+                    // stale-cycle settle (dead reservation) → omitted, so that row
+                    // falls to the pending/tiler path rather than risk a wrong stamp.
+                    cumulativeCheckpoint:
+                      servedCumulative === null ? undefined : servedCumulative.toString(),
                   };
                   const sigMessage = canonicalEventMessage(eventPayload);
                   wallet
@@ -2263,6 +2273,11 @@ interface EventPayload {
    *  vault rows are credited on-redeem by the vault settlement watcher, budget/
    *  exact rows by the settlement verifier. Informational — not signed. */
   mode: "vault" | "budget" | "exact";
+  /** Vault only: operator's on-chain cumulative (USDC base) AFTER this serve, so
+   *  the indexer attaches the paying redeem by interval containment rather than by
+   *  summing serve amounts (issue #379). Informational — not signed. Absent on the
+   *  budget/exact paths. */
+  cumulativeCheckpoint?: string;
 }
 
 /**
@@ -2274,7 +2289,7 @@ interface EventPayload {
  * but is not included in the signature (CDP can fail to return a tx hash;
  * adding it to the signature would reject legitimate events).
  */
-export function canonicalEventMessage(ev: Omit<EventPayload, "txHash" | "mode">): string {
+export function canonicalEventMessage(ev: Omit<EventPayload, "txHash" | "mode" | "cumulativeCheckpoint">): string {
   return `halo-event:${ev.id}:${ev.operator.toLowerCase()}:${ev.consumer.toLowerCase()}:${ev.amountUsdc}:${ev.tokens}:${ev.timestamp}`;
 }
 

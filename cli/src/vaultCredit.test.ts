@@ -419,8 +419,11 @@ test("STALE-CYCLE GUARD: a late settle/release/redeem for a prior cycle can't co
   assert.equal(l.snapshot(C, O)!.cycle, 2n);
   assert.equal(l.snapshot(C, O)!.inflight, 900n);
 
-  // Trailing cycle-1 settle: must NOT subtract from cycle-2 inflight nor add served.
-  l.settleServed(C, O, 1n, 800n, 800n);
+  // Trailing cycle-1 settle: must NOT subtract from cycle-2 inflight nor add served,
+  // and must return `null` so the caller emits NO cumulativeCheckpoint (the current
+  // entry's `served` is the NEW cycle's and could collide with a live redeem boundary
+  // — issue #379). A null checkpoint routes the row to the pending/tiler path.
+  assert.equal(l.settleServed(C, O, 1n, 800n, 800n), null, "stale-cycle settle returns null (no checkpoint)");
   assert.equal(l.snapshot(C, O)!.inflight, 900n, "cycle-1 settle left cycle-2 inflight intact");
   assert.equal(l.snapshot(C, O)!.served, 0n, "cycle-1 served not leaked into cycle 2");
 
@@ -433,6 +436,20 @@ test("STALE-CYCLE GUARD: a late settle/release/redeem for a prior cycle can't co
   l.noteRedeemed(C, O, 9_000n, 1n);
   assert.equal(l.snapshot(C, O)!.redeemed, 0n, "old-cycle cumulative didn't over-credit cycle 2");
   assert.ok(l.outstandingFor(C, O) <= W, "outstanding still bounded by the window");
+});
+
+test("settleServed return contract: live settle yields the post-settle cumulative (the #379 checkpoint)", () => {
+  // The returned `served` is the serve's on-chain cumulative checkpoint the operator
+  // emits on the event so the indexer attaches the paying redeem by interval
+  // containment (issue #379). Monotonic across serves; a zero-actual serve doesn't
+  // advance it.
+  const l = new VaultCreditLedger();
+  l.admit(C, O, CY, 100n, W);
+  assert.equal(l.settleServed(C, O, CY, 100n, 100n), 100n); // first serve → cumulative 100
+  l.admit(C, O, CY, 250n, W);
+  assert.equal(l.settleServed(C, O, CY, 250n, 250n), 350n); // second serve → 100 + 250
+  l.admit(C, O, CY, 50n, W);
+  assert.equal(l.settleServed(C, O, CY, 50n, 0n), 350n); // zero-actual serve → unchanged
 });
 
 test("STALE-CYCLE GUARD: admit refuses a stale-cycle request without mutating the live entry", () => {
