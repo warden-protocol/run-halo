@@ -244,24 +244,35 @@ export class VaultCreditLedger {
     return { ok: true, outstanding: VaultCreditLedger.outstanding(e) };
   }
 
-  /** Convert an admitted request's reserved ceiling into ACTUAL served cost. */
+  /** Convert an admitted request's reserved ceiling into ACTUAL served cost.
+   *  Returns the post-settle cumulative `served` for this cycle — the operator's
+   *  on-chain cumulative AFTER this serve, which the consumer's receipt advances to
+   *  (floored to `redeemed` on the next `syncOnchain`). The caller emits it as the
+   *  serve event's `cumulativeCheckpoint` so the indexer can match this serve to the
+   *  redeem whose interval closes on it (issue #379, off-chain), instead of
+   *  reconstructing the position by summing amounts (which drifts on a
+   *  never-redeemed / over-served serve — issue #446). */
   settleServed(
     consumer: string,
     operator: string,
     cycle: bigint,
     ceilingBase: bigint,
     actualBase: bigint
-  ): void {
+  ): bigint | null {
     const e = this.entryFor(consumer, operator, cycle);
     // A settle for an OLDER cycle than we've advanced to (the reservation bumped
     // generation while this request was in flight) must NOT mutate the current
     // entry — subtracting this dead cycle's ceiling from the new generation's
     // inflight, or adding its served cost, corrupts the live window. The work it
     // accounts for is already gone with the prior cycle. (Matches syncOnchain /
-    // recordReceipt, which guard the same way.)
-    if (cycle < e.cycle) return;
+    // recordReceipt, which guard the same way.) Return `null` so the caller emits NO
+    // checkpoint: the current entry's `served` belongs to the NEW cycle and could
+    // collide with a real new-cycle redeem boundary, mis-attributing this dead-cycle
+    // serve. With no checkpoint the row falls to the pending/tiler path — money-safe.
+    if (cycle < e.cycle) return null;
     e.inflight = e.inflight > ceilingBase ? e.inflight - ceilingBase : 0n;
     if (actualBase > 0n) e.served += actualBase;
+    return e.served;
   }
 
   /** Return an admitted request's reserved ceiling when the serve produced no
