@@ -62,6 +62,8 @@ import {
   isEncryptedEnvelope,
   OperatorKeyPair,
 } from "../encryption";
+import { HALO_VERSION } from "../version";
+import { restartIntoManagedInstall, startAutoUpdateMonitor } from "../update";
 
 interface InferenceRequestMessage {
   type: "inference-request";
@@ -826,16 +828,34 @@ export async function cmdServe(): Promise<void> {
   let heartbeatStarted = false;
   let shuttingDown = false;
   let reconnectAttempt = 0;
-
-  process.on("SIGINT", () => {
+  let signalShutdownRequested = false;
+  let shutdownPromise: Promise<void> | null = null;
+  let stopUpdateMonitor = (): void => {};
+  const gracefulShutdown = (): Promise<void> => {
+    if (shutdownPromise) return shutdownPromise;
     shuttingDown = true;
+    stopUpdateMonitor();
     console.log("\n  shutting down");
     // Best-effort: collect any held receipts before exit (issue #369), bounded
-    // so shutdown never hangs on a slow facilitator.
-    void Promise.race([
-      redeemer.flush(),
-      new Promise((r) => setTimeout(r, 3000)),
-    ]).finally(() => process.exit(0));
+    // so shutdown never hangs on a slow facilitator. Auto-update deliberately
+    // uses this exact same drain as an operator-requested restart.
+    shutdownPromise = Promise.race([
+      redeemer.flush().then(() => undefined),
+      new Promise<void>((resolve) => setTimeout(resolve, 3000)),
+    ]);
+    return shutdownPromise;
+  };
+  const exitGracefully = (): void => {
+    signalShutdownRequested = true;
+    void gracefulShutdown().finally(() => process.exit(0));
+  };
+  process.on("SIGINT", exitGracefully);
+  process.on("SIGTERM", exitGracefully);
+  stopUpdateMonitor = startAutoUpdateMonitor(async () => {
+    if (shuttingDown || signalShutdownRequested) return;
+    await gracefulShutdown();
+    if (signalShutdownRequested) return;
+    restartIntoManagedInstall();
   });
 
   // Run the WS lifecycle. Resolves when the socket closes; never rejects —
@@ -857,6 +877,7 @@ export async function cmdServe(): Promise<void> {
       const ws = new WebSocket(wsUrl, {
         perMessageDeflate: false, // small JSON frames don't compress; skip the CPU cost
         handshakeTimeout: 10_000, // fail upgrade fast if relay is unreachable
+        headers: { "X-Halo-Cli-Version": HALO_VERSION },
       });
 
       // Application-level keepalive state. lastPongAt seeds at connect time
@@ -923,6 +944,11 @@ export async function cmdServe(): Promise<void> {
           return;
         }
 
+        if (msg.type === "warning") {
+          console.warn(`  ⚠ relay warning: ${(msg as { message?: string }).message ?? "upgrade recommended"}`);
+          return;
+        }
+
         // First message from the relay carries the peerId — we bind the
         // operator's announce signature to it so a stolen announce payload
         // can't be replayed.
@@ -947,6 +973,7 @@ export async function cmdServe(): Promise<void> {
                 type: "announce",
                 data: {
                   address: cfg.operator.address,
+                  cliVersion: HALO_VERSION,
                   // Primary slug (back-compat single-provider classification).
                   provider: cfg.provider.slug,
                   // Every distinct provider slug this operator fronts.
@@ -2364,7 +2391,11 @@ function writePidFile(): void {
   writeFileSync(pidFilePath(), `${process.pid}\n`, { mode: 0o600 });
   const cleanup = (): void => {
     try {
-      unlinkSync(pidFilePath());
+      // A self-reexec child may already have replaced the pid file. Never let
+      // the exiting parent delete a newer process's ownership marker.
+      if (require("fs").readFileSync(pidFilePath(), "utf8").trim() === String(process.pid)) {
+        unlinkSync(pidFilePath());
+      }
     } catch {
       /* already gone */
     }

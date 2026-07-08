@@ -13,6 +13,7 @@
  * server maps it to an HTTP error.
  */
 import { ethers } from "ethers";
+import { setCliVersionHeader } from "./versionHeader";
 import { BASE_CHAIN_ID } from "./config";
 
 export class X402Error extends Error {
@@ -144,6 +145,7 @@ export async function payAndFetch(
     "Content-Type": "application/json",
     ...(opts.forwardHeaders ?? {}),
   };
+  setCliVersionHeader(baseHeaders);
 
   // 1) Unpaid probe — bounded timeout, with a few retries on transient
   // connection faults (a relay mid-restart is the common cause of the

@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { vaultSend } from "./commands/consume";
 import type { VaultConsumeClient } from "./vault-consume";
+import { HALO_VERSION } from "./version";
 
 test("vaultSend re-reserves the typed operator requirement and retries the unserved request once", async (t) => {
   const originalFetch = global.fetch;
@@ -10,10 +11,12 @@ test("vaultSend re-reserves the typed operator requirement and retries the unser
   });
 
   const requestBodies: string[] = [];
+  const requestVersions: Array<string | null> = [];
   let sends = 0;
   global.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
     sends += 1;
     requestBodies.push(String(init?.body ?? ""));
+    requestVersions.push(new Headers(init?.headers).get("X-Halo-Cli-Version"));
     if (sends === 1) {
       return new Response(
         JSON.stringify({
@@ -76,6 +79,7 @@ test("vaultSend re-reserves the typed operator requirement and retries the unser
 
   assert.equal(sends, 2);
   assert.deepEqual(requestBodies, [requestBodies[0], requestBodies[0]], "retry replays the same body");
+  assert.deepEqual(requestVersions, [HALO_VERSION, HALO_VERSION]);
   assert.equal(ensured.length, 2);
   assert.equal(ensured[1], 5_000n);
   assert.equal(result.status, 200);

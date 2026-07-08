@@ -8,6 +8,9 @@ import { cmdStatus } from "./commands/status";
 import { cmdDoctor } from "./commands/doctor";
 import { cmdService } from "./commands/service";
 import { cmdVault } from "./commands/vault";
+import { HALO_VERSION } from "./version";
+import { checkAndApplyUpdate, restartIntoManagedInstall } from "./update";
+import { shouldPreRunUpdate } from "./commandGating";
 
 // Fail-fast Node version check. The CLI uses Node 20+ APIs (notably
 // scrypt with maxmem parameters; on Node 18 the maxmem boundary crashes
@@ -76,6 +79,7 @@ halo — Halo operator + payer CLI
   halo link                                        pair with a dashboard wallet
   halo status                                      show wallet + league stats
   halo doctor [--json]                             diagnose install state, local endpoints, config, reachability
+  halo update                                      check for and apply the latest CLI release now
   halo service <install|uninstall|status|logs> [consume|serve] [-- daemon args…]
                                                    install consume/serve as an ALWAYS-ON OS service (launchd/systemd) that
                                                    survives agent/gateway restarts. e.g. halo service install consume -- --port 8799
@@ -106,7 +110,52 @@ function parseFlags(argv: string[]): Flags {
 
 async function main(): Promise<void> {
   const [, , cmd, ...rest] = process.argv;
+  if (cmd === "--version" || cmd === "-v") {
+    process.stdout.write(`${HALO_VERSION}\n`);
+    return;
+  }
+  if (cmd === "-h" || cmd === "--help" || cmd === "help" || cmd === undefined) {
+    process.stdout.write(USAGE);
+    return;
+  }
+
   const flags = parseFlags(rest);
+
+  if (cmd === "update") {
+    const result = await checkAndApplyUpdate({ force: true });
+    switch (result.kind) {
+      case "applied":
+        console.log(`✓ halo updated ${result.from} → ${result.to}`);
+        return;
+      case "current":
+      case "cached":
+        console.log(`✓ halo is current (${HALO_VERSION})`);
+        return;
+      case "disabled":
+        console.log("halo auto-update is disabled by HALO_NO_AUTOUPDATE=1");
+        return;
+      case "unmanaged":
+        console.log(
+          `halo is running from an unmanaged checkout (${process.argv[1]}). ` +
+            "The updater will not modify development installs."
+        );
+        return;
+      case "locked":
+        console.log("another halo update is already in progress");
+        return;
+      case "failed":
+        throw new Error(`update failed: ${result.error}`);
+    }
+  }
+
+  // Recognized short-lived commands update before doing real work; long-running
+  // commands (run/serve/consume) update on their own heartbeat, and an unknown
+  // command must fall through to "unknown command" without triggering an update
+  // cycle. See shouldPreRunUpdate.
+  if (shouldPreRunUpdate(cmd)) {
+    const result = await checkAndApplyUpdate();
+    if (result.kind === "applied") restartIntoManagedInstall(false);
+  }
 
   switch (cmd) {
     case "setup":
@@ -216,12 +265,6 @@ async function main(): Promise<void> {
       // Pass the raw args through — `service` does its own sub/target/passthrough
       // parsing (e.g. `halo service install consume -- --port 8799 --budget-usdc 5`).
       return cmdService(rest);
-    case "-h":
-    case "--help":
-    case "help":
-    case undefined:
-      process.stdout.write(USAGE);
-      return;
     default:
       console.error(`unknown command: ${cmd}`);
       process.stdout.write(USAGE);

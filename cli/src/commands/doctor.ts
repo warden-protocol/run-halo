@@ -13,6 +13,7 @@
 import { existsSync, readFileSync, statSync } from "fs";
 import path from "path";
 import { configDir, configPath, defaultKeystorePath, loadConfig } from "../config";
+import { readUpdateDiagnostics, UpdateDiagnostics } from "../update";
 
 export interface DoctorOptions {
   json?: boolean;
@@ -41,6 +42,7 @@ interface DoctorReport {
     /** Path to the running CLI entry. */
     entry: string;
   };
+  update: UpdateDiagnostics;
   configDir: {
     path: string;
     exists: boolean;
@@ -283,6 +285,7 @@ async function buildReport(): Promise<DoctorReport> {
       nodeVersion: process.versions.node,
       entry: process.argv[1] || "(unknown)",
     },
+    update: readUpdateDiagnostics(),
     configDir: {
       path: configDirPath,
       exists: configDirExists,
@@ -319,7 +322,32 @@ function printText(r: DoctorReport): void {
 
   console.log(`Install`);
   console.log(`  ${mark(true)} Node ${r.install.nodeVersion}`);
-  console.log(`  ${mark(true)} entry: ${r.install.entry}\n`);
+  console.log(`  ${mark(true)} entry: ${r.install.entry}`);
+  console.log(`  ${mark(true)} version: ${r.update.currentVersion}`);
+  console.log(`  ${r.update.managed ? mark(true) : warn("unmanaged")} auto-update: ${r.update.managed ? "managed" : "disabled for this checkout"}`);
+  if (r.update.latestKnownVersion) {
+    console.log(`    latest known: ${r.update.latestKnownVersion} (checked ${r.update.lastCheckedAt})`);
+  }
+  if (r.update.lastUpdateStatus) {
+    console.log(
+      `    last check: ${r.update.lastUpdateStatus}` +
+        `${r.update.lastUpdateTarget ? ` (target ${r.update.lastUpdateTarget})` : ""}`
+    );
+  }
+  if (r.update.lastUpdateAppliedAt) {
+    console.log(`    last applied: ${r.update.lastUpdateAppliedAt}`);
+  }
+  if (r.update.lastUpdateError) {
+    console.log(`    last error: ${r.update.lastUpdateError}`);
+  }
+  if (r.update.lock.held || r.update.lock.stale) {
+    console.log(
+      `    update lock: ${r.update.lock.stale ? "stale" : "held"}` +
+        `${r.update.lock.pid ? ` by pid ${r.update.lock.pid}` : ""}` +
+        `${r.update.lock.startedAt ? ` since ${r.update.lock.startedAt}` : ""}`
+    );
+  }
+  console.log();
 
   console.log(`Config (${r.configDir.path})`);
   console.log(`  ${mark(r.configDir.exists)} directory ${r.configDir.exists ? "exists" : "missing"}`);

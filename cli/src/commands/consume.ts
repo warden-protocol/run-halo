@@ -61,6 +61,8 @@ import {
   withReservationMargin,
   type VaultOperatorSelectionReason,
 } from "@halo/vault-core";
+import { setCliVersionHeader } from "../versionHeader";
+import { restartIntoManagedInstall, startAutoUpdateMonitor } from "../update";
 
 interface Args {
   port?: number;
@@ -252,6 +254,7 @@ export async function vaultSend(
     "x-halo-operator": opts.operator,
     "x-halo-vault-consumer": await client.consumer(),
   };
+  setCliVersionHeader(headers);
   if (!("x-halo-max-price" in headers) && !("X-Halo-Max-Price" in headers)) {
     headers["x-halo-max-price"] = String(opts.priceUsdPerMtok);
   }
@@ -382,6 +385,33 @@ async function runDetached(
     console.error(`  ⚠ launched detached (pid ${pid}) but it didn't report healthy within 12s — check ${logPath}`);
     process.exit(1);
   }
+}
+
+/**
+ * Bounded graceful drain shared by the SIGINT/SIGTERM and auto-update paths.
+ * Resolves once BOTH the server has closed and pending vault redeems have
+ * flushed, or after `timeoutMs`, whichever comes first (a stuck close or wedged
+ * redeem can never hang shutdown). The redeem flush MUST be awaited here — the
+ * auto-update path calls process.exit() the instant this resolves, so a
+ * fire-and-forget flush would truncate an in-flight redeem for already-served
+ * tokens (operator served unpaid, per docs/VAULT_PAYMENT_INVARIANTS.md).
+ */
+export function drainForShutdown(
+  closeServer: () => Promise<void>,
+  flushRedeems: (() => Promise<void>) | null,
+  timeoutMs: number
+): Promise<void> {
+  return new Promise<void>((done) => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      done();
+    };
+    setTimeout(finish, timeoutMs).unref();
+    const flushed = flushRedeems ? flushRedeems().catch(() => {}) : Promise.resolve();
+    void Promise.all([closeServer(), flushed]).then(finish);
+  });
 }
 
 export async function cmdConsume(args: Args): Promise<void> {
@@ -1054,6 +1084,10 @@ export async function cmdConsume(args: Args): Promise<void> {
       const headers: Record<string, string> = { "Content-Type": "application/json", ...budgetHeaders() };
       const operator = result.headers.get("X-Halo-Operator");
       if (operator) headers["X-Halo-Operator"] = operator;
+      const deprecationWarning = result.headers.get("X-Halo-Deprecation-Warning");
+      if (deprecationWarning) {
+        headers["X-Halo-Deprecation-Warning"] = deprecationWarning;
+      }
       headers["X-Halo-Paid"] = result.paid ? "true" : "false";
       logReq({
         model: typeof parsed.model === "string" ? parsed.model : "(none)",
@@ -1158,24 +1192,40 @@ export async function cmdConsume(args: Args): Promise<void> {
     console.log(`\n  point an OpenAI-compatible client at the endpoint above. Fund the wallet with USDC on Base.\n`);
   });
 
-  // Keep the process alive until interrupted.
+  // Keep the process alive until interrupted. Auto-update and SIGINT/SIGTERM
+  // share the same bounded drain: shutdown() awaits the pending-receipt flush so
+  // the auto-update restart's process.exit() can't truncate an in-flight redeem.
   await new Promise<void>((resolve) => {
-    let shuttingDown = false;
-    const shutdown = () => {
-      if (shuttingDown) return; // second Ctrl-C shouldn't double-run
-      shuttingDown = true;
+    let shutdownPromise: Promise<void> | null = null;
+    let signalShutdownRequested = false;
+    let stopUpdateMonitor = (): void => {};
+    const shutdown = (): Promise<void> => {
+      if (shutdownPromise) return shutdownPromise;
       console.log("\n  shutting down…");
-      // Flush any in-flight vault receipt redeems so the operator is paid for
-      // work already served before we exit.
-      if (vault) void vault.flushRedeems();
-      server.close(() => resolve());
-      // Drop idle keep-alive sockets so close() doesn't wait on them, and
-      // force-resolve if an in-flight request refuses to drain.
-      server.closeIdleConnections?.();
-      setTimeout(() => resolve(), 5000).unref();
+      stopUpdateMonitor();
+      shutdownPromise = drainForShutdown(
+        () =>
+          new Promise<void>((r) => {
+            server.close(() => r());
+            server.closeIdleConnections?.();
+          }),
+        vault ? () => vault.flushRedeems() : null,
+        5000
+      );
+      return shutdownPromise;
     };
-    process.on("SIGINT", shutdown);
-    process.on("SIGTERM", shutdown);
+    const signalShutdown = (): void => {
+      signalShutdownRequested = true;
+      void shutdown().then(resolve);
+    };
+    process.on("SIGINT", signalShutdown);
+    process.on("SIGTERM", signalShutdown);
+    stopUpdateMonitor = startAutoUpdateMonitor(async () => {
+      if (shutdownPromise || signalShutdownRequested) return;
+      await shutdown();
+      if (signalShutdownRequested) return;
+      restartIntoManagedInstall();
+    });
   });
 }
 

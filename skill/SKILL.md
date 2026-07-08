@@ -60,16 +60,18 @@ no League points and just burns the settlement spread.
 
 ### Install the CLI
 
-Both roles use the `halo` CLI. One command installs it (idempotent — safe to re-run,
-exits cleanly if already installed):
+Both roles use the `halo` CLI. One command installs it and is safe to re-run: a managed
+install updates in place, while a contributor's unmanaged `npm link` checkout is left untouched.
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/warden-protocol/run-halo/main/skill/scripts/install.sh)
 ```
 
-The script checks for **Node 20+** (the CLI fails fast on older versions), clones the repo
-into `$TMPDIR/halo-install`, runs `npm install && npm run build && npm link`, and verifies
-with `halo --help`. If Node 20+ is missing, the operator installs it manually
+The script checks for **Node 20+** (the CLI fails fast on older versions), resolves the latest
+CI-verified `cli-vX.Y.Z` release into `~/.halo/src`, builds `vault-core → sdk → cli` with
+`npm ci`, links it with `npm link`, and verifies with `halo --version`. Future releases apply
+silently in the background; `halo update` forces an immediate check. If Node 20+ is missing,
+the operator installs it manually
 (https://nodejs.org or `nvm install 20 && nvm use 20`) — don't try to install Node from the
 skill.
 

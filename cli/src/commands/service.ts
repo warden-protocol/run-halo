@@ -99,22 +99,42 @@ function passphrasePreflight(): void {
   }
 }
 
+export function buildServiceEnvironment(
+  source: NodeJS.ProcessEnv = process.env,
+  home = homedir()
+): Record<string, string> {
+  const env: Record<string, string> = {
+    HOME: home,
+    PATH: source.PATH || "/usr/local/bin:/usr/bin:/bin",
+    HALO_SERVICE: "1",
+  };
+  if (source.HALO_PASSPHRASE != null) env.HALO_PASSPHRASE = source.HALO_PASSPHRASE;
+  if (source.HALO_NO_AUTOUPDATE != null) {
+    env.HALO_NO_AUTOUPDATE = source.HALO_NO_AUTOUPDATE;
+  }
+  for (const k of [
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+  ]) {
+    if (source[k] != null) env[k] = source[k] as string;
+  }
+  return env;
+}
+
 function install(target: Target, passthrough: string[], dryRun: boolean): void {
   const argv = [...invocation(), target, ...passthrough];
   const outLog = path.join(configDir(), `${target}.log`);
   const errLog = path.join(configDir(), `${target}.err`);
-  const env: Record<string, string> = {
-    HOME: homedir(),
-    PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin",
-  };
-  if (process.env.HALO_PASSPHRASE != null) env.HALO_PASSPHRASE = process.env.HALO_PASSPHRASE;
+  const env = buildServiceEnvironment();
   // Carry proxy config into the unit — a background service inherits none of the
   // shell's env, so without this it can't reach the relay / Intel PCS on a
   // proxied network (consume/serve call installProxyFromEnv() to honor these).
-  for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy", "ALL_PROXY", "all_proxy"]) {
-    if (process.env[k] != null) env[k] = process.env[k] as string;
-  }
-
   if (process.platform === "darwin") return installLaunchd(target, argv, env, outLog, errLog, dryRun);
   if (process.platform === "linux") return installSystemd(target, argv, env, outLog, errLog, dryRun);
   console.error(
