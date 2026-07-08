@@ -1,0 +1,82 @@
+---
+name: Cut CLI release
+
+"on":
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Semver without the cli-v prefix (for example 0.2.0)
+        required: true
+        type: string
+      ref:
+        description: Exact branch, tag, or commit to validate and release
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout requested commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Validate release version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "version must be X.Y.Z" >&2
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/cli-v${VERSION}" >/dev/null 2>&1; then
+            echo "cli-v${VERSION} already exists" >&2
+            exit 1
+          fi
+
+      - name: Setup Node
+        uses: ./.github/actions/setup-node
+        with:
+          package: cli
+
+      # Create the candidate tag locally before building so generate-version.js
+      # bakes the exact version that will be published. It is not pushed unless
+      # every validation and dist smoke test below succeeds.
+      - name: Create local candidate tag
+        env:
+          VERSION: ${{ inputs.version }}
+        run: git tag "cli-v${VERSION}" HEAD
+
+      - name: Validate vault-core
+        working-directory: vault-core
+        run: npm ci && npm run typecheck && npm test && npm run build
+
+      - name: Validate SDK
+        working-directory: sdk
+        run: npm ci && npm run typecheck && npm test && npm run build
+
+      - name: Validate CLI
+        working-directory: cli
+        run: npm ci && npm run typecheck && npm test && npm run build
+
+      - name: Smoke-test built CLI
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          test "$(node cli/dist/index.js --version)" = "cli-v${VERSION}"
+          HELP=$(node cli/dist/index.js --help)
+          grep -Fq "halo — Halo operator + payer CLI" <<< "$HELP"
+
+      - name: Create verified CLI release tag
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git push origin "cli-v${VERSION}"
