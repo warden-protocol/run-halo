@@ -254,6 +254,8 @@ export function isReasoningModel(model: string): boolean {
     m.includes("deepseek-r") || // DeepSeek R1 / R1-distill
     m.includes("magistral") || // Mistral reasoning
     m.includes("qwq") || // Qwen QwQ
+    /glm-(4\.[5-9]|[5-9])/.test(m) || // Zhipu GLM-4.5+/5 are hybrid-reasoning, thinking on by default
+    m.includes("minimax-m") || // MiniMax M-series (M1/M2/M3) are reasoning-first
     m.includes("thinking") // explicit "…-thinking" model-id variants
   );
 }
