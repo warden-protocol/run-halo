@@ -56,6 +56,24 @@ import { decryptSecret, isEncryptedSecret } from "../secret";
 import { sanitizeChatRequest, sanitizeMessages } from "../sanitize";
 import { installProxyFromEnv } from "../proxy";
 import {
+  classifyUpstreamProviderError,
+  CREDIT_EXHAUSTED_400_RE,
+  normalizeUpstreamError,
+  operatorErrorResponse,
+  transientUpstreamErrorResponse,
+  upstreamProviderErrorResponse,
+  type UpstreamProviderErrorCode,
+} from "../upstream-error";
+import {
+  breakerCode,
+  clearBreaker,
+  isBreakerOpen,
+  isStickyUpstreamCode,
+  openBreakerSlugs,
+  setBreakerChangeHandler,
+  tripBreaker,
+} from "../provider-breaker";
+import {
   decryptRequest,
   encryptResponse,
   generateOperatorKeypair,
@@ -137,6 +155,12 @@ function parseVoucherHeader(raw: string | undefined): SignedVoucher | undefined 
 // enclave and CANNOT read the content — it relays ciphertext only.
 const E2EE_REQ_HEADERS = ["x-client-pub-key", "x-encryption-version", "x-signing-algo"];
 
+function maskApiKeyForLog(k: string | undefined): string {
+  if (!k) return "(no key sent)";
+  if (k.length <= 12) return `set, len ${k.length}`;
+  return `${k.slice(0, 6)}…${k.slice(-4)} (len ${k.length})`;
+}
+
 // Upstream RESPONSE headers safe to relay back to the consumer (TEE attestation
 // / response-signature material for client-side verification). Allowlisted so a
 // hostile upstream can't echo arbitrary operator-side metadata. Exact NEAR names
@@ -208,6 +232,119 @@ function resolveProvider(
   return { provider, apiKey };
 }
 
+// ── Upstream provider circuit breaker (issue #459) ──────────────────────────
+// A credit-exhaustion or auth failure from an upstream provider does NOT clear
+// on the next request — the account is out of credits or the key is bad. Rather
+// than pay the latency of forwarding a fresh failure to every consumer (and
+// keep advertising models we can't actually serve), we OPEN a breaker for that
+// provider on the first such error. While open:
+//   • the provider's models are de-announced from the relay, so it routes them
+//     to healthy operators instead of us;
+//   • further requests for those models are instant-rejected (pre-payment, so
+//     the consumer is never charged) with the same structured error;
+//   • a background probe re-tests the account and CLOSES the breaker (re-
+//     announcing the models) once it's healthy again.
+// The pure state machine (which providers are open, and the change hook) lives
+// in ../provider-breaker; this file owns the fetch probe, model filtering, and
+// relay re-announce. Transient upstream errors (a 429 without a credit signal,
+// 5xx) are NOT sticky — relay rotation handles those and they self-heal.
+const PROVIDER_REPROBE_INTERVAL_MS = 60_000;
+
+// Trip the breaker and log the transition (the pure trip() only mutates state).
+function tripBreakerLogged(slug: string, code: UpstreamProviderErrorCode | null): void {
+  if (!tripBreaker(slug, code)) return;
+  const why =
+    code === "credit_exhausted"
+      ? "upstream provider account is out of credits"
+      : "upstream provider rejected the API key";
+  console.warn(
+    `  ⛔ circuit breaker OPEN for "${slug}" (${why}); de-announcing its models and ` +
+      `instant-rejecting its requests until it recovers (re-probing every ${PROVIDER_REPROBE_INTERVAL_MS / 1000}s)`
+  );
+}
+
+function clearBreakerLogged(slug: string): void {
+  if (clearBreaker(slug)) {
+    console.log(`  ✅ circuit breaker CLOSED for "${slug}"; re-announcing its models`);
+  }
+}
+
+// Union of models advertised by providers whose breaker is currently open.
+function breakerDeannouncedModels(cfg: HaloConfig): Set<string> {
+  const providers = configProviders(cfg);
+  const out = new Set<string>();
+  for (const m of allConfiguredModels(cfg)) {
+    if (isBreakerOpen(providerForModel(providers, m).slug)) out.add(m);
+  }
+  return out;
+}
+
+// Best-effort 1-token health probe for a single provider. Returns true when the
+// account looks servable again (2xx, or any non-2xx that is NOT a credit/auth
+// fault — e.g. a 400 from the throwaway payload still proves the key + credits
+// work). A network/timeout error is inconclusive → treated as still-unhealthy
+// so the breaker stays open. Mirrors the startup key probe.
+async function probeProviderHealthy(provider: ProviderConfig): Promise<boolean> {
+  const k = typeof provider.apiKey === "string" ? provider.apiKey : undefined;
+  if (!k) return true; // keyless/local provider — nothing to authenticate
+  const model = provider.models[0];
+  if (!model) return true;
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 8_000);
+    const wire = wireFormatFor(provider.slug);
+    const base = provider.baseUrl.replace(/\/+$/, "");
+    const url = wire === "anthropic" ? `${base}/messages` : `${base}/chat/completions`;
+    const headers =
+      wire === "anthropic"
+        ? anthropicHeaders(k)
+        : { "Content-Type": "application/json", Authorization: `Bearer ${k}` };
+    const body =
+      wire === "anthropic"
+        ? chatCompletionsToAnthropicRequest({
+            model,
+            messages: [{ role: "user", content: "." }],
+            max_tokens: 1,
+          })
+        : { model, messages: [{ role: "user", content: "." }], max_tokens: 1 };
+    const res = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+    if (res.ok) return true;
+    const text = await res.text().catch(() => "");
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parsed = { error: { message: text } };
+    }
+    return !isStickyUpstreamCode(classifyUpstreamProviderError(res.status, parsed));
+  } catch {
+    return false; // inconclusive — keep the breaker open
+  }
+}
+
+// Long-lived loop (started once, alongside the heartbeat): periodically re-probes
+// every open breaker and closes the ones that recovered.
+async function startBreakerReprobe(cfg: HaloConfig): Promise<void> {
+  const providers = configProviders(cfg);
+  for (;;) {
+    await new Promise((r) => setTimeout(r, PROVIDER_REPROBE_INTERVAL_MS));
+    for (const slug of openBreakerSlugs()) {
+      const provider = providers.find((p) => p.slug === slug);
+      if (!provider) {
+        clearBreakerLogged(slug); // provider no longer configured — nothing to gate
+        continue;
+      }
+      if (await probeProviderHealthy(provider)) clearBreakerLogged(slug);
+    }
+  }
+}
+
 async function callUpstream(
   cfg: HaloConfig,
   _apiKey: string | undefined,
@@ -249,8 +386,7 @@ async function callUpstream(
   if (wire === "anthropic") {
     if (!apiKey) {
       return {
-        status: 500,
-        data: { error: { message: "anthropic provider requires an API key" } },
+        ...upstreamProviderErrorResponse("operator_auth_failure"),
         usage: zeroUsage,
         respHeaders: {},
       };
@@ -292,7 +428,12 @@ async function callUpstream(
         : err instanceof Error
           ? err.message
           : String(err);
-    return { status: 504, data: { error: { message: msg } }, usage: zeroUsage, respHeaders: {} };
+    console.warn(`  ⚠ upstream request failed before response: ${msg}`);
+    return {
+      ...transientUpstreamErrorResponse(),
+      usage: zeroUsage,
+      respHeaders: {},
+    };
   }
   clearTimeout(timer);
 
@@ -307,18 +448,17 @@ async function callUpstream(
   // On non-2xx, never pass the raw upstream body to the consumer. A misbehaving
   // or hostile upstream (custom proxy, self-hosted gateway, dev fork) could echo
   // request headers or other operator-side metadata in its error body. We
-  // sanitize to a fixed safe shape — `message`/`type`/`code` only, all coerced
-  // to strings — and log the full original to operator stderr so the operator
-  // can still debug locally.
+  // sanitize consumer-fault errors to safe `message`/`type`/`code` fields, and
+  // collapse provider-side infrastructure failures to structured Halo codes.
+  // The full original body is only printed to the operator terminal when
+  // HALO_DEBUG_UPSTREAM_ERRORS=1 is set.
   if (!res.ok) {
     // Auth failures are almost always a stale/wrong key configured for THIS
     // provider — name it explicitly (with a masked fingerprint of the key that
     // was actually sent) so the operator can compare against a known-good key
     // and re-set the right gateway, instead of seeing a generic browser error.
     if (res.status === 401 || res.status === 403) {
-      const masked = apiKey
-        ? `${apiKey.slice(0, 6)}…${apiKey.slice(-4)} (len ${apiKey.length})`
-        : "(no key sent)";
+      const masked = maskApiKeyForLog(apiKey);
       console.error(
         `  ✖ upstream "${provider.slug}" rejected the API key (HTTP ${res.status}). ` +
           `Key sent: ${masked}. The key configured for "${provider.slug}" was refused by ${base} — ` +
@@ -332,12 +472,11 @@ async function callUpstream(
         `  upstream ${res.status} (set HALO_DEBUG_UPSTREAM_ERRORS=1 to print body to this terminal)`
       );
     }
-    return {
-      status: res.status,
-      data: sanitizeUpstreamError(parsed, res.status),
-      usage: zeroUsage,
-      respHeaders: {},
-    };
+    // A credit/auth fault won't clear next request — open this provider's
+    // breaker so we de-announce its models and stop paying to re-discover it.
+    tripBreakerLogged(provider.slug, classifyUpstreamProviderError(res.status, parsed));
+    const normalized = normalizeUpstreamError(parsed, res.status);
+    return { ...normalized, usage: zeroUsage, respHeaders: {} };
   }
 
   // Translate Anthropic responses back to OpenAI shape so the consumer sees a
@@ -418,7 +557,9 @@ async function streamUpstream(
         : err instanceof Error
           ? err.message
           : String(err);
-    return { status: 504, usage: zeroUsage, ok: false, errorData: { error: { message: msg } } };
+    console.warn(`  ⚠ upstream(stream) request failed before response: ${msg}`);
+    const normalized = transientUpstreamErrorResponse();
+    return { status: normalized.status, usage: zeroUsage, ok: false, errorData: normalized.data };
   }
   if (!res.ok || !res.body) {
     clearTimeout(timer);
@@ -429,11 +570,23 @@ async function streamUpstream(
     } catch {
       parsed = { error: { message: text } };
     }
-    if (process.env.HALO_DEBUG_UPSTREAM_ERRORS === "1") {
+    if (res.status === 401 || res.status === 403) {
+      console.error(
+        `  ✖ upstream(stream) "${provider.slug}" rejected the API key (HTTP ${res.status}). ` +
+          `Key sent: ${maskApiKeyForLog(apiKey)}. The key configured for "${provider.slug}" ` +
+          `was refused by ${base} — re-set it with: halo setup --add-provider --provider ${provider.slug} --api-key <key>  (then restart serve).`
+      );
+    } else if (process.env.HALO_DEBUG_UPSTREAM_ERRORS === "1") {
       // Terminal-only: the body can echo the prompt, so it must not hit serve.log.
       debugToTerminal(`  upstream(stream) ${res.status} body: ${text.slice(0, 2000)}`);
+    } else {
+      console.error(
+        `  upstream(stream) ${res.status} (set HALO_DEBUG_UPSTREAM_ERRORS=1 to print body to this terminal)`
+      );
     }
-    return { status: res.status, usage: zeroUsage, ok: false, errorData: sanitizeUpstreamError(parsed, res.status) };
+    tripBreakerLogged(provider.slug, classifyUpstreamProviderError(res.status, parsed));
+    const normalized = normalizeUpstreamError(parsed, res.status);
+    return { status: normalized.status, usage: zeroUsage, ok: false, errorData: normalized.data };
   }
 
   let usage = zeroUsage;
@@ -477,41 +630,19 @@ async function streamUpstream(
     }
   } catch (err) {
     clearTimeout(timer);
+    console.warn(
+      `  ⚠ upstream(stream) read failed: ${err instanceof Error ? err.message : String(err)}`
+    );
+    const normalized = upstreamProviderErrorResponse("provider_error");
     return {
-      status: 502,
+      status: normalized.status,
       usage,
       ok: false,
-      errorData: { error: { message: err instanceof Error ? err.message : String(err) } },
+      errorData: normalized.data,
     };
   }
   clearTimeout(timer);
   return { status: 200, usage, ok: true };
-}
-
-/**
- * Strip an upstream error body down to a fixed safe shape. Preserves the
- * standard OpenAI-error fields (`message`, `type`, `code`) when present and
- * non-empty strings — drops everything else. Prevents a hostile or
- * misconfigured upstream from leaking operator-side request metadata back to
- * the consumer.
- */
-function sanitizeUpstreamError(parsed: unknown, status: number): unknown {
-  const src = (parsed as { error?: unknown })?.error;
-  const safe: { message: string; type?: string; code?: string } = {
-    message: `upstream provider returned ${status}`,
-  };
-  if (src && typeof src === "object") {
-    const e = src as Record<string, unknown>;
-    if (typeof e.message === "string" && e.message.length > 0 && e.message.length < 500) {
-      safe.message = e.message;
-    }
-    if (typeof e.type === "string" && e.type.length < 100) safe.type = e.type;
-    if (typeof e.code === "string" && e.code.length < 100) safe.code = e.code;
-  } else if (typeof (parsed as { message?: unknown })?.message === "string") {
-    const m = (parsed as { message: string }).message;
-    if (m.length > 0 && m.length < 500) safe.message = m;
-  }
-  return { error: safe };
 }
 
 // Reconnect strategy: try forever by default, with exponential backoff capped
@@ -691,24 +822,42 @@ export async function cmdServe(): Promise<void> {
   // BEFORE any consumer request, so a stale/typo'd key (which looks right in the
   // masked fingerprint — same prefix/suffix/length, different middle) surfaces as
   // a clear startup failure instead of a confusing "Invalid or expired API key"
-  // in the consumer's browser. One ~free 1-token call per keyed openai-compat
+  // in the consumer's browser. One ~free 1-token call per keyed
   // provider; best-effort (a network blip just skips, never blocks serve).
   await Promise.all(
     configProviders(cfg).map(async (p) => {
       const k = typeof p.apiKey === "string" ? p.apiKey : undefined;
-      if (!k || wireFormatFor(p.slug) !== "openai-compat") return; // skip keyless/local + anthropic-wire
+      if (!k) return; // skip keyless/local providers
       const model = p.models[0];
       if (!model) return;
       try {
         const ctrl = new AbortController();
         const timer = setTimeout(() => ctrl.abort(), 8_000);
-        const res = await fetch(`${p.baseUrl.replace(/\/+$/, "")}/chat/completions`, {
+        const wire = wireFormatFor(p.slug);
+        const url =
+          wire === "anthropic"
+            ? `${p.baseUrl.replace(/\/+$/, "")}/messages`
+            : `${p.baseUrl.replace(/\/+$/, "")}/chat/completions`;
+        const headers =
+          wire === "anthropic"
+            ? anthropicHeaders(k)
+            : { "Content-Type": "application/json", Authorization: `Bearer ${k}` };
+        const body =
+          wire === "anthropic"
+            ? chatCompletionsToAnthropicRequest({
+                model,
+                messages: [{ role: "user", content: "." }],
+                max_tokens: 1,
+              })
+            : { model, messages: [{ role: "user", content: "." }], max_tokens: 1 };
+        const res = await fetch(url, {
           method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${k}` },
-          body: JSON.stringify({ model, messages: [{ role: "user", content: "." }], max_tokens: 1 }),
+          headers,
+          body: JSON.stringify(body),
           signal: ctrl.signal,
         });
         clearTimeout(timer);
+        const probeText = await res.text().catch(() => "");
         if (res.status === 401 || res.status === 403) {
           console.error(
             `  ✖ ${p.slug}: upstream REJECTED the stored key (HTTP ${res.status}) — ${maskKey(k)}.`
@@ -717,6 +866,25 @@ export async function cmdServe(): Promise<void> {
             `    This is the key actually loaded for "${p.slug}"; the upstream says it's invalid. ` +
               `Compare it to a key that works in a direct curl (a 1-char typo keeps the same length/prefix). ` +
               `Re-set: halo setup --add-provider --provider ${p.slug} --api-key <key>  then restart serve.`
+          );
+          // Don't announce models we can't serve; the background re-probe closes
+          // the breaker once the key is fixed (issue #459).
+          tripBreakerLogged(p.slug, "operator_auth_failure");
+        } else if (res.status === 402) {
+          console.error(
+            `  ✖ ${p.slug}: upstream accepted the stored key but cannot serve paid requests ` +
+              `(HTTP 402, likely out of credits) — ${maskKey(k)}.`
+          );
+          tripBreakerLogged(p.slug, "credit_exhausted");
+        } else if (res.status === 400 && CREDIT_EXHAUSTED_400_RE.test(probeText)) {
+          console.error(
+            `  ✖ ${p.slug}: upstream accepted the stored key but reports insufficient account credits ` +
+              `(HTTP 400) — ${maskKey(k)}.`
+          );
+          tripBreakerLogged(p.slug, "credit_exhausted");
+        } else if (!res.ok) {
+          console.log(
+            `  • ${p.slug}: key probe reached upstream but returned HTTP ${res.status}; serve will continue`
           );
         } else {
           console.log(`  ✓ ${p.slug}: stored key accepted by upstream`);
@@ -961,12 +1129,16 @@ export async function cmdServe(): Promise<void> {
           ): Promise<void> => {
             const signature = await wallet.signMessage(announceMsg);
             const providers = configProviders(cfg);
-            const announceModels = allConfiguredModels(cfg);
+            // De-announce models whose provider circuit breaker is open (issue
+            // #459) so the relay routes them to healthy operators instead of us;
+            // re-announced (via the breaker change hook below) once it recovers.
+            const deannounced = breakerDeannouncedModels(cfg);
+            const announceModels = allConfiguredModels(cfg).filter((m) => !deannounced.has(m));
             // Models served by a TEE provider → advertised as confidential-capable
             // so the relay can classify TEE PER MODEL (a multi-provider operator
             // may serve openrouter + near; only the near models are confidential).
             const teeModels = providers
-              .filter((p) => isTeeProviderSlug(p.slug))
+              .filter((p) => isTeeProviderSlug(p.slug) && !isBreakerOpen(p.slug))
               .flatMap((p) => p.models);
             ws.send(
               JSON.stringify({
@@ -1020,6 +1192,9 @@ export async function cmdServe(): Promise<void> {
           };
 
           const initialVaultCapability = vaultPayments;
+          // Last capability we announced — a breaker re-announce must preserve
+          // it (don't silently drop a vault promotion that already landed).
+          let announcedCapability = initialVaultCapability;
           try {
             await sendAnnouncement(initialVaultCapability, false);
           } catch (err) {
@@ -1027,12 +1202,22 @@ export async function cmdServe(): Promise<void> {
             ws.close(4000, "announce sign failed");
             return;
           }
+          // Re-announce (with the breaker-filtered model set) whenever a
+          // provider trips or recovers, so the relay's routing table tracks
+          // which of our models are actually servable (issue #459).
+          setBreakerChangeHandler(() => {
+            if (wsClosed || ws.readyState !== WebSocket.OPEN) return;
+            void sendAnnouncement(announcedCapability, false).catch((err) =>
+              logError("circuit-breaker re-announce failed", err)
+            );
+          });
           if (!initialVaultCapability) {
             void (async () => {
               while (!shuttingDown && !wsClosed) {
                 if (await probeVaultCapability()) {
                   if (ws.readyState !== WebSocket.OPEN || wsClosed) return;
                   try {
+                    announcedCapability = true;
                     await sendAnnouncement(true, true);
                     return;
                   } catch (err) {
@@ -1049,6 +1234,11 @@ export async function cmdServe(): Promise<void> {
             heartbeatStarted = true;
             startHeartbeat(cfg, wallet).catch((err) =>
               logError("heartbeat loop crashed", err)
+            );
+            // Re-probe any open provider breakers in the background; closing one
+            // re-announces its models via the breaker change hook (issue #459).
+            startBreakerReprobe(cfg).catch((err) =>
+              logError("breaker re-probe loop crashed", err)
             );
           }
           return;
@@ -1133,6 +1323,37 @@ export async function cmdServe(): Promise<void> {
 
         const requestedModel =
           typeof req.body.model === "string" ? req.body.model : allConfiguredModels(cfg)[0] || "unknown";
+
+        // Circuit breaker (issue #459): if this model's provider is known to be
+        // out of credits / rejecting its key, don't verify payment or call
+        // upstream — instant-reject BEFORE the consumer is charged. The response
+        // is byte-for-byte what a live upstream failure would have produced
+        // (structured 502 upstream_provider_error), so the consumer/frontend
+        // classify it identically. The real failover is that we've de-announced
+        // this model, so the relay routes the consumer's next attempt to a
+        // healthy operator; a request already in flight when the breaker tripped
+        // still lands here and gets the fast, un-charged rejection.
+        const brokenSlug = providerForModel(configProviders(cfg), requestedModel).slug;
+        if (isBreakerOpen(brokenSlug)) {
+          const code = breakerCode(brokenSlug) ?? "provider_error";
+          console.warn(
+            `  ⛔ instant-reject ${req.requestId}: breaker open for "${brokenSlug}" (${code}); not charging`
+          );
+          if (ws.readyState === WebSocket.OPEN) {
+            const rejected = upstreamProviderErrorResponse(code);
+            ws.send(
+              JSON.stringify({
+                type: "inference-response",
+                requestId: req.requestId,
+                status: rejected.status,
+                headers: {},
+                body: rejected.data,
+              })
+            );
+          }
+          return;
+        }
+
         // Completion ceiling drives the prompt-blind 402 quote. The consumer
         // sends max_tokens on BOTH the challenge probe and the retry, so this
         // value is identical across the two calls and the quote stays stable.
@@ -1247,12 +1468,22 @@ export async function cmdServe(): Promise<void> {
                 console.warn(
                   `  ⚠ rejecting vault request ${req.requestId}: ${chk.reason} (need ${fmtUsd(ceilingCost)}, have ${fmtUsd(chk.remaining)})`
                 );
+                // An EXPIRED reservation is usually revived by re-reserving (a
+                // top-up extends its expiry) — UNLESS it has reached its on-chain
+                // lifetime cap (created + maxReserveTtl), in which case only a
+                // reclaim + fresh reserve recovers the funds (#473). The operator
+                // doesn't read the cap here, so name both paths rather than
+                // over-claiming that a top-up can't revive (PR #481 review).
+                const advice =
+                  chk.reason === "reservation expired"
+                    ? "re-reserve to extend it — or, if it has reached its on-chain lifetime cap, reclaim it from your vault first, then re-reserve"
+                    : "reserve more from your vault";
                 out = {
                   status: 402,
                   headers: {},
                   body: {
                     error: {
-                      message: `Vault reservation insufficient: ${chk.reason}. This request needs up to ${fmtUsd(ceilingCost)} reserved; reserve more from your vault.`,
+                      message: `Vault reservation insufficient: ${chk.reason}. This request needs up to ${fmtUsd(ceilingCost)} reserved; ${advice}.`,
                       type: "vault_reservation_insufficient",
                       requiredUsdcBase: ceilingCost.toString(),
                       remainingUsdcBase: chk.remaining.toString(),
@@ -2089,10 +2320,14 @@ export async function cmdServe(): Promise<void> {
             );
             creditAdmitted = null;
           }
+          console.warn(
+            `  ⚠ serve failed before response: ${err instanceof Error ? err.message : String(err)}`
+          );
+          const failed = operatorErrorResponse();
           out = {
-            status: 502,
+            status: failed.status,
             headers: {},
-            body: { error: err instanceof Error ? err.message : String(err) },
+            body: failed.data,
           };
         }
 
@@ -2119,6 +2354,10 @@ export async function cmdServe(): Promise<void> {
       ws.on("close", (code, reason) => {
         wsClosed = true;
         stopKeepalive();
+        // Drop the breaker re-announce hook for this (now-dead) socket; the next
+        // connection re-registers it, and its fresh announce reflects the
+        // current breaker state (issue #459).
+        setBreakerChangeHandler(null);
         console.log(`  ✖ disconnected (code=${code}, reason=${reason.toString() || "-"})`);
         resolve({ announced });
       });
