@@ -18,7 +18,10 @@ import { promisify } from "node:util";
 import { configDir } from "./config";
 import { HALO_VERSION } from "./version";
 
-export const CANONICAL_REMOTE = "https://github.com/warden-protocol/halo.git";
+// run-halo fork: managed installs are cloned from and self-update against the
+// fork, where the fork's release tags (cli-v0.2.1+) are cut. Upstream halo has a
+// separate, older release line, so this must NOT be de-branded back to halo.git.
+export const CANONICAL_REMOTE = "https://github.com/warden-protocol/run-halo.git";
 // Cache successful checks and failed-target backoff for the same short interval.
 export const UPDATE_CHECK_TTL_MS = 5 * 60 * 1000;
 // Grace window after a detached relaunch spawns, to catch a child that launches
