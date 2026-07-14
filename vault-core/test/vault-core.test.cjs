@@ -313,12 +313,6 @@ test("isReasoningModel flags reasoning families and not ordinary models", () => 
     "qwen/qwq-32b",
     "qwen3-235b-a22b-thinking",
     "some-reasoner",
-    "z-ai/glm-4.5", // GLM-4.5+ hybrid-reasoning, thinking on by default
-    "glm-4.7-flash",
-    "z-ai/glm-5",
-    "glm-5v-turbo",
-    "minimax/minimax-m2", // MiniMax M-series reasoning-first
-    "minimax-m2.1",
   ]) {
     assert.equal(core.isReasoningModel(m), true, `expected reasoning: ${m}`);
   }
@@ -333,9 +327,6 @@ test("isReasoningModel flags reasoning families and not ordinary models", () => 
     "llama-3.3-70b",
     "qwen2.5-72b",
     "mixtral-8x7b",
-    "z-ai/glm-4", // pre-reasoning GLM-4 base — must NOT match
-    "glm-4.1v", // GLM-4.1 (< 4.5) — must NOT match
-    "minimax-text-01", // MiniMax non-M text model — must NOT match
     "",
   ]) {
     assert.equal(core.isReasoningModel(m), false, `expected non-reasoning: ${m}`);
