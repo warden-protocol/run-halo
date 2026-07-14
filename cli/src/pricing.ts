@@ -318,14 +318,6 @@ export async function upstreamRatePer1KUsd(params: {
  * Heuristic: ~4 chars per token. Conservative for English, slightly
  * over-estimates for code/CJK; both bias toward over-quoting the user,
  * which is honest behavior for a ceiling-style 402.
- *
- * Counts array-form content (multimodal / tool parts) the same way as
- * @halo/vault-core `estimateTokens` (JSON.stringify each part). Previously this
- * counted only string `content`, so an array-content prompt was estimated as 0
- * prompt chars — the operator's vault ceiling then under-priced the request and
- * settled at a loss, AND diverged from the consumer's reserve sizing (which does
- * count array content), forcing an extra reserve-and-replay round trip. Keeping
- * the two estimators consistent restores `reserve >= gate` without the replay.
  */
 export function estimatePromptTokens(messages: unknown): number {
   if (!Array.isArray(messages)) return 0;
@@ -334,9 +326,6 @@ export function estimatePromptTokens(messages: unknown): number {
     if (m && typeof m === "object") {
       const content = (m as { content?: unknown }).content;
       if (typeof content === "string") chars += content.length;
-      else if (Array.isArray(content)) {
-        for (const part of content) chars += JSON.stringify(part).length;
-      }
     }
   }
   // +4 tokens per message for role + delimiters, OpenAI's published overhead.
