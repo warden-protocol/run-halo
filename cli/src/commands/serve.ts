@@ -24,7 +24,7 @@ import {
   OpenAIChatRequest,
 } from "../anthropic-adapter";
 import {
-  estimatePromptTokens,
+  estimateRequestPromptTokens,
   priceRequest,
   upstreamContextLength,
   upstreamRatePer1KUsd,
@@ -51,7 +51,11 @@ import {
 } from "../vaultReceiptRehydration";
 import { releaseAbortedVaultServe, withAbortedStreamCleanup } from "../vaultStreamAbort";
 import { OperatorRedeemer } from "../vaultRedeemer";
-import { completionCeilingTokens, formatUsdcBase, priceImages } from "@halo/vault-core";
+import {
+  formatUsdcBase,
+  priceImages,
+  requestCompletionCeilingTokens,
+} from "@halo/vault-core";
 import { isAddress } from "ethers";
 import { decryptSecret, isEncryptedSecret } from "../secret";
 import { sanitizeChatRequest, sanitizeMessages } from "../sanitize";
@@ -117,6 +121,7 @@ interface InferenceRequestMessage {
     model?: string;
     messages?: Array<{ role: string; content: string }>;
     max_tokens?: number;
+    max_completion_tokens?: number;
     [k: string]: unknown;
   };
 }
@@ -161,6 +166,49 @@ export function requestAcceptsMedia(
 ): boolean {
   const header = (headers["x-halo-accept-media"] || "").trim().toLowerCase();
   return body.acceptMedia === true || header === "1" || header === "true";
+}
+
+export function forwardVaultCompletionLimit(
+  body: InferenceRequestMessage["body"],
+  providerSlug: string,
+  completionCeilingTokens: number
+): InferenceRequestMessage["body"] {
+  const hasMaxTokens = Object.prototype.hasOwnProperty.call(body, "max_tokens");
+  const hasMaxCompletionTokens = Object.prototype.hasOwnProperty.call(
+    body,
+    "max_completion_tokens"
+  );
+  if (hasMaxTokens || hasMaxCompletionTokens) return body;
+
+  return providerSlug === "openai"
+    ? { ...body, max_completion_tokens: completionCeilingTokens }
+    : { ...body, max_tokens: completionCeilingTokens };
+}
+
+export function invalidVaultTextGenerationControlField(
+  body: InferenceRequestMessage["body"],
+  isImageRequest: boolean
+): "max_tokens" | "max_completion_tokens" | "n" | null {
+  if (isImageRequest) return null;
+  for (const field of ["max_tokens", "max_completion_tokens"] as const) {
+    if (!Object.prototype.hasOwnProperty.call(body, field)) continue;
+    const value = body[field];
+    if (
+      typeof value !== "number" ||
+      !Number.isFinite(value) ||
+      !Number.isInteger(value) ||
+      value <= 0
+    ) {
+      return field;
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(body, "n")) {
+    const n = body.n;
+    if (typeof n !== "number" || !Number.isFinite(n) || !Number.isInteger(n) || n !== 1) {
+      return "n";
+    }
+  }
+  return null;
 }
 
 function imageEntryHasBytesOrUrl(value: unknown): boolean {
@@ -614,11 +662,12 @@ async function startBreakerReprobe(cfg: HaloConfig): Promise<void> {
   }
 }
 
-async function callUpstream(
+export async function callUpstream(
   cfg: HaloConfig,
   _apiKey: string | undefined,
   body: InferenceRequestMessage["body"],
-  reqHeaders?: Record<string, string>
+  reqHeaders?: Record<string, string>,
+  vaultCompletionCeilingTokens?: number
 ): Promise<{ status: number; data: unknown; usage: UpstreamUsage; respHeaders: Record<string, string> }> {
   const zeroUsage: UpstreamUsage = { total_tokens: 0, prompt_tokens: 0, completion_tokens: 0 };
   // Multi-provider: the model in the body picks the gateway + key (a single
@@ -628,10 +677,18 @@ async function callUpstream(
   const wire = wireFormatFor(provider.slug);
   const base = provider.baseUrl.replace(/\/+$/, "");
 
+  const forwardedBody =
+    vaultCompletionCeilingTokens === undefined
+      ? body
+      : forwardVaultCompletionLimit(body, provider.slug, vaultCompletionCeilingTokens);
+
   // Apply the identity-metadata allowlist before either upstream wire-format path.
-  const { sanitized, report } = sanitizeChatRequest(body);
+  const { sanitized, report } = sanitizeChatRequest(forwardedBody);
   if (sanitized.messages !== undefined) {
     sanitized.messages = sanitizeMessages(sanitized.messages);
+  }
+  if (vaultCompletionCeilingTokens !== undefined && provider.slug === "openrouter") {
+    sanitized.provider = { require_parameters: true };
   }
   // Buffered calls remove `stream`; the streaming path forces it independently.
   delete sanitized.stream;
@@ -862,17 +919,25 @@ export async function callUpstreamImage(
 }
 
 /** Stream OpenAI-format deltas and capture final usage. */
-async function streamUpstream(
+export async function streamUpstream(
   cfg: HaloConfig,
   _apiKey: string | undefined,
   body: InferenceRequestMessage["body"],
-  onDelta: (deltaObj: unknown) => void
+  onDelta: (deltaObj: unknown) => void,
+  vaultCompletionCeilingTokens?: number
 ): Promise<{ status: number; usage: UpstreamUsage; ok: boolean; errorData?: unknown }> {
   const zeroUsage: UpstreamUsage = { total_tokens: 0, prompt_tokens: 0, completion_tokens: 0 };
-  const { sanitized } = sanitizeChatRequest(body);
-  if (sanitized.messages !== undefined) sanitized.messages = sanitizeMessages(sanitized.messages);
   // Per-model provider resolution (multi-provider operators) — see callUpstream.
   const { provider, apiKey } = resolveProvider(cfg, body);
+  const forwardedBody =
+    vaultCompletionCeilingTokens === undefined
+      ? body
+      : forwardVaultCompletionLimit(body, provider.slug, vaultCompletionCeilingTokens);
+  const { sanitized } = sanitizeChatRequest(forwardedBody);
+  if (sanitized.messages !== undefined) sanitized.messages = sanitizeMessages(sanitized.messages);
+  if (vaultCompletionCeilingTokens !== undefined && provider.slug === "openrouter") {
+    sanitized.provider = { require_parameters: true };
+  }
   const base = provider.baseUrl.replace(/\/+$/, "");
   const url = `${base}/chat/completions`;
   const headers: Record<string, string> = { "Content-Type": "application/json" };
@@ -1732,9 +1797,6 @@ export async function cmdServe(): Promise<void> {
           return;
         }
 
-        // Price against the stable raw completion budget forwarded by the relay.
-        const estimatedCompletionTokens =
-          typeof req.body.max_tokens === "number" ? req.body.max_tokens : 500;
         let out: { status: number; headers: Record<string, string>; body: unknown };
 
         // Match relay normalization so whitespace/case variants cannot select a different rail here.
@@ -1762,6 +1824,36 @@ export async function cmdServe(): Promise<void> {
 
         try {
           if (paymentMode === "vault") {
+            const invalidGenerationControl = invalidVaultTextGenerationControlField(
+              req.body,
+              imagePrice !== null
+            );
+            if (invalidGenerationControl !== null) {
+              console.warn(
+                `  ⚠ rejecting vault text request ${req.requestId}: invalid ${invalidGenerationControl}`
+              );
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(
+                  JSON.stringify({
+                    type: "inference-response",
+                    requestId: req.requestId,
+                    status: 400,
+                    headers: {},
+                    body: {
+                      error: {
+                        message:
+                          invalidGenerationControl === "n"
+                            ? "n must be the numeric integer 1 when supplied for a vault text request."
+                            : `${invalidGenerationControl} must be a positive finite integer when supplied.`,
+                        type: "vault_invalid_generation_control",
+                        field: invalidGenerationControl,
+                      },
+                    },
+                  })
+                );
+              }
+              return;
+            }
             // Vault mode gates pre-work on a live operator reservation; collection still requires a signed receipt.
             const consumerAddr = (req.headers["x-halo-vault-consumer"] || "").toLowerCase();
             const fmtUsd = (b: bigint) => formatUsdcBase(b, { withDollarSign: true });
@@ -1810,21 +1902,16 @@ export async function cmdServe(): Promise<void> {
                   /* malformed piggyback receipt — ignore; the gate still protects us */
                 }
               }
-              // Shared reasoning headroom keeps consumer reservation and serve gate equal.
-              const vaultCompletionCeiling = completionCeilingTokens(
-                requestedModel,
-                estimatedCompletionTokens,
-                typeof req.body.max_completion_tokens === "number"
-                  ? req.body.max_completion_tokens
-                  : undefined
-              );
+              // Shared completion sizing keeps consumer reservation, serve gate,
+              // and the omitted-limit upstream bound equal.
+              const vaultCompletionCeiling = requestCompletionCeilingTokens(req.body);
               const ceilingCost =
                 imagePrice !== null
                   ? priceImages(imagePrice, requestedImageCount(req.body))
                   : await priceRequest({
                       cfg,
                       model: requestedModel,
-                      promptTokens: estimatePromptTokens((req.body as { messages?: unknown }).messages),
+                      promptTokens: estimateRequestPromptTokens(req.body),
                       completionTokens: vaultCompletionCeiling,
                     });
               let chk: ReservationCheck;
@@ -1962,24 +2049,30 @@ export async function cmdServe(): Promise<void> {
                   respHeaders?: Record<string, string>;
                 };
                 if (wantsVaultStream) {
-                  const sres = await streamUpstream(cfg, upstreamApiKey, req.body, (deltaObj) => {
-                    if (abortedStreams.has(req.requestId)) return;
-                    if (ws.readyState !== WebSocket.OPEN) return;
-                    const data =
-                      consumerPublicKey !== undefined
-                        ? JSON.stringify(
-                            encryptResponse(deltaObj, consumerPublicKey, encryptionKeys.privateKey)
-                          )
-                        : JSON.stringify(deltaObj);
-                    ws.send(
-                      JSON.stringify({
-                        type: "inference-chunk",
-                        requestId: req.requestId,
-                        data,
-                        encrypted: consumerPublicKey !== undefined,
-                      })
-                    );
-                  });
+                  const sres = await streamUpstream(
+                    cfg,
+                    upstreamApiKey,
+                    req.body,
+                    (deltaObj) => {
+                      if (abortedStreams.has(req.requestId)) return;
+                      if (ws.readyState !== WebSocket.OPEN) return;
+                      const data =
+                        consumerPublicKey !== undefined
+                          ? JSON.stringify(
+                              encryptResponse(deltaObj, consumerPublicKey, encryptionKeys.privateKey)
+                            )
+                          : JSON.stringify(deltaObj);
+                      ws.send(
+                        JSON.stringify({
+                          type: "inference-chunk",
+                          requestId: req.requestId,
+                          data,
+                          encrypted: consumerPublicKey !== undefined,
+                        })
+                      );
+                    },
+                    vaultCompletionCeiling
+                  );
                   upstream = {
                     status: sres.status,
                     data: sres.ok ? { streamed: true } : sres.errorData,
@@ -1990,7 +2083,13 @@ export async function cmdServe(): Promise<void> {
                   upstream =
                     imagePrice !== null
                       ? await callUpstreamImage(cfg, upstreamApiKey, req.body)
-                      : await callUpstream(cfg, upstreamApiKey, req.body, reqHeaders);
+                      : await callUpstream(
+                          cfg,
+                          upstreamApiKey,
+                          req.body,
+                          reqHeaders,
+                          vaultCompletionCeiling
+                        );
                 }
                 const encryptIfNeeded = (data: unknown): unknown =>
                   consumerPublicKey !== undefined
@@ -2369,9 +2468,7 @@ export async function cmdServe(): Promise<void> {
               const inputFloor = await priceRequest({
                 cfg,
                 model: requestedModel,
-                promptTokens: estimatePromptTokens(
-                  (req.body as { messages?: unknown }).messages
-                ),
+                promptTokens: estimateRequestPromptTokens(req.body),
                 completionTokens: 0,
               });
               if (inputFloor >= witnessCap) {

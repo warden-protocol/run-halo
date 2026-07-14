@@ -36,8 +36,6 @@ import {
   VaultConsumeClient,
   guardVaultFresh,
   priceTokens,
-  estimateTokens,
-  completionCeilingTokens,
   resolveSessionSigner,
   fmtUsd as fmtVaultUsd,
   type OpsState,
@@ -46,6 +44,7 @@ import {
 import {
   MAX_VAULT_RESERVATION_ATTEMPTS,
   RESERVATION_PRICE_MARGIN_BPS,
+  estimateReservationTokens,
   meterVaultResponse,
   priceImages,
   requiredVaultReservationBase,
@@ -1275,17 +1274,8 @@ export async function cmdConsume(args: Args): Promise<void> {
     // Vault rail: capture the prompt-size estimate (to size the reservation)
     // BEFORE confidential/E2E mutate `parsed`, and pin ONE operator to reserve
     // against, encrypt to, and meter (TEE-only when confidential).
-    const vaultEstTokens = estimateTokens(
-      (parsed as { messages?: unknown }).messages,
-      // Shared reasoning headroom keeps reservation and operator gate equal.
-      completionCeilingTokens(
-        typeof parsed.model === "string" ? parsed.model : "",
-        typeof parsed.max_tokens === "number" ? parsed.max_tokens : 1024,
-        typeof parsed.max_completion_tokens === "number"
-          ? parsed.max_completion_tokens
-          : undefined
-      )
-    );
+    // Shared reasoning headroom keeps reservation and operator gate equal.
+    const vaultEstTokens = estimateReservationTokens(parsed);
     const maxPriceUsdPerMtok =
       Number(maxAmountBase) /
       Math.max(1, vaultEstTokens) /

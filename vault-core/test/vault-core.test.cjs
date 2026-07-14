@@ -113,6 +113,153 @@ test("image price resolution mirrors model matching without token-rate scaling",
   );
 });
 
+test("image prompt sizing applies gpt-4o-mini detail costs with conservative high-detail tiles", () => {
+  assert.equal(core.estimateImagePromptTokens("gpt-4o-mini", "low"), 2_833);
+  assert.equal(
+    core.estimateImagePromptTokens("openai/gpt-4o-mini-2024-07-18", "low"),
+    2_833
+  );
+  const maxHighDetail = 2_833 + 8 * 5_667;
+  assert.equal(core.estimateImagePromptTokens("gpt-4o-mini", "high"), maxHighDetail);
+  assert.equal(core.estimateImagePromptTokens("openai/gpt-4o-mini", "auto"), maxHighDetail);
+  assert.equal(core.estimateImagePromptTokens("gpt-4o-mini"), maxHighDetail);
+});
+
+test("image prompt sizing applies current OpenAI patch profiles", () => {
+  assert.equal(core.estimateImagePromptTokens("gpt-4.1-mini-2025-04-14", "low"), 415);
+  assert.equal(core.estimateImagePromptTokens("openai/gpt-4.1-mini", "high"), 2_489);
+  assert.equal(core.estimateImagePromptTokens("gpt-5-mini", "low"), 415);
+  assert.equal(core.estimateImagePromptTokens("openai/gpt-5-mini", "high"), 2_489);
+  assert.equal(core.estimateImagePromptTokens("gpt-5.4-mini-2026-03-17", "high"), 2_489);
+  assert.equal(core.estimateImagePromptTokens("gpt-5-nano", "low"), 630);
+  assert.equal(core.estimateImagePromptTokens("openai/gpt-5.4-nano", "high"), 3_779);
+});
+
+test("image prompt sizing recognizes OpenAI tile-family low-detail bases", () => {
+  for (const [model, tokens] of [
+    ["openai/gpt-5", 70],
+    ["gpt-5-chat-latest", 70],
+    ["openai/gpt-4o-2024-11-20", 85],
+    ["gpt-4.1", 85],
+    ["gpt-4.5", 85],
+    ["openai/o1-pro", 75],
+    ["o3", 75],
+    ["computer-use-preview", 65],
+  ]) {
+    assert.equal(core.estimateImagePromptTokens(model, "low"), tokens, model);
+    assert.ok(core.estimateImagePromptTokens(model, "high") >= core.IMAGE_PROMPT_TOKENS, model);
+  }
+});
+
+test("image prompt sizing applies Claude standard and high-resolution caps for every detail", () => {
+  for (const detail of ["low", "high", undefined]) {
+    assert.equal(
+      core.estimateImagePromptTokens("anthropic/claude-sonnet-4-6", detail),
+      core.IMAGE_PROMPT_TOKENS
+    );
+    for (const model of [
+      "claude-fable-5",
+      "claude-mythos-5",
+      "claude-opus-4-8",
+      "claude-opus-4-7",
+      "anthropic/claude-opus-4.8",
+      "anthropic/claude-opus-4.7",
+      "anthropic/claude-sonnet-5",
+    ]) {
+      assert.equal(core.estimateImagePromptTokens(model, detail), 4_784, `${model}/${detail}`);
+    }
+  }
+});
+
+test("named unknown image models use the full fallback without fuzzy family collisions", () => {
+  assert.equal(
+    core.estimateImagePromptTokens("unknown/model", "low"),
+    core.IMAGE_PROMPT_TOKENS
+  );
+  assert.equal(
+    core.estimateImagePromptTokens("unknown/model", "high"),
+    core.IMAGE_PROMPT_TOKENS
+  );
+  assert.equal(
+    core.estimateImagePromptTokens("", "low"),
+    core.LOW_DETAIL_IMAGE_PROMPT_TOKENS
+  );
+  assert.equal(
+    core.estimateImagePromptTokens("openai/gpt-4o-mini-tts", "low"),
+    core.IMAGE_PROMPT_TOKENS
+  );
+  assert.equal(
+    core.estimateImagePromptTokens("anthropic/claude-opus-4-80", "high"),
+    core.IMAGE_PROMPT_TOKENS
+  );
+  assert.equal(
+    core.estimateImagePromptTokens("anthropic/claude-opus-4.80", "high"),
+    core.IMAGE_PROMPT_TOKENS
+  );
+});
+
+test("request image sizing is shared by reservation and gate estimators", () => {
+  const body = {
+    model: "openai/gpt-4o-mini",
+    max_tokens: 17,
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "input_image", detail: "high", image_url: "https://example.com/image.png" },
+        ],
+      },
+    ],
+  };
+  const prompt = core.estimateRequestPromptTokens(body);
+  assert.equal(prompt, core.estimateImagePromptTokens(body.model, "high") + 4);
+  assert.equal(core.estimatePromptTokens(body.messages, body.model), prompt);
+  assert.equal(core.estimateReservationTokens(body), prompt + body.max_tokens);
+  body.messages[0].content[0].detail = "low";
+  assert.equal(core.estimateRequestPromptTokens(body), 2_833 + 4);
+
+  const patchBody = {
+    model: "gpt-4.1-mini-2025-04-14",
+    messages: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "image_url",
+            image_url: { url: "https://example.com/image.png", detail: "high" },
+          },
+        ],
+      },
+    ],
+  };
+  assert.equal(core.estimateRequestPromptTokens(patchBody), 2_489 + 4);
+});
+
+test("request image sizing profiles every top-level and nested image", () => {
+  const body = {
+    model: "openai/gpt-5-mini",
+    messages: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "image_url",
+            image_url: { url: "https://example.com/low.png", detail: "low" },
+          },
+          {
+            type: "tool_result",
+            content: [
+              { type: "image", source: { type: "base64", data: "AAAA" } },
+              { type: "input_image", detail: "low", image_url: "https://example.com/two.png" },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+  assert.equal(core.estimateRequestPromptTokens(body), 415 + 2_489 + 415 + 4);
+});
+
 test("shared vault selection distinguishes free and legacy pinned operators", () => {
   const legacy = {
     address: "0xlegacy",
@@ -399,6 +546,12 @@ test("isReasoningModel flags reasoning families and not ordinary models", () => 
     "qwen/qwq-32b",
     "qwen3-235b-a22b-thinking",
     "some-reasoner",
+    "z-ai/glm-4.5", // GLM-4.5+ hybrid-reasoning, thinking on by default
+    "glm-4.7-flash",
+    "z-ai/glm-5",
+    "glm-5v-turbo",
+    "minimax/minimax-m2", // MiniMax M-series reasoning-first
+    "minimax-m2.1",
   ]) {
     assert.equal(core.isReasoningModel(m), true, `expected reasoning: ${m}`);
   }
@@ -413,6 +566,10 @@ test("isReasoningModel flags reasoning families and not ordinary models", () => 
     "llama-3.3-70b",
     "qwen2.5-72b",
     "mixtral-8x7b",
+    "z-ai/glm-4", // pre-reasoning GLM-4 base — must NOT match
+    "glm-4.1v", // GLM-4.1 (< 4.5) — must NOT match
+    "minimax-text-01", // MiniMax non-M text model — must NOT match
+    "minimax/minimax-m2-her", // MiniMax M2-her is a dialogue model (2048-tok output cap), not reasoning
     "",
   ]) {
     assert.equal(core.isReasoningModel(m), false, `expected non-reasoning: ${m}`);
@@ -442,10 +599,109 @@ test("completionCeilingTokens is defensive on non-finite / non-positive budgets"
   assert.equal(core.completionCeilingTokens("o3-mini", NaN), core.REASONING_COMPLETION_FLOOR);
 });
 
-test("REASONING_COMPLETION_FLOOR is a fixed positive integer (consumer/operator must agree)", () => {
+test("request completion ceiling defaults omitted limits and preserves explicit limits", () => {
+  assert.equal(
+    core.requestCompletionCeilingTokens({ model: "gpt-4o" }),
+    core.DEFAULT_COMPLETION_CEILING_TOKENS
+  );
+  assert.equal(core.requestCompletionCeilingTokens({ model: "gpt-4o", max_tokens: 321 }), 321);
+  assert.equal(
+    core.requestCompletionCeilingTokens({ model: "gpt-4o", max_completion_tokens: 654 }),
+    654
+  );
+  assert.equal(
+    core.requestCompletionCeilingTokens({
+      model: "gpt-4o",
+      max_tokens: 1_500,
+      max_completion_tokens: 2_500,
+    }),
+    2_500
+  );
+  assert.equal(
+    core.requestCompletionCeilingTokens({
+      model: "gpt-4o",
+      max_tokens: 3_500,
+      max_completion_tokens: 2_500,
+    }),
+    3_500
+  );
+});
+
+test("request completion ceiling ignores invalid fields and falls back only without a valid limit", () => {
+  assert.equal(
+    core.requestCompletionCeilingTokens({
+      model: "gpt-4o",
+      max_tokens: NaN,
+      max_completion_tokens: -1,
+    }),
+    core.DEFAULT_COMPLETION_CEILING_TOKENS
+  );
+  assert.equal(
+    core.requestCompletionCeilingTokens({
+      model: "gpt-4o",
+      max_tokens: "4096",
+      max_completion_tokens: 2_048.9,
+    }),
+    2_048
+  );
+  assert.equal(
+    core.requestCompletionCeilingTokens({
+      model: "gpt-4o",
+      max_tokens: 0.5,
+      max_completion_tokens: Infinity,
+    }),
+    core.DEFAULT_COMPLETION_CEILING_TOKENS
+  );
+});
+
+test("request completion ceiling applies the reasoning floor to omitted and explicit limits", () => {
+  assert.equal(
+    core.requestCompletionCeilingTokens({ model: "minimax/minimax-m2" }),
+    core.REASONING_COMPLETION_FLOOR
+  );
+  assert.equal(
+    core.requestCompletionCeilingTokens({ model: "o3-mini", max_tokens: 16 }),
+    core.REASONING_COMPLETION_FLOOR
+  );
+  const aboveFloor = core.REASONING_COMPLETION_FLOOR + 123;
+  assert.equal(
+    core.requestCompletionCeilingTokens({
+      model: "deepseek-r1",
+      max_tokens: 16,
+      max_completion_tokens: aboveFloor,
+    }),
+    aboveFloor
+  );
+});
+
+test("estimateReservationTokens uses the request completion ceiling exactly", () => {
+  for (const body of [
+    { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] },
+    {
+      model: "minimax/minimax-m2",
+      messages: [{ role: "user", content: "hi" }],
+      max_completion_tokens: 10_240,
+    },
+    {
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "hi" }],
+      max_tokens: NaN,
+      max_completion_tokens: -1,
+    },
+  ]) {
+    assert.equal(
+      core.estimateReservationTokens(body),
+      core.estimateRequestPromptTokens(body) + core.requestCompletionCeilingTokens(body)
+    );
+  }
+});
+
+test("completion ceiling constants are fixed positive integers (consumer/operator must agree)", () => {
   assert.equal(typeof core.REASONING_COMPLETION_FLOOR, "number");
   assert.ok(Number.isInteger(core.REASONING_COMPLETION_FLOOR));
   assert.ok(core.REASONING_COMPLETION_FLOOR > 0);
+  assert.equal(core.DEFAULT_COMPLETION_CEILING_TOKENS, 1024);
+  assert.ok(Number.isInteger(core.DEFAULT_COMPLETION_CEILING_TOKENS));
 });
 
 test("classifyReservationRevival gates zombie top-ups on the lifetime cap (#473)", () => {

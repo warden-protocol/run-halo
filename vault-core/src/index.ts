@@ -196,18 +196,202 @@ export function requiredVaultReservationBase(payload: unknown): bigint | null {
   return required > 0n ? required : null;
 }
 
-export function estimateTokens(messages: unknown, maxTokens: number): number {
-  let chars = 0;
-  if (Array.isArray(messages)) {
-    for (const message of messages) {
-      const content = (message as { content?: unknown })?.content;
-      if (typeof content === "string") chars += content.length;
-      else if (Array.isArray(content)) {
-        for (const part of content) chars += JSON.stringify(part).length;
-      }
+/** OpenAI's published per-message overhead: role + delimiter tokens. */
+const MESSAGE_OVERHEAD_TOKENS = 4;
+
+/** Conservative image-token fallback for an unrecognized or omitted model. */
+export const IMAGE_PROMPT_TOKENS = 1600;
+
+/** Legacy low-detail fallback retained for callers that cannot supply a model. */
+export const LOW_DETAIL_IMAGE_PROMPT_TOKENS = 85;
+
+const OPENAI_HIGH_DETAIL_MAX_TILES = 8;
+const OPENAI_HIGH_DETAIL_PATCH_BUDGET = 1536;
+const OPENAI_LOW_DETAIL_PATCH_BUDGET = 256;
+const CLAUDE_STANDARD_IMAGE_TOKEN_CAP = 1568;
+const CLAUDE_HIGH_RES_IMAGE_TOKEN_CAP = 4784;
+
+type ImageTokenProfile =
+  | { kind: "tiles"; base: number; perTile: number }
+  | { kind: "patches"; multiplier: number }
+  | { kind: "cap"; tokens: number };
+
+function modelLeaf(model: string): string {
+  const leaf = (model || "").trim().toLowerCase().split("/").pop() ?? "";
+  return leaf.split(":", 1)[0];
+}
+
+function isModelFamily(model: string, family: string): boolean {
+  return (
+    model === family ||
+    (model.startsWith(family) && /^-\d{4}-\d{2}-\d{2}$/.test(model.slice(family.length)))
+  );
+}
+
+function imageTokenProfile(model: string): ImageTokenProfile | null {
+  const m = modelLeaf(model);
+  if (isModelFamily(m, "gpt-5.4-mini") || isModelFamily(m, "gpt-5-mini")) {
+    return { kind: "patches", multiplier: 1.62 };
+  }
+  if (isModelFamily(m, "gpt-5.4-nano") || isModelFamily(m, "gpt-5-nano")) {
+    return { kind: "patches", multiplier: 2.46 };
+  }
+  if (isModelFamily(m, "gpt-4.1-mini")) return { kind: "patches", multiplier: 1.62 };
+  if (isModelFamily(m, "gpt-4.1-nano")) return { kind: "patches", multiplier: 2.46 };
+  if (isModelFamily(m, "o4-mini")) return { kind: "patches", multiplier: 1.72 };
+  if (isModelFamily(m, "gpt-4o-mini")) {
+    return { kind: "tiles", base: 2833, perTile: 5667 };
+  }
+  if (isModelFamily(m, "gpt-5") || m === "gpt-5-chat-latest") {
+    return { kind: "tiles", base: 70, perTile: 140 };
+  }
+  if (
+    isModelFamily(m, "gpt-4o") ||
+    isModelFamily(m, "gpt-4.1") ||
+    isModelFamily(m, "gpt-4.5")
+  ) {
+    return { kind: "tiles", base: 85, perTile: 170 };
+  }
+  if (isModelFamily(m, "o1") || isModelFamily(m, "o1-pro") || isModelFamily(m, "o3")) {
+    return { kind: "tiles", base: 75, perTile: 150 };
+  }
+  if (isModelFamily(m, "computer-use-preview")) {
+    return { kind: "tiles", base: 65, perTile: 129 };
+  }
+  if (
+    isModelFamily(m, "claude-fable-5") ||
+    isModelFamily(m, "claude-mythos-5") ||
+    isModelFamily(m, "claude-opus-4-8") ||
+    isModelFamily(m, "claude-opus-4.8") ||
+    isModelFamily(m, "claude-opus-4-7") ||
+    isModelFamily(m, "claude-opus-4.7") ||
+    isModelFamily(m, "claude-sonnet-5")
+  ) {
+    return { kind: "cap", tokens: CLAUDE_HIGH_RES_IMAGE_TOKEN_CAP };
+  }
+  if (m.startsWith("claude-")) {
+    return { kind: "cap", tokens: CLAUDE_STANDARD_IMAGE_TOKEN_CAP };
+  }
+  return null;
+}
+
+/** Conservative image tokens for a model/detail pair when image dimensions are unavailable. */
+export function estimateImagePromptTokens(model: string, detail?: unknown): number {
+  const profile = imageTokenProfile(model);
+  if (!profile) {
+    if ((model || "").trim()) return IMAGE_PROMPT_TOKENS;
+    return detail === "low" ? LOW_DETAIL_IMAGE_PROMPT_TOKENS : IMAGE_PROMPT_TOKENS;
+  }
+  if (profile.kind === "cap") {
+    return Math.max(IMAGE_PROMPT_TOKENS, profile.tokens);
+  }
+  if (profile.kind === "tiles") {
+    if (detail === "low") return profile.base;
+    return Math.max(
+      IMAGE_PROMPT_TOKENS,
+      profile.base + OPENAI_HIGH_DETAIL_MAX_TILES * profile.perTile
+    );
+  }
+  const patchBudget =
+    detail === "low" ? OPENAI_LOW_DETAIL_PATCH_BUDGET : OPENAI_HIGH_DETAIL_PATCH_BUDGET;
+  const fallback = detail === "low" ? LOW_DETAIL_IMAGE_PROMPT_TOKENS : IMAGE_PROMPT_TOKENS;
+  return Math.max(fallback, Math.ceil(patchBudget * profile.multiplier));
+}
+
+/** Max nesting depth walked for tool-result-wrapped content (cycle/DoS guard). */
+const IMAGE_NESTING_MAX_DEPTH = 6;
+
+function isImagePart(part: unknown): boolean {
+  if (!part || typeof part !== "object") return false;
+  const p = part as Record<string, unknown>;
+  return (
+    p.type === "image_url" ||
+    p.type === "image" ||
+    p.type === "input_image" ||
+    p.type === "output_image" ||
+    "image_url" in p ||
+    "image" in p
+  );
+}
+
+/** Best-effort serialized char length of a content part; 0 for non-JSON input. */
+function partCharLength(part: unknown): number {
+  try {
+    const s = JSON.stringify(part);
+    return typeof s === "string" ? s.length : 0;
+  } catch {
+    return 0; // cyclic / BigInt / non-serializable — untrusted input, never throw
+  }
+}
+
+/** Bounded token estimate for an image part under the request's model. */
+function imagePartTokens(part: unknown, model: string): number {
+  const p = part as { image_url?: unknown; detail?: unknown };
+  const iu = p.image_url;
+  const detail =
+    (iu && typeof iu === "object" ? (iu as { detail?: unknown }).detail : undefined) ?? p.detail;
+  return estimateImagePromptTokens(model, detail);
+}
+
+/** Walk message content (recursing into nested tool-result content) into text chars + image tokens. */
+function accumulateContent(
+  content: unknown,
+  depth: number,
+  acc: { chars: number; imageTokens: number },
+  model: string
+): void {
+  if (typeof content === "string") {
+    acc.chars += content.length;
+    return;
+  }
+  if (!Array.isArray(content) || depth >= IMAGE_NESTING_MAX_DEPTH) return;
+  for (const part of content) {
+    if (isImagePart(part)) {
+      acc.imageTokens += imagePartTokens(part, model);
+    } else if (
+      part &&
+      typeof part === "object" &&
+      Array.isArray((part as { content?: unknown }).content)
+    ) {
+      // Nested content (e.g. Anthropic tool_result wrapping an image) — recurse so a
+      // nested image is bounded, not char-counted via its serialized base64.
+      accumulateContent((part as { content?: unknown }).content, depth + 1, acc, model);
+    } else {
+      acc.chars += partCharLength(part);
     }
   }
-  return Math.ceil(chars / 4) + maxTokens;
+}
+
+/** Shared prompt-token estimate for the consumer reserve and the operator gate (invariant #7). */
+export function estimatePromptTokens(messages: unknown, model = ""): number {
+  if (!Array.isArray(messages)) return 0;
+  const acc = { chars: 0, imageTokens: 0 };
+  for (const message of messages) {
+    if (message && typeof message === "object") {
+      const m = message as Record<string, unknown>;
+      accumulateContent(m.content, 0, acc, model);
+      if (m.tool_calls !== undefined) acc.chars += partCharLength(m.tool_calls);
+      if (m.function_call !== undefined) acc.chars += partCharLength(m.function_call);
+      if (typeof m.tool_call_id === "string") acc.chars += m.tool_call_id.length;
+    }
+  }
+  return Math.ceil(acc.chars / 4) + acc.imageTokens + messages.length * MESSAGE_OVERHEAD_TOKENS;
+}
+
+export function estimateTokens(messages: unknown, maxTokens: number): number {
+  return estimatePromptTokens(messages) + maxTokens;
+}
+
+/** Prompt tokens for a full chat request: messages (incl. tool-call fields) + forwarded tool/function schemas. */
+export function estimateRequestPromptTokens(body: unknown): number {
+  if (Array.isArray(body)) return estimatePromptTokens(body); // tolerate a bare messages array
+  if (!body || typeof body !== "object") return 0;
+  const b = body as { model?: unknown; messages?: unknown; tools?: unknown; functions?: unknown };
+  const model = typeof b.model === "string" ? b.model : "";
+  let tokens = estimatePromptTokens(b.messages, model);
+  if (b.tools !== undefined) tokens += Math.ceil(partCharLength(b.tools) / 4);
+  if (b.functions !== undefined) tokens += Math.ceil(partCharLength(b.functions) / 4);
+  return tokens;
 }
 
 /** Heuristically detect model families that reason by default. */
@@ -225,12 +409,17 @@ export function isReasoningModel(model: string): boolean {
     m.includes("deepseek-r") ||
     m.includes("magistral") ||
     m.includes("qwq") ||
+    /glm-(4\.[5-9]|[5-9])/.test(m) || // Zhipu GLM-4.5+/5 hybrid-reasoning (thinking on by default); excludes glm-4 / glm-4.1
+    (/minimax-m\d/.test(m) && !m.includes("-her")) || // MiniMax M-series (M1/M2/M3) reasoning-first; excludes minimax-text-01 and the M2-her dialogue variant
     m.includes("thinking")
   );
 }
 
 /** Shared minimum completion ceiling for models that reason by default. */
 export const REASONING_COMPLETION_FLOOR = 8192;
+
+/** Completion ceiling used when a request supplies neither valid limit field. */
+export const DEFAULT_COMPLETION_CEILING_TOKENS = 1024;
 
 /** Size a completion ceiling without changing the upstream request limit. */
 export function completionCeilingTokens(
@@ -248,6 +437,38 @@ export function completionCeilingTokens(
   );
   if (!isReasoningModel(model)) return budget;
   return Math.max(budget, REASONING_COMPLETION_FLOOR);
+}
+
+function validCompletionLimit(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return undefined;
+  const tokens = Math.floor(value);
+  return tokens > 0 ? tokens : undefined;
+}
+
+/** Derive the shared reserve/gate completion ceiling from a full request body. */
+export function requestCompletionCeilingTokens(body: unknown): number {
+  const b =
+    body && typeof body === "object" && !Array.isArray(body)
+      ? (body as {
+          model?: unknown;
+          max_tokens?: unknown;
+          max_completion_tokens?: unknown;
+        })
+      : {};
+  const model = typeof b.model === "string" ? b.model : "";
+  const maxTokens = validCompletionLimit(b.max_tokens);
+  const maxCompletionTokens = validCompletionLimit(b.max_completion_tokens);
+  return completionCeilingTokens(
+    model,
+    maxTokens ?? (maxCompletionTokens === undefined ? DEFAULT_COMPLETION_CEILING_TOKENS : 0),
+    maxCompletionTokens
+  );
+}
+
+/** Consumer reservation token count: full request prompt + reasoning-aware completion ceiling (invariant #7). */
+export function estimateReservationTokens(body: unknown): number {
+  if (!body || typeof body !== "object") return 0;
+  return estimateRequestPromptTokens(body) + requestCompletionCeilingTokens(body);
 }
 
 export interface ComputeReserveAmountParams {

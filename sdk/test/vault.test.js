@@ -16,6 +16,7 @@ const {
   selectVaultOperator,
   usageTokensFromSseBody,
 } = require("../dist/vault");
+const { estimateReservationTokens, estimateTokens, withReservationMargin } = require("@halo/vault-core");
 
 test("pins the current production vault", () => {
   assert.equal(VAULT_ADDRESS, "0x3907F660B257560883E891fbbB9F997Eff70E40E");
@@ -345,6 +346,95 @@ test("payInference re-reserves from a typed insufficient-reservation 402 and ret
   assert.equal(result.paid, true);
   assert.equal(result.chargedBase, "91");
   assert.deepEqual(redeemed, { address: operator, cycle: 2n, epoch: 2n, cost: 91n });
+});
+
+test("payInference reserves explicit and omitted reasoning completion ceilings (#510, #532)", async (t) => {
+  const originalFetch = global.fetch;
+  t.after(() => {
+    global.fetch = originalFetch;
+  });
+  const operator = "0x0000000000000000000000000000000000000021";
+  const paymentResponse = Buffer.from(JSON.stringify({ amountUsdc: "91" })).toString("base64");
+  let calls = 0;
+  global.fetch = async () => {
+    calls += 1;
+    if (calls === 1) {
+      return new Response(
+        JSON.stringify({
+          operators: [
+            {
+              address: operator,
+              models: ["z-ai/glm-5"],
+              pricing: { "z-ai/glm-5": 0.001 },
+              vaultPayments: true,
+            },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    }
+    return new Response('{"choices":[]}', {
+      status: 200,
+      headers: { "PAYMENT-RESPONSE": paymentResponse },
+    });
+  };
+
+  const ensured = [];
+  const client = {
+    ensureReservation: async (_address, cost) => {
+      ensured.push(cost);
+      return {
+        ops: { locked: 1_000_000n, redeemed: 0n, expiry: 0n, created: 0n, cycle: 1n },
+        keyEpoch: 1n,
+      };
+    },
+    consumer: async () => "0x0000000000000000000000000000000000000022",
+    recordAndRedeem: () => {},
+  };
+
+  const body = { model: "z-ai/glm-5", max_tokens: 16, messages: [{ role: "user", content: "hi" }] };
+  const result = await payInference({
+    signer: {},
+    relayUrl: "https://relay.invalid",
+    facilitatorUrl: "https://facilitator.invalid",
+    rpcUrl: "http://127.0.0.1:1",
+    body,
+    client,
+  });
+
+  assert.equal(calls, 2, "operator list + settled send");
+  assert.equal(result.status, 200);
+  assert.equal(result.paid, true);
+
+  // resolveModelPriceUsdPerMtok scales the advertised per-1K rate to per-Mtok (0.001 * 1000 = 1).
+  const price = 1;
+  const withCeiling = withReservationMargin(priceTokens(price, estimateReservationTokens(body)));
+  const withRaw = withReservationMargin(priceTokens(price, estimateTokens(body.messages, 16)));
+  assert.equal(ensured[0], withCeiling);
+  assert.ok(withCeiling > withRaw, "reasoning ceiling must raise the reservation above raw max_tokens=16");
+
+  calls = 0;
+  ensured.length = 0;
+  const omittedBody = {
+    model: "z-ai/glm-5",
+    messages: [{ role: "user", content: "hi" }],
+  };
+  const omittedResult = await payInference({
+    signer: {},
+    relayUrl: "https://relay.invalid",
+    facilitatorUrl: "https://facilitator.invalid",
+    rpcUrl: "http://127.0.0.1:1",
+    body: omittedBody,
+    client,
+  });
+
+  assert.equal(calls, 2, "operator list + omitted-limit settled send");
+  assert.equal(omittedResult.status, 200);
+  assert.equal(omittedResult.paid, true);
+  assert.equal(
+    ensured[0],
+    withReservationMargin(priceTokens(price, estimateReservationTokens(omittedBody)))
+  );
 });
 
 test("uses exact-first fuzzy model matching and prefers vault-capable operators", async (t) => {
