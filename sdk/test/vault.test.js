@@ -631,6 +631,279 @@ test("reclaims eligible reservations without dropping the retry hint early", asy
   assert.equal(client.reservedOperators.has(operator), false);
 });
 
+test("ensureReservation refuses to top up a reservation wedged past its lifetime cap (#473)", async () => {
+  const signer = { getAddress: async () => "0x0000000000000000000000000000000000000009" };
+  const client = new HaloVaultClient(signer, {
+    facilitatorUrl: "https://facilitator.invalid",
+    rpcUrl: "http://127.0.0.1:1",
+    chainId: 8453,
+  });
+  const operator = "0x000000000000000000000000000000000000000a";
+  const now = Math.floor(Date.now() / 1000);
+  const session = "0x00000000000000000000000000000000000000ab";
+  client.consumer = async () => signer.getAddress();
+  client.sessionAddress = async () => session;
+  client.readVaultState = async () => ({
+    balance: 1_000_000n,
+    lockedTotal: 500n,
+    withdrawable: 1_000_000n,
+    sessionKey: session,
+    reserveNonce: 0n,
+    keyEpoch: 0n,
+  });
+  client.maxReserveTtl = async () => 100n; // created + 100 is in the past → capped
+  client.redeemGrace = async () => 1000n; // still within expiry + grace → wedged
+  client.readOps = async () => ({
+    locked: 500n,
+    redeemed: 0n,
+    expiry: BigInt(now - 10),
+    created: BigInt(now - 200),
+    cycle: 3n,
+  });
+  let released = 0;
+  client.postRelease = async () => {
+    released += 1;
+    return "0x";
+  };
+  let reserved = 0;
+  client.postReserve = async () => {
+    reserved += 1;
+  };
+  await assert.rejects(() => client.ensureReservation(operator, 100n), /stranded until/);
+  assert.equal(released, 0, "wedged reservation must not be released (NotExpired)");
+  assert.equal(reserved, 0, "wedged reservation must not be topped up");
+});
+
+test("ensureReservation reclaims a lifetime-capped reservation then reserves fresh (#473)", async () => {
+  const signer = { getAddress: async () => "0x000000000000000000000000000000000000000b" };
+  const client = new HaloVaultClient(signer, {
+    facilitatorUrl: "https://facilitator.invalid",
+    rpcUrl: "http://127.0.0.1:1",
+    chainId: 8453,
+  });
+  const operator = "0x000000000000000000000000000000000000000c";
+  const now = Math.floor(Date.now() / 1000);
+  const session = "0x00000000000000000000000000000000000000cd";
+  client.consumer = async () => signer.getAddress();
+  client.sessionAddress = async () => session;
+  client.readVaultState = async () => ({
+    balance: 1_000_000n,
+    lockedTotal: 500n,
+    withdrawable: 1_000_000n,
+    sessionKey: session,
+    reserveNonce: 0n,
+    keyEpoch: 0n,
+  });
+  client.maxReserveTtl = async () => 100n;
+  client.redeemGrace = async () => 5n; // past expiry + grace → reclaimable
+  let locked = 500n;
+  client.readOps = async () => ({
+    locked,
+    redeemed: 0n,
+    expiry: BigInt(now - 100),
+    created: BigInt(now - 300),
+    cycle: 3n,
+  });
+  let released = 0;
+  client.postRelease = async () => {
+    released += 1;
+    locked = 0n; // reclaim zeroes locked → the guard falls through to a fresh reserve
+    return "0x";
+  };
+  client.signReserve = async () => "0xsig";
+  let reserved = 0;
+  client.postReserve = async () => {
+    reserved += 1;
+  };
+  client.waitForReservation = async () => ({
+    locked: 600n,
+    redeemed: 0n,
+    expiry: BigInt(now + 3600),
+    created: BigInt(now),
+    cycle: 4n,
+  });
+  const res = await client.ensureReservation(operator, 100n);
+  assert.equal(released, 1, "capped reservation is reclaimed once");
+  assert.equal(reserved, 1, "a fresh reserve follows the reclaim");
+  assert.equal(res.ops.cycle, 4n, "returns the new cycle, not the dead one");
+});
+
+test("ensureReservation fails closed when reclaiming a capped reservation fails; never tops up the dead cycle (#473/PR#481)", async () => {
+  const signer = { getAddress: async () => "0x000000000000000000000000000000000000000d" };
+  const client = new HaloVaultClient(signer, {
+    facilitatorUrl: "https://facilitator.invalid",
+    rpcUrl: "http://127.0.0.1:1",
+    chainId: 8453,
+  });
+  const operator = "0x000000000000000000000000000000000000000e";
+  const now = Math.floor(Date.now() / 1000);
+  const session = "0x00000000000000000000000000000000000000ef";
+  client.consumer = async () => signer.getAddress();
+  client.sessionAddress = async () => session;
+  client.readVaultState = async () => ({
+    balance: 1_000_000n,
+    lockedTotal: 500n,
+    withdrawable: 1_000_000n, // ample free balance — a top-up WOULD succeed if attempted
+    sessionKey: session,
+    reserveNonce: 0n,
+    keyEpoch: 0n,
+  });
+  client.maxReserveTtl = async () => 100n;
+  client.redeemGrace = async () => 5n; // reclaimable (past expiry + grace)
+  client.readOps = async () => ({
+    locked: 500n, // stays > 0: the reclaim never lands
+    redeemed: 0n,
+    expiry: BigInt(now - 100),
+    created: BigInt(now - 300),
+    cycle: 3n,
+  });
+  client.postRelease = async () => {
+    throw new Error("facilitator down");
+  };
+  let reserved = 0;
+  client.signReserve = async () => "0xsig";
+  client.postReserve = async () => {
+    reserved += 1;
+  };
+  await assert.rejects(() => client.ensureReservation(operator, 100n), /facilitator down/);
+  assert.equal(reserved, 0, "a failed reclaim must NOT fall through to top up the dead cycle");
+});
+
+test("ensureReservation fails closed on an expired-but-revivable reservation with no free balance to refresh (#473/PR#481 P1)", async () => {
+  const signer = { getAddress: async () => "0x0000000000000000000000000000000000000010" };
+  const client = new HaloVaultClient(signer, {
+    facilitatorUrl: "https://facilitator.invalid",
+    rpcUrl: "http://127.0.0.1:1",
+    chainId: 8453,
+  });
+  const operator = "0x0000000000000000000000000000000000000011";
+  const now = Math.floor(Date.now() / 1000);
+  const session = "0x0000000000000000000000000000000000001100";
+  client.consumer = async () => signer.getAddress();
+  client.sessionAddress = async () => session;
+  // Whole balance locked to this operator: withdrawable == 0, so no refresh
+  // reserve can be funded (autoTopUp not configured).
+  client.readVaultState = async () => ({
+    balance: 5_000n,
+    lockedTotal: 5_000n,
+    withdrawable: 0n,
+    sessionKey: session,
+    reserveNonce: 0n,
+    keyEpoch: 0n,
+  });
+  client.maxReserveTtl = async () => 604800n; // cap far in the future → revivable, not a zombie
+  client.redeemGrace = async () => 21600n; // within grace → not reclaimable yet
+  // Expired (30s ago), but locked (5000) still covers estCost (1000).
+  client.readOps = async () => ({
+    locked: 5_000n,
+    redeemed: 0n,
+    expiry: BigInt(now - 30),
+    created: BigInt(now - 30),
+    cycle: 2n,
+  });
+  client.releaseExpiredReservations = async () => false;
+  let reserved = 0;
+  client.signReserve = async () => "0xsig";
+  client.postReserve = async () => {
+    reserved += 1;
+  };
+  await assert.rejects(
+    () => client.ensureReservation(operator, 1_000n),
+    /expired and there's no free balance/
+  );
+  assert.equal(reserved, 0, "must not return an expired reservation without refreshing it");
+});
+
+test("ensureReservation serves a still-live reservation at its cap without a dead refresh top-up (#481 near-expiry)", async () => {
+  const signer = { getAddress: async () => "0x0000000000000000000000000000000000000012" };
+  const client = new HaloVaultClient(signer, {
+    facilitatorUrl: "https://facilitator.invalid",
+    rpcUrl: "http://127.0.0.1:1",
+    chainId: 8453,
+  });
+  const operator = "0x0000000000000000000000000000000000000013";
+  const now = Math.floor(Date.now() / 1000);
+  const session = "0x0000000000000000000000000000000000001200";
+  const TTL = 604800n;
+  client.consumer = async () => signer.getAddress();
+  client.sessionAddress = async () => session;
+  // Free balance available → a refresh top-up WOULD be submitted if unguarded.
+  client.readVaultState = async () => ({
+    balance: 10_000n,
+    lockedTotal: 5_000n,
+    withdrawable: 5_000n,
+    sessionKey: session,
+    reserveNonce: 0n,
+    keyEpoch: 4n,
+  });
+  client.maxReserveTtl = async () => TTL;
+  client.redeemGrace = async () => 21600n;
+  // Still LIVE (expiry 60s out) but inside the 120s refresh margin, and sitting at
+  // its lifetime cap (created + TTL == expiry). A refresh can't move expiry.
+  client.readOps = async () => ({
+    locked: 5_000n, // covers estCost 1000
+    redeemed: 0n,
+    expiry: BigInt(now + 60),
+    created: BigInt(now + 60) - TTL,
+    cycle: 9n,
+  });
+  let reserved = 0;
+  client.signReserve = async () => "0xsig";
+  client.postReserve = async () => {
+    reserved += 1;
+  };
+  const res = await client.ensureReservation(operator, 1_000n);
+  assert.equal(reserved, 0, "no dead refresh top-up on a live at-cap reservation");
+  assert.equal(res.ops.cycle, 9n, "serves on the existing reservation as-is");
+  assert.equal(res.keyEpoch, 4n);
+});
+
+test("ensureReservation fails closed for an UNDER-COVERED near-expiry at-cap reservation - no dead coverage top-up (#481)", async () => {
+  const signer = { getAddress: async () => "0x0000000000000000000000000000000000000014" };
+  const client = new HaloVaultClient(signer, {
+    facilitatorUrl: "https://facilitator.invalid",
+    rpcUrl: "http://127.0.0.1:1",
+    chainId: 8453,
+  });
+  const operator = "0x0000000000000000000000000000000000000015";
+  const now = Math.floor(Date.now() / 1000);
+  const session = "0x0000000000000000000000000000000000001400";
+  const TTL = 604800n;
+  client.consumer = async () => signer.getAddress();
+  client.sessionAddress = async () => session;
+  // Ample free balance → a COVERAGE top-up would be submitted if unguarded.
+  client.readVaultState = async () => ({
+    balance: 10_000n,
+    lockedTotal: 500n,
+    withdrawable: 9_500n,
+    sessionKey: session,
+    reserveNonce: 0n,
+    keyEpoch: 2n,
+  });
+  client.maxReserveTtl = async () => TTL;
+  client.redeemGrace = async () => 21600n;
+  // Still LIVE (60s out), inside the refresh margin, AT its lifetime cap, and
+  // UNDER-COVERED for the request (locked 500 < estCost 1000).
+  client.readOps = async () => ({
+    locked: 500n,
+    redeemed: 0n,
+    expiry: BigInt(now + 60),
+    created: BigInt(now + 60) - TTL,
+    cycle: 7n,
+  });
+  client.releaseExpiredReservations = async () => false;
+  let reserved = 0;
+  client.signReserve = async () => "0xsig";
+  client.postReserve = async () => {
+    reserved += 1;
+  };
+  await assert.rejects(
+    () => client.ensureReservation(operator, 1_000n),
+    /at its on-chain lifetime cap and about to expire/
+  );
+  assert.equal(reserved, 0, "must NOT top up a doomed at-cap cycle even to add coverage");
+});
+
 test("optional undefined values do not erase client defaults", () => {
   const client = new HaloVaultClient(
     { getAddress: async () => "0x0000000000000000000000000000000000000008" },
@@ -1038,7 +1311,13 @@ test("ensureReservation serves a covered near-expiry reservation with the whole 
     reserveNonce: 0n,
     keyEpoch: 7n,
   });
-  const ops = { locked: 5_000n, redeemed: 0n, expiry: BigInt(secNow + 60), created: 0n, cycle: 3n };
+  // Cap far in the future (created recent) → verdict live_or_revivable, so the
+  // guard falls through to reserve sizing; with withdrawable == 0 that yields a
+  // 0-amount refresh (no doomed 1n reserve). Immutables are stubbed because the
+  // near-expiry guard now reads them (#481).
+  client.maxReserveTtl = async () => 604800n;
+  client.redeemGrace = async () => 21600n;
+  const ops = { locked: 5_000n, redeemed: 0n, expiry: BigInt(secNow + 60), created: BigInt(secNow), cycle: 3n };
   client.readOps = async () => ops;
   let reserveAttempted = false;
   client.postReserve = async () => {
@@ -1113,7 +1392,7 @@ test("checkSessionKey classifies the on-chain key against this wallet (#426)", a
   assert.equal(mismatch.expected, wallet);
 });
 
-test("ensureReservation fails closed on a session-key mismatch — never serves unpayable work (#426)", async () => {
+test("ensureReservation fails closed on a session-key mismatch - never serves unpayable work (#426)", async () => {
   const client = new HaloVaultClient(
     { getAddress: async () => "0x00000000000000000000000000000000000000A1" },
     { facilitatorUrl: "https://facilitator.invalid", rpcUrl: "http://127.0.0.1:1", chainId: 8453 }

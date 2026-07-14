@@ -43,6 +43,7 @@ import {
   VAULT_ADDRESS,
   advanceCumulativeReceipt,
   classifyRedeemError,
+  classifyReservationRevival,
   classifySessionKey,
   computeReserveAmount,
   estimateTokens,
@@ -177,6 +178,7 @@ export class HaloVaultClient {
   private readonly reservedOperators = new Set<string>();
   private readonly releaseAttemptedAt = new Map<string, number>();
   private redeemGraceCache: bigint | null = null;
+  private maxReserveTtlCache: bigint | null = null;
   private readonly autoTopUpBase: bigint;
   private addr: string | undefined;
   private sessionAddr: string | undefined;
@@ -446,6 +448,15 @@ export class HaloVaultClient {
     return this.redeemGraceCache;
   }
 
+  // Immutable — read once and cache. Used by the zombie-reservation guard (#473).
+  private async maxReserveTtl(): Promise<bigint> {
+    if (this.maxReserveTtlCache !== null) return this.maxReserveTtlCache;
+    this.maxReserveTtlCache = BigInt(
+      await withTimeout(this.vault.maxReserveTtl(), READ_TIMEOUT_MS, "maxReserveTtl read")
+    );
+    return this.maxReserveTtlCache;
+  }
+
   private async postRelease(operator: string): Promise<string> {
     const res = await fetch(`${this.facBase()}/vault/release`, {
       method: "POST",
@@ -540,8 +551,87 @@ export class HaloVaultClient {
     }
     const sec = nowSec();
     const live = () => ops.expiry === 0n || BigInt(sec + REFRESH_MARGIN) < ops.expiry;
+    // Actually past its on-chain expiry (not merely inside the 120s refresh
+    // margin). The operator rejects an expired reservation even when `locked`
+    // still covers the cost, so one must be refreshed (or reclaimed) — never
+    // returned as-is (#473 / PR #481 P1).
+    const isExpired = () => ops.locked > 0n && ops.expiry !== 0n && BigInt(sec) >= ops.expiry;
+
+    // Track this operator as soon as we read a NONZERO reservation for it, before
+    // the wedged/no-free-balance guards below can throw. releaseExpiredReservations
+    // only sweeps tracked operators (the vault can't enumerate them), so a reserve
+    // that errors out before the add at the end would otherwise strand these funds
+    // outside the auto-reclaim sweep. Set.add is idempotent.
+    if (ops.locked > 0n) this.reservedOperators.add(operator.toLowerCase());
 
     if (ops.locked < estCost || !live()) {
+      // Lifetime-cap guard (#473). `reserve` caps expiry at created +
+      // maxReserveTtl; once a top-up can't move expiry past that cap, adding to
+      // `locked` only strands funds behind a dead expiry. Run this whenever a
+      // funded reservation needs a refresh — i.e. `!live()` (near-expiry OR
+      // expired), NOT only once expired — so a reservation sitting AT its cap
+      // inside the refresh margin doesn't get a dead top-up (#481 review). A live
+      // reservation far from its cap short-circuits to "live_or_revivable" inside
+      // the classifier, so the healthy top-up path stays off the extra reads.
+      if (ops.locked > 0n && !live()) {
+        // FAIL CLOSED (mirrors the frontend path): read the lifetime-cap
+        // immutables and classify BEFORE any reserve. Every failure below —
+        // the immutable reads, the release broadcast, or waiting for it to mine
+        // — propagates out of the reserve rather than being swallowed. Swallowing
+        // and falling through would let `postReserve` top up the SAME dead cycle,
+        // stranding more funds — the exact bug #473 fixes (PR #481 review).
+        const [maxTtl, grace] = await Promise.all([this.maxReserveTtl(), this.redeemGrace()]);
+        // Pass the refresh margin as the cap safety headroom: a top-up counts as
+        // able to refresh only if the cap leaves at least this long for the
+        // reserve tx to mine before it (else it can't move expiry).
+        const verdict = classifyReservationRevival(
+          ops,
+          maxTtl,
+          grace,
+          BigInt(sec),
+          BigInt(REFRESH_MARGIN)
+        );
+        if (verdict === "reclaimable") {
+          this.cfg.log(
+            `vault reservation to ${operator.slice(0, 8)}… hit its on-chain lifetime cap; reclaiming $${fmtUsd(ops.locked)} and re-reserving fresh`
+          );
+          await this.postRelease(operator);
+          this.releaseAttemptedAt.set(operator.toLowerCase(), Date.now());
+          // WAIT for the reclaim to mine (locked → 0) before re-reserving: a
+          // reserve submitted while `locked` is still > 0 sees `fresh == false`
+          // and only tops up the SAME dead reservation. Re-read after so the
+          // reserve below opens a fresh cycle (created/expiry reset).
+          await this.waitForRelease(operator);
+          [state, ops] = await Promise.all([this.readVaultState(), this.readOps(operator)]);
+        } else if (verdict === "wedged") {
+          const until = new Date(Number(ops.expiry + grace) * 1000).toISOString();
+          throw new Error(
+            `Vault reservation to ${operator.slice(0, 8)}… expired at its on-chain lifetime cap, ` +
+              `so its remaining $${fmtUsd(ops.locked)} is stranded until ${until} (a top-up can't ` +
+              `revive it). Reclaim it after that time and retry.`
+          );
+        } else if (verdict === "serve_as_is") {
+          // Still live but at its lifetime cap: NO reserve into this cycle can
+          // move expiry, so any top-up — refresh OR coverage — is dead (it would
+          // confirm behind the imminent, unmovable expiry and strand the added
+          // funds; #481 review). If existing locked covers this request, serve
+          // as-is; otherwise fail clearly rather than fund the doomed cycle.
+          if (ops.locked >= estCost) {
+            this.reservedOperators.add(operator.toLowerCase());
+            return { ops, keyEpoch: state.keyEpoch };
+          }
+          // Reclaim isn't available until strictly after expiry + redeemGrace
+          // (releaseExpired reverts before then), so point at that time — not
+          // merely "when it expires", which lands in the wedged window.
+          const reclaimAt = new Date(Number(ops.expiry + grace) * 1000).toISOString();
+          throw new Error(
+            `Vault reservation to ${operator.slice(0, 8)}… is at its on-chain lifetime cap and about ` +
+              `to expire, so it can't be extended, and its remaining $${fmtUsd(ops.locked)} doesn't ` +
+              `cover this request ($${fmtUsd(estCost)}). It becomes reclaimable at ${reclaimAt}; ` +
+              `reclaim it then and retry.`
+          );
+        }
+      }
       if (ops.locked + state.withdrawable < estCost) {
         if (await this.releaseExpiredReservations(operator)) {
           [state, ops] = await Promise.all([this.readVaultState(), this.readOps(operator)]);
@@ -554,6 +644,13 @@ export class HaloVaultClient {
         // Re-read after the attempt regardless of its boolean outcome: a partial
         // deposit or a concurrent lock can move state even when the top-up didn't
         // fully cover the need, so always refresh before sizing the reservation.
+        await this.autoTopUp(target);
+        [state, ops] = await Promise.all([this.readVaultState(), this.readOps(operator)]);
+      }
+      // An expired reservation needs free balance to fund the refresh reserve.
+      // If the whole balance is locked (withdrawable == 0) but auto-top-up is
+      // configured, refill so an agent self-heals instead of erroring (#481 P1).
+      if (isExpired() && state.withdrawable === 0n && this.autoTopUpBase > 0n) {
         await this.autoTopUp(target);
         [state, ops] = await Promise.all([this.readVaultState(), this.readOps(operator)]);
       }
@@ -574,6 +671,18 @@ export class HaloVaultClient {
       // misleading "can't cover" or attempting a 1n reserve that reverts InsufficientFree.
       if (ops.locked + amount < estCost) {
         throw new Error(this.insufficientMsg(state.withdrawable, estCost));
+      }
+      // Fail closed if the reservation is expired but no refresh reserve will be
+      // sent (amount == 0 because there's no free balance): returning it would
+      // just get rejected by the operator ("reservation expired") and the caller
+      // would retry into the same state (#481 P1).
+      if (isExpired() && amount === 0n) {
+        throw new Error(
+          `Your vault reservation for this operator has expired and there's no free balance ` +
+            `to refresh it. Deposit more to your vault${
+              this.autoTopUpBase > 0n ? "" : " (or set autoTopUpUsd to refill automatically)"
+            }, or wait until it becomes reclaimable after its grace period, then retry.`
+        );
       }
       if (amount > 0n) {
         const expiry = BigInt(sec + this.cfg.reserveTtlSec);
@@ -622,6 +731,24 @@ export class HaloVaultClient {
     return this.autoTopUpBase > 0n
       ? `${base} Auto-top-up couldn't refill it — the signer is likely out of USDC (it also needs a little ETH on Base for the deposit tx).`
       : `${base} Deposit more with HaloVaultClient.deposit(usd), or set autoTopUpUsd to refill from the signer automatically.`;
+  }
+
+  /** Poll until a submitted releaseExpired is mined (`locked` returns to 0), or
+   *  time out — so the fresh reserve that follows opens a new cycle (#473). */
+  private async waitForRelease(operator: string): Promise<void> {
+    const deadline = Date.now() + 30_000;
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      try {
+        if ((await this.readOps(operator)).locked === 0n) return;
+      } catch {
+        /* transient RPC — the release tx is submitted; keep polling to the deadline */
+      }
+      if (Date.now() > deadline) {
+        throw new Error("Reclaim didn't confirm on-chain in time — retry shortly.");
+      }
+      await new Promise((r) => setTimeout(r, 600));
+    }
   }
 
   private async waitForReservation(operator: string, before: OpsState): Promise<OpsState> {

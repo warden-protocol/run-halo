@@ -21,6 +21,7 @@ export const VAULT_ABI = [
   "function withdrawAuthorized(address) view returns (uint256)",
   "function withdrawTimelock() view returns (uint64)",
   "function redeemGrace() view returns (uint64)",
+  "function maxReserveTtl() view returns (uint64)",
   "function ops(address,address) view returns (uint256 locked,uint256 redeemed,uint64 expiry,uint64 created,uint64 cycle)",
 ];
 
@@ -180,6 +181,65 @@ export function withReservationMargin(
   if (estimatedCost === 0n || marginBps === 0n) return estimatedCost;
   const bps = 10_000n;
   return (estimatedCost * (bps + marginBps) + bps - 1n) / bps;
+}
+
+/**
+ * Classify an operator reservation for the consumer's ensure/top-up path (#473).
+ *
+ * `HaloVault.reserve()` caps a reservation's expiry at `created + maxReserveTtl`
+ * (its absolute lifetime), and only ADDS to `locked` — it never opens a fresh
+ * cycle while `locked > 0`. So a top-up can revive an expired reservation only
+ * while the lifetime cap is far enough in the future for the reserve tx to mine
+ * BEFORE the cap; once the cap is at/behind now, the extra reserve just strands
+ * more funds behind an expiry that can't move. Detect that so the client reclaims
+ * (or waits) instead of pouring funds into a dead reservation.
+ *
+ *  - "live_or_revivable": funds aren't locked, or the lifetime cap still leaves
+ *    `capSafetyMarginSec` of headroom — a top-up extends expiry to
+ *    `min(now+ttl, cap)`, whether the reservation is already expired (revive) or
+ *    merely inside its pre-expiry refresh margin (refresh). PREFERRED over reclaim
+ *    whenever the cap allows it: it's a plain reserve that doesn't depend on
+ *    `releaseExpired`, which is gated by sequencer health and can revert
+ *    `GracePeriodNotOver` for up to one `redeemGrace` after a sequencer recovery
+ *    even when the reservation is already past its own `expiry + redeemGrace`.
+ *  - "serve_as_is": the cap is too close for a top-up to advance expiry, but the
+ *    reservation is STILL LIVE (`now < expiry`). A refresh here would only strand
+ *    funds behind an expiry that can't move, so don't top up — keep using the
+ *    current reservation until it expires (then it becomes reclaimable/wedged).
+ *  - "reclaimable": expired, cap too close/past to safely revive, AND past
+ *    `expiry + redeemGrace`, so `releaseExpired` opens a fresh cycle — the only
+ *    safe recovery in this state.
+ *  - "wedged": expired within `expiry + redeemGrace` and the cap is too close (or
+ *    past), so it can neither be safely revived nor reclaimed (`NotExpired`).
+ *    Surface the wait.
+ *
+ * `capSafetyMarginSec` is the headroom a top-up needs between now and the cap for
+ * its reserve tx to mine while still live; callers pass their mine/refresh margin.
+ */
+export function classifyReservationRevival(
+  ops: { locked: bigint; expiry: bigint; created: bigint },
+  maxReserveTtl: bigint,
+  redeemGrace: bigint,
+  nowSec: bigint,
+  capSafetyMarginSec: bigint = 0n
+): "live_or_revivable" | "serve_as_is" | "reclaimable" | "wedged" {
+  // Nothing locked (or a never-set reservation) → the normal reserve path handles it.
+  if (ops.locked === 0n || ops.expiry === 0n) return "live_or_revivable";
+  // If the lifetime cap still leaves safe headroom, a plain top-up advances expiry
+  // — PREFER that over reclaim (no `releaseExpired` round-trip; immune to its
+  // sequencer-health gate, which can revert `GracePeriodNotOver` even past
+  // `expiry + redeemGrace`). Checked BEFORE both the expiry and grace tests so a
+  // reservation inside its refresh margin — not yet expired — is judged by whether
+  // a top-up can actually MOVE expiry, not merely by "still live".
+  if (ops.created + maxReserveTtl > nowSec + capSafetyMarginSec) return "live_or_revivable";
+  // Cap too close/past → a top-up can't move expiry to a safely-live value.
+  // Still live → keep serving on the current reservation; a refresh would be a dead
+  // top-up that strands the added funds behind an unmovable expiry (#481 review).
+  if (nowSec < ops.expiry) return "serve_as_is";
+  // Expired: reclaim once past the grace window (releaseExpired opens a fresh
+  // cycle); until then it's wedged (can neither revive nor reclaim — `NotExpired`).
+  if (nowSec > ops.expiry + redeemGrace) return "reclaimable";
+  return "wedged";
 }
 
 /** Read the operator gate's exact reservation requirement from a 402 body.

@@ -365,3 +365,130 @@ test("REASONING_COMPLETION_FLOOR is a fixed positive integer (consumer/operator 
   assert.ok(Number.isInteger(core.REASONING_COMPLETION_FLOOR));
   assert.ok(core.REASONING_COMPLETION_FLOOR > 0);
 });
+
+test("classifyReservationRevival gates zombie top-ups on the lifetime cap (#473)", () => {
+  const TTL = 604800n; // 7d maxReserveTtl (dev)
+  const GRACE = 21600n; // 6h redeemGrace (dev)
+  const now = 10_000_000n;
+  // No funds locked → nothing to strand; take the normal reserve path.
+  assert.equal(
+    core.classifyReservationRevival({ locked: 0n, expiry: 0n, created: 0n }, TTL, GRACE, now),
+    "live_or_revivable"
+  );
+  // Expired but cap still in the future → a top-up extends expiry, so revivable.
+  assert.equal(
+    core.classifyReservationRevival(
+      { locked: 100n, expiry: now - 10n, created: now - 100n },
+      TTL,
+      GRACE,
+      now
+    ),
+    "live_or_revivable"
+  );
+  // Lifetime cap in the past, still within expiry+grace → wedged (can't revive, can't reclaim).
+  assert.equal(
+    core.classifyReservationRevival(
+      { locked: 100n, expiry: now - 100n, created: now - TTL - 100n },
+      TTL,
+      GRACE,
+      now
+    ),
+    "wedged"
+  );
+  // Lifetime cap in the past AND past expiry+grace → reclaimable.
+  assert.equal(
+    core.classifyReservationRevival(
+      { locked: 100n, expiry: now - GRACE - 100n, created: now - TTL - GRACE - 100n },
+      TTL,
+      GRACE,
+      now
+    ),
+    "reclaimable"
+  );
+  // Never-topped reservation older than the cap but expiry far in the past:
+  // expiry < cap < now still strands (cap can't push expiry past now).
+  assert.equal(
+    core.classifyReservationRevival(
+      { locked: 100n, expiry: now - TTL, created: now - TTL, },
+      TTL,
+      GRACE,
+      now
+    ),
+    "reclaimable"
+  );
+  // #481 review: expired AND reclaim-eligible, but the lifetime cap is still
+  // comfortably in the FUTURE → prefer a plain top-up (revive), NOT reclaim.
+  // `releaseExpired` can transiently revert (GracePeriodNotOver, sequencer gate)
+  // even past expiry+grace, so we must not force the fragile reclaim path when a
+  // robust revive is available.
+  assert.equal(
+    core.classifyReservationRevival(
+      { locked: 100n, expiry: now - GRACE - 50n, created: now - GRACE - 50n },
+      TTL, // cap = created + TTL is far in the future
+      GRACE,
+      now,
+      120n
+    ),
+    "live_or_revivable"
+  );
+  // Reclaim IS preferred when past grace AND the cap is too close to safely
+  // revive (a top-up would race the cap): expiry past grace, cap inside margin.
+  assert.equal(
+    core.classifyReservationRevival(
+      { locked: 100n, expiry: now - GRACE - 50n, created: now - TTL + 60n }, // cap = now + 60
+      TTL,
+      GRACE,
+      now,
+      120n // margin 120 > 60 headroom → revive unsafe → reclaim
+    ),
+    "reclaimable"
+  );
+  // Expired within grace, cap comfortably in the future → revivable by top-up.
+  assert.equal(
+    core.classifyReservationRevival(
+      { locked: 100n, expiry: now - 10n, created: now - 10n },
+      TTL,
+      GRACE,
+      now,
+      120n
+    ),
+    "live_or_revivable"
+  );
+  // Expired within grace, but the cap is INSIDE the safety margin → a top-up
+  // could mine after the cap and strand the funds, and reclaim isn't available
+  // yet → wedged.
+  assert.equal(
+    core.classifyReservationRevival(
+      { locked: 100n, expiry: now - 10n, created: now - TTL + 60n }, // cap = now + 60
+      TTL,
+      GRACE,
+      now,
+      120n // margin 120 > 60 headroom
+    ),
+    "wedged"
+  );
+  // #481 review (near-expiry): NOT yet expired but inside the refresh margin AND
+  // sitting at its lifetime cap (cap == expiry, within the margin). A refresh
+  // top-up can't move expiry → don't submit a dead top-up; keep serving as-is.
+  assert.equal(
+    core.classifyReservationRevival(
+      { locked: 100n, expiry: now + 60n, created: now + 60n - TTL }, // live; cap = now + 60
+      TTL,
+      GRACE,
+      now,
+      120n // margin 120 > 60 headroom → cap can't extend expiry
+    ),
+    "serve_as_is"
+  );
+  // Near-expiry but the cap is far ahead → a refresh top-up DOES extend expiry.
+  assert.equal(
+    core.classifyReservationRevival(
+      { locked: 100n, expiry: now + 60n, created: now }, // live; cap = now + TTL (far)
+      TTL,
+      GRACE,
+      now,
+      120n
+    ),
+    "live_or_revivable"
+  );
+});
