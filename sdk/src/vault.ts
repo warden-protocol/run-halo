@@ -21,7 +21,7 @@ import {
   classifyReservationRevival,
   classifySessionKey,
   computeReserveAmount,
-  estimateTokens,
+  estimateReservationTokens,
   formatUsdcBase,
   meterVaultResponse,
   priceTokens,
@@ -39,8 +39,12 @@ export {
   VAULT_ADDRESS,
   classifyRedeemError,
   classifySessionKey,
+  completionCeilingTokens,
   computeReserveAmount,
+  estimateRequestPromptTokens,
+  estimateReservationTokens,
   estimateTokens,
+  isReasoningModel,
   parseVaultSettlement,
   priceTokens,
   reportedUsageTokens,
@@ -1046,9 +1050,8 @@ export async function payInference(opts: PayInferenceOptions): Promise<Inference
 
   const client = opts.client ?? managedVaultClient(opts, chainId);
 
-  const maxTokens =
-    typeof opts.body.max_tokens === "number" ? (opts.body.max_tokens as number) : 1024;
-  const estTokens = estimateTokens(opts.body.messages, maxTokens);
+  // Shared reasoning headroom keeps reservation and operator gate equal (invariant #7).
+  const estTokens = estimateReservationTokens(opts.body);
   const estCost = withReservationMargin(priceTokens(pin.priceUsdPerMtok, estTokens));
   let { ops, keyEpoch } = await client.ensureReservation(pin.address, estCost);
 

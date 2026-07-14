@@ -155,6 +155,8 @@ test("callUpstreamImage posts to the provider images endpoint and requests inlin
   assert.equal(seenBody.response_format, "b64_json");
   assert.equal(seenBody.stream, undefined);
   assert.equal(seenBody.user, undefined);
+  assert.equal(seenBody.max_tokens, undefined);
+  assert.equal(seenBody.max_completion_tokens, undefined);
 });
 
 test("URL-only image responses fail closed instead of being fetched", () => {

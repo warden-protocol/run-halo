@@ -1,3 +1,4 @@
+import { DEFAULT_COMPLETION_CEILING_TOKENS } from "@halo/vault-core";
 import { ANTHROPIC_API_VERSION } from "./providers";
 
 interface OpenAIChatMessage {
@@ -9,6 +10,7 @@ export interface OpenAIChatRequest {
   model?: string;
   messages?: OpenAIChatMessage[];
   max_tokens?: number;
+  max_completion_tokens?: number;
   temperature?: number;
   top_p?: number;
   stop?: string | string[];
@@ -54,10 +56,20 @@ export function chatCompletionsToAnthropicRequest(
     // don't get the tool-loop shape from a single OpenAI translation.
   }
 
-  // max_tokens is required by Anthropic. Cap at a generous default if absent
-  // so the upstream call doesn't 400; the consumer is paying per token
-  // anyway and the relay already capped the signed amount.
-  const maxTokens = typeof body.max_tokens === "number" ? body.max_tokens : 1024;
+  const maxCompletionTokens =
+    typeof body.max_completion_tokens === "number" &&
+    Number.isFinite(body.max_completion_tokens) &&
+    Number.isInteger(body.max_completion_tokens) &&
+    body.max_completion_tokens > 0
+      ? body.max_completion_tokens
+      : undefined;
+  // Keep the adapter's historic handling of numeric max_tokens values so
+  // malformed numeric budget requests still fail upstream instead of silently
+  // becoming a potentially billable default-sized generation.
+  const maxTokens =
+    typeof body.max_tokens === "number"
+      ? body.max_tokens
+      : (maxCompletionTokens ?? DEFAULT_COMPLETION_CEILING_TOKENS);
 
   const out: Record<string, unknown> = {
     model: body.model,

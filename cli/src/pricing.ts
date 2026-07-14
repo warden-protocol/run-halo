@@ -291,16 +291,6 @@ export async function upstreamRatePer1KUsd(params: {
   return perToken * 1000;
 }
 
-/** Estimate quote tokens at roughly four characters each; settlement uses reported usage. */
-export function estimatePromptTokens(messages: unknown): number {
-  if (!Array.isArray(messages)) return 0;
-  let chars = 0;
-  for (const m of messages) {
-    if (m && typeof m === "object") {
-      const content = (m as { content?: unknown }).content;
-      if (typeof content === "string") chars += content.length;
-    }
-  }
-  // +4 tokens per message for role + delimiters, OpenAI's published overhead.
-  return Math.ceil(chars / 4) + messages.length * 4;
-}
+// Shared media-aware prompt estimator — keeps the operator's vault gate sized
+// identically to the consumer's reservation (`estimateTokens` in `@halo/vault-core`).
+export { estimatePromptTokens, estimateRequestPromptTokens } from "@halo/vault-core";
