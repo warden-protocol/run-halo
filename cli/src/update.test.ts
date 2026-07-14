@@ -27,7 +27,7 @@ import {
 import { statSync } from "node:fs";
 import { configDir } from "./config";
 
-const CANONICAL_REMOTE = "https://github.com/warden-protocol/halo.git";
+const CANONICAL_REMOTE = "https://github.com/warden-protocol/run-halo.git";
 
 function markManaged(dir: string): void {
   mkdirSync(path.join(dir, ".git"), { recursive: true });
