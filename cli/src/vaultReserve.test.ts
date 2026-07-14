@@ -1,11 +1,3 @@
-/**
- * computeReserveAmount spec (issue #367). Run:
- *   node --require ts-node/register --test src/vaultReserve.test.ts
- *
- * The property that fixes #367: a single reservation never sinks more than a
- * slice (1/liquiditySlots) of free balance into batching, yet always covers the request —
- * so a wide fan-out can't lock the whole deposit, and requests still serve.
- */
 import test from "node:test";
 import assert from "node:assert/strict";
 import { computeReserveAmount, VaultConsumeClient } from "./vault-consume";
@@ -20,22 +12,18 @@ const base = {
 };
 
 test("ample balance → full batch (reserveMultiple × estCost)", () => {
-  // target 500, cap = 100000/8 = 12500 ≫ 500 → full batch.
   assert.equal(computeReserveAmount({ ...base, withdrawable: 100_000n }), 500n);
 });
 
 test("tight balance → capped at 1/liquiditySlots of free, not the whole deposit (#367)", () => {
-  // free 800, cap = 800/8 = 100; target 500 > cap → reserve only 100.
   assert.equal(computeReserveAmount({ ...base, withdrawable: 800n }), 100n);
 });
 
 test("cap never under-serves the request — always ≥ estCost", () => {
-  // free 200, cap = 25 < estCost 100 → must still reserve estCost (100) to serve.
   assert.equal(computeReserveAmount({ ...base, withdrawable: 200n }), 100n);
 });
 
 test("never reserves more than the free balance", () => {
-  // free 60 < estCost 100: amount clamps to withdrawable (caller then errors if < estCost).
   assert.equal(computeReserveAmount({ ...base, withdrawable: 60n }), 60n);
 });
 
@@ -54,9 +42,7 @@ test("already covered but expiring → minimal 1-unit bump to refresh expiry", (
 });
 
 test("partial existing reservation tops up toward the batch, still capped", () => {
-  // locked 200, target 500 → want +300; cap = 100000/8 huge → +300.
   assert.equal(computeReserveAmount({ ...base, locked: 200n, withdrawable: 100_000n }), 300n);
-  // same, but tight free 1600 → cap 200 < 300 → +200 (still ≥ needed=0 since locked≥estCost).
   assert.equal(computeReserveAmount({ ...base, locked: 200n, withdrawable: 1_600n }), 200n);
 });
 
@@ -65,18 +51,13 @@ test("fan-out simulation: 8 operators each lock ≤ 1/8 of remaining free, depos
   let totalLocked = 0n;
   for (let i = 0; i < 8; i++) {
     const amt = computeReserveAmount({ ...base, locked: 0n, withdrawable: free, live: false });
-    // Each reservation caps at free/8, so it always leaves the majority free.
     assert.ok(amt <= free / 8n || amt === base.estCost, `op ${i} took too much: ${amt} of ${free}`);
     free -= amt;
     totalLocked += amt;
   }
   assert.ok(free > 0n, "free balance never floored to 0 by fan-out");
-  // Old behavior would have locked 8 × 500 = 4000 flat; here it stays bounded
-  // and proportional to free balance.
 });
 
-// ── reclaim semantics (#367) — release is async, so don't drop on broadcast ──
-// Drive releaseExpiredReservations against stubbed I/O (no chain/facilitator).
 const OP = `0x${"a".repeat(40)}`;
 function reclaimHarness(over: {
   grace?: () => Promise<bigint>;
@@ -91,7 +72,7 @@ function reclaimHarness(over: {
   let releases = 0;
   const a = c as unknown as Record<string, unknown>;
   a.redeemGrace = over.grace ?? (async () => 60n);
-  a.readOps = over.ops ?? (async () => ({ locked: 500n, expiry: 1n })); // expiry 1 = far past
+  a.readOps = over.ops ?? (async () => ({ locked: 500n, expiry: 1n }));
   a.postRelease = async () => {
     releases++;
     return "0xhash";
@@ -123,7 +104,7 @@ test("reclaim: an expired operator is released but RETAINED (so a dropped releas
 test("reclaim: cooldown prevents re-broadcasting a release while one is in flight", async () => {
   const { c, releases } = reclaimHarness({});
   await c.releaseExpiredReservations();
-  await c.releaseExpiredReservations(); // still locked, within cooldown
+  await c.releaseExpiredReservations();
   assert.equal(releases(), 1, "second pass is throttled — no duplicate release");
 });
 

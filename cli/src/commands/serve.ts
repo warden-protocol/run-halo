@@ -1,10 +1,3 @@
-/**
- * halo serve — operator process.
- *
- * Opens an outbound WebSocket to the relay, announces models, and handles
- * inference-request messages with full x402 semantics via the configured
- * facilitator (CDP by default).
- */
 import prompts from "prompts";
 import { WebSocket } from "ws";
 import { randomBytes } from "crypto";
@@ -18,25 +11,24 @@ import {
   configProviders,
   providerForModel,
   allConfiguredModels,
+  imagePriceForModel,
+  providerServesConfiguredImageModel,
 } from "../config";
 import { loadWallet } from "../wallet";
-import { Facilitator } from "../cdp-facilitator";
-import {
-  computeActualAmount,
-  priceRequest,
-  encodePaymentRequiredHeader,
-  encodePaymentResponseHeader,
-  x402Verify,
-  x402Settle,
-} from "../x402-server";
-import { wireFormatFor, isTeeProviderSlug } from "../providers";
+import { Facilitator } from "../facilitator";
+import { imageEndpointPathFor, wireFormatFor, isTeeProviderSlug } from "../providers";
 import {
   anthropicHeaders,
   anthropicResponseToChatCompletion,
   chatCompletionsToAnthropicRequest,
   OpenAIChatRequest,
 } from "../anthropic-adapter";
-import { upstreamRatePer1KUsd, upstreamContextLength, estimatePromptTokens } from "../pricing";
+import {
+  estimatePromptTokens,
+  priceRequest,
+  upstreamContextLength,
+  upstreamRatePer1KUsd,
+} from "../pricing";
 import {
   checkReservationCached,
   collectibleServeAmount,
@@ -48,9 +40,18 @@ import {
   getVaultAddress,
   setActiveVaultAddress,
 } from "../vault";
-import { VaultCreditLedger, creditWindowBase, AdmitResult } from "../vaultCredit";
+import { VaultCreditLedger, creditWindowBase, AdmitResult, ReceiptSnapshot } from "../vaultCredit";
+import { VaultReceiptStore } from "../vaultReceiptStore";
+import {
+  PendingHeldReceipt,
+  durableReceiptSnapshot,
+  handoffRehydratedReceipt,
+  receiptPairKey,
+  shouldRetryRehydration,
+} from "../vaultReceiptRehydration";
+import { releaseAbortedVaultServe, withAbortedStreamCleanup } from "../vaultStreamAbort";
 import { OperatorRedeemer } from "../vaultRedeemer";
-import { completionCeilingTokens, formatUsdcBase } from "@halo/vault-core";
+import { completionCeilingTokens, formatUsdcBase, priceImages } from "@halo/vault-core";
 import { isAddress } from "ethers";
 import { decryptSecret, isEncryptedSecret } from "../secret";
 import { sanitizeChatRequest, sanitizeMessages } from "../sanitize";
@@ -75,12 +76,35 @@ import {
 } from "../provider-breaker";
 import {
   decryptRequest,
+  encryptBytes,
   encryptResponse,
   generateOperatorKeypair,
   isEncryptedEnvelope,
   OperatorKeyPair,
 } from "../encryption";
-import { HALO_VERSION } from "../version";
+import {
+  MediaChunkFrame,
+  chunkMediaEnvelope,
+  packMediaPlaintext,
+  padToBucket,
+} from "../mediaChunks";
+import {
+  ImageFormat,
+  MalformedImageError,
+  UnsupportedImageFormatError,
+  detectImageFormat,
+  stripImageMetadata,
+} from "../imageStrip";
+import { relayCliVersion } from "../relayVersion";
+import {
+  facilitatorVaultError,
+  inspectFacilitatorVault,
+} from "../vault-address";
+import {
+  CapabilityAnnouncementSync,
+  FacilitatorIdentityProbe,
+  retainVaultIdentityAnnouncement,
+} from "../vaultCapability";
 import { restartIntoManagedInstall, startAutoUpdateMonitor } from "../update";
 
 interface InferenceRequestMessage {
@@ -97,6 +121,12 @@ interface InferenceRequestMessage {
   };
 }
 
+interface StreamAbortMessage {
+  type: "stream-abort";
+  requestId: string;
+  reason?: string;
+}
+
 // Timeout for the upstream provider fetch. Must be shorter than the relay's
 // INFERENCE_TIMEOUT_MS (120s) so the operator can send a proper error response
 // instead of letting the relay time out and return 504.
@@ -104,6 +134,8 @@ const UPSTREAM_TIMEOUT_MS = 90_000;
 // Re-ping local models inside Ollama's default 5-min keep_alive window.
 const MODEL_WARM_INTERVAL_MS = 4 * 60_000;
 const VAULT_CAPABILITY_RETRY_MS = 60_000;
+const MAX_MEDIA_STREAM_BYTES = 16 * 1024 * 1024;
+const MAX_IMAGE_UPSTREAM_BODY_BYTES = MAX_MEDIA_STREAM_BYTES;
 
 interface UpstreamUsage {
   total_tokens: number;
@@ -118,18 +150,293 @@ interface UpstreamUsage {
   cached_prompt_tokens?: number;
 }
 
-/** Consumer voucher (Phase 1), forwarded verbatim to the facilitator. */
+function requestedImageCount(body: InferenceRequestMessage["body"]): number {
+  const n = body && typeof body === "object" ? (body as { n?: unknown }).n : undefined;
+  return typeof n === "number" && Number.isFinite(n) && n > 0 ? Math.ceil(n) : 1;
+}
+
+export function requestAcceptsMedia(
+  body: InferenceRequestMessage["body"],
+  headers: Record<string, string | undefined>
+): boolean {
+  const header = (headers["x-halo-accept-media"] || "").trim().toLowerCase();
+  return body.acceptMedia === true || header === "1" || header === "true";
+}
+
+function imageEntryHasBytesOrUrl(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const entry = value as Record<string, unknown>;
+  if (typeof entry.b64_json === "string" && entry.b64_json.length > 0) return true;
+  if (typeof entry.url === "string" && entry.url.length > 0) return true;
+  const imageUrl = entry.image_url;
+  if (typeof imageUrl === "string" && imageUrl.length > 0) return true;
+  if (imageUrl && typeof imageUrl === "object") {
+    const url = (imageUrl as { url?: unknown }).url;
+    return typeof url === "string" && url.length > 0;
+  }
+  return false;
+}
+
+function countImageEntries(value: unknown): number {
+  return Array.isArray(value) ? value.filter(imageEntryHasBytesOrUrl).length : 0;
+}
+
+export function servedImageCountFromResponse(data: unknown): number {
+  if (!data || typeof data !== "object") return 0;
+  const root = data as Record<string, unknown>;
+  const direct = countImageEntries(root.data);
+  if (direct > 0) return direct;
+
+  const choices = Array.isArray(root.choices) ? root.choices : [];
+  let count = 0;
+  for (const choice of choices) {
+    if (!choice || typeof choice !== "object") continue;
+    const message = (choice as { message?: unknown }).message;
+    if (!message || typeof message !== "object") continue;
+    const msg = message as Record<string, unknown>;
+    const messageImages = countImageEntries(msg.images);
+    if (messageImages > 0) {
+      count += messageImages;
+      continue;
+    }
+    const content = msg.content;
+    if (Array.isArray(content)) {
+      count += content.filter((part) => {
+        if (!part || typeof part !== "object") return false;
+        const p = part as Record<string, unknown>;
+        return (
+          p.type === "image_url" ||
+          p.type === "output_image" ||
+          imageEntryHasBytesOrUrl(p)
+        );
+      }).length;
+    }
+  }
+  return count;
+}
+
+export function priceServedImagesForVault(
+  usdcPerImage: number,
+  responseData: unknown,
+  ceilingCost: bigint
+): { servedImageCount: number; uncappedAmount: bigint; actualAmount: bigint; tokens: 0 } {
+  const servedImageCount = servedImageCountFromResponse(responseData);
+  const uncappedAmount = priceImages(usdcPerImage, servedImageCount);
+  return {
+    servedImageCount,
+    uncappedAmount,
+    actualAmount: collectibleServeAmount(uncappedAmount, ceilingCost),
+    tokens: 0,
+  };
+}
+
+export class UndeliverableImageResponseError extends Error {
+  readonly type: string;
+  constructor(type: string, message: string) {
+    super(message);
+    this.name = "UndeliverableImageResponseError";
+    this.type = type;
+  }
+}
+
+function imageMimeForFormat(format: ImageFormat): string {
+  switch (format) {
+    case "jpeg":
+      return "image/jpeg";
+    case "png":
+      return "image/png";
+    case "webp":
+      return "image/webp";
+    default:
+      throw new UndeliverableImageResponseError(
+        "unsupported_image_format",
+        `unsupported image format after strip: ${format}`
+      );
+  }
+}
+
+function decodeInlineImageBase64(value: string): Buffer {
+  const dataUrl = /^data:[^;,]+;base64,(.*)$/i.exec(value);
+  const raw = dataUrl ? dataUrl[1] : value;
+  if (raw.length === 0 || raw.length % 4 === 1 || /[\r\n]/.test(raw) || !/^[A-Za-z0-9+/]*={0,2}$/.test(raw)) {
+    throw new UndeliverableImageResponseError(
+      "malformed_image_base64",
+      "upstream image response contained malformed inline base64"
+    );
+  }
+  return Buffer.from(raw, "base64");
+}
+
+function inlineImageBase64FromEntry(value: unknown): string | null {
+  if (!value || typeof value !== "object") return null;
+  const entry = value as Record<string, unknown>;
+  if (typeof entry.b64_json === "string" && entry.b64_json.length > 0) {
+    return entry.b64_json;
+  }
+  if (entryHasUrlOnlyImage(entry)) {
+    throw new UndeliverableImageResponseError(
+      "url_only_image_response",
+      "upstream returned a URL-only image response; refusing operator-side fetch"
+    );
+  }
+  return null;
+}
+
+function entryHasUrlOnlyImage(entry: Record<string, unknown>): boolean {
+  if (typeof entry.url === "string" && entry.url.length > 0) return true;
+  const imageUrl = entry.image_url;
+  if (typeof imageUrl === "string" && imageUrl.length > 0) return true;
+  if (imageUrl && typeof imageUrl === "object") {
+    const url = (imageUrl as { url?: unknown }).url;
+    return typeof url === "string" && url.length > 0;
+  }
+  return false;
+}
+
+function inlineImageBytesFromEntry(value: unknown): Buffer | null {
+  const b64 = inlineImageBase64FromEntry(value);
+  return b64 === null ? null : decodeInlineImageBase64(b64);
+}
+
+function inlineImageBase64FromResponse(data: unknown): string[] {
+  if (!data || typeof data !== "object") return [];
+  const root = data as Record<string, unknown>;
+  if (Array.isArray(root.data)) {
+    const images: string[] = [];
+    for (const entry of root.data) {
+      const b64 = inlineImageBase64FromEntry(entry);
+      if (b64) images.push(b64);
+    }
+    return images;
+  }
+
+  const images: string[] = [];
+  const choices = Array.isArray(root.choices) ? root.choices : [];
+  for (const choice of choices) {
+    if (!choice || typeof choice !== "object") continue;
+    const message = (choice as { message?: unknown }).message;
+    if (!message || typeof message !== "object") continue;
+    const msg = message as Record<string, unknown>;
+    if (Array.isArray(msg.images)) {
+      let foundInImages = false;
+      for (const entry of msg.images) {
+        const b64 = inlineImageBase64FromEntry(entry);
+        if (b64) {
+          images.push(b64);
+          foundInImages = true;
+        }
+      }
+      if (foundInImages) continue;
+    }
+    const content = msg.content;
+    if (Array.isArray(content)) {
+      for (const part of content) {
+        const b64 = inlineImageBase64FromEntry(part);
+        if (b64) images.push(b64);
+      }
+    }
+  }
+  return images;
+}
+
+export function inlineImageBytesFromResponse(data: unknown): Buffer[] {
+  return inlineImageBase64FromResponse(data).map(decodeInlineImageBase64);
+}
+
+function assertImageUpstreamBodyWithinCap(responseData: unknown): void {
+  const bodyBytes = Buffer.byteLength(JSON.stringify(responseData), "utf8");
+  if (bodyBytes > MAX_IMAGE_UPSTREAM_BODY_BYTES) {
+    throw new UndeliverableImageResponseError(
+      "image_upstream_body_too_large",
+      `upstream image response exceeds ${MAX_IMAGE_UPSTREAM_BODY_BYTES} bytes`
+    );
+  }
+}
+
+export function buildImageMediaFrames(
+  requestId: string,
+  responseData: unknown,
+  consumerPublicKey: Uint8Array,
+  operatorKeys: OperatorKeyPair
+): { frames: MediaChunkFrame[]; imageCount: number; streamBytes: number } {
+  assertImageUpstreamBodyWithinCap(responseData);
+  const images = inlineImageBase64FromResponse(responseData);
+  const frames: MediaChunkFrame[] = [];
+  let streamBytes = 0;
+  for (let imageIndex = 0; imageIndex < images.length; imageIndex++) {
+    const stripped = stripImageMetadata(decodeInlineImageBase64(images[imageIndex]));
+    const mime = imageMimeForFormat(detectImageFormat(stripped));
+    const packed = packMediaPlaintext(stripped, mime);
+    const padded = padToBucket(packed);
+    const envelope = encryptBytes(padded, consumerPublicKey, operatorKeys);
+    const imageFrames = chunkMediaEnvelope(requestId, envelope, {
+      imageIndex,
+      imageCount: images.length,
+    });
+    for (const frame of imageFrames) {
+      streamBytes += Buffer.byteLength(JSON.stringify(frame), "utf8");
+      if (streamBytes > MAX_MEDIA_STREAM_BYTES) {
+        throw new UndeliverableImageResponseError(
+          "media_stream_too_large",
+          `encrypted image media stream exceeds ${MAX_MEDIA_STREAM_BYTES} bytes`
+        );
+      }
+      frames.push(frame);
+    }
+  }
+  return { frames, imageCount: images.length, streamBytes };
+}
+
+export function buildImageTerminalBody(imageSettlement: { servedImageCount: number }): unknown {
+  return {
+    imageDelivered: true,
+    images: imageSettlement.servedImageCount,
+  };
+}
+
+export function buildNoImageTerminalBody(): unknown {
+  return {
+    error: {
+      type: "no_image",
+      message: "Upstream image response contained no deliverable inline images.",
+    },
+  };
+}
+
+export function prepareImageDeliveryFrames(params: {
+  requestId: string;
+  responseData: unknown;
+  imageSettlement: { servedImageCount: number };
+  consumerPublicKey: Uint8Array | undefined;
+  operatorKeys: OperatorKeyPair;
+}): { frames: MediaChunkFrame[]; imageCount: number; streamBytes: number } {
+  if (params.consumerPublicKey === undefined) {
+    throw new UndeliverableImageResponseError(
+      "image_encryption_required",
+      "Image delivery requires an encrypted Halo request with a consumer public key."
+    );
+  }
+  const prepared = buildImageMediaFrames(
+    params.requestId,
+    params.responseData,
+    params.consumerPublicKey,
+    params.operatorKeys
+  );
+  if (prepared.imageCount !== params.imageSettlement.servedImageCount) {
+    throw new UndeliverableImageResponseError(
+      "image_count_mismatch",
+      `image response count changed during media preparation (${prepared.imageCount} prepared, ${params.imageSettlement.servedImageCount} priced)`
+    );
+  }
+  return prepared;
+}
+
 type SignedVoucher = {
   voucher: { budgetId: string; operator: string; cumulative: string; expiry: number };
   signature: string;
 };
 
-/**
- * Parse the consumer's base64(JSON) X-Halo-Voucher header into the shape the
- * facilitator expects, or undefined when absent/malformed. The operator forwards
- * it verbatim — it does NOT verify it (the facilitator holds the sessionKey and
- * does the cryptographic check), so a bad header simply degrades to "no voucher".
- */
+/** Parse a voucher for verbatim forwarding; absent or malformed input becomes `undefined`. */
 function parseVoucherHeader(raw: string | undefined): SignedVoucher | undefined {
   if (!raw) return undefined;
   try {
@@ -149,10 +456,7 @@ function parseVoucherHeader(raw: string | undefined): SignedVoucher | undefined 
   return undefined;
 }
 
-// Consumer→TEE end-to-end-encryption headers (NEAR confidential path). The
-// consumer encrypts the message content to the model TEE's key; these carry the
-// ephemeral pubkey + scheme. The operator forwards them verbatim to the upstream
-// enclave and CANNOT read the content — it relays ciphertext only.
+// Forward the confidential request's ephemeral-key and scheme headers verbatim.
 const E2EE_REQ_HEADERS = ["x-client-pub-key", "x-encryption-version", "x-signing-algo"];
 
 function maskApiKeyForLog(k: string | undefined): string {
@@ -161,11 +465,7 @@ function maskApiKeyForLog(k: string | undefined): string {
   return `${k.slice(0, 6)}…${k.slice(-4)} (len ${k.length})`;
 }
 
-// Upstream RESPONSE headers safe to relay back to the consumer (TEE attestation
-// / response-signature material for client-side verification). Allowlisted so a
-// hostile upstream can't echo arbitrary operator-side metadata. Exact NEAR names
-// are confirmed against the live endpoint in the integration spike; the response
-// body's chat id also lets the consumer fetch the signature directly from NEAR.
+// Allowlist response-proof headers so upstreams cannot echo arbitrary operator metadata.
 function passthroughResponseHeaders(res: { headers: Headers }): Record<string, string> {
   const out: Record<string, string> = {};
   res.headers.forEach((v, k) => {
@@ -184,17 +484,7 @@ function passthroughResponseHeaders(res: { headers: Headers }): Record<string, s
   return out;
 }
 
-/**
- * Confidential (TEE) per-response signature. NEAR's `/v1/signature/{id}` REQUIRES
- * the provider API key (confirmed live; the attestation report is public, this is
- * not). So the operator — which holds the key — fetches it and forwards the
- * {text,signature,signing_address} blob to the consumer; the KEY NEVER LEAVES THE
- * OPERATOR. The consumer fetches the public attestation itself and verifies this
- * signature recovers to the attested signer (ethers.verifyMessage). A malicious
- * operator can't forge it (must recover to the attested address) — only withhold
- * it, in which case client verification fails closed. Returns base64 of the
- * payload, or null on any failure (inference confidentiality is unaffected).
- */
+/** Fetch the keyed response proof for client-side signer verification; return base64 or `null`. */
 async function fetchTeeSignature(
   baseUrl: string,
   apiKey: string | undefined,
@@ -232,25 +522,10 @@ function resolveProvider(
   return { provider, apiKey };
 }
 
-// ── Upstream provider circuit breaker (issue #459) ──────────────────────────
-// A credit-exhaustion or auth failure from an upstream provider does NOT clear
-// on the next request — the account is out of credits or the key is bad. Rather
-// than pay the latency of forwarding a fresh failure to every consumer (and
-// keep advertising models we can't actually serve), we OPEN a breaker for that
-// provider on the first such error. While open:
-//   • the provider's models are de-announced from the relay, so it routes them
-//     to healthy operators instead of us;
-//   • further requests for those models are instant-rejected (pre-payment, so
-//     the consumer is never charged) with the same structured error;
-//   • a background probe re-tests the account and CLOSES the breaker (re-
-//     announcing the models) once it's healthy again.
-// The pure state machine (which providers are open, and the change hook) lives
-// in ../provider-breaker; this file owns the fetch probe, model filtering, and
-// relay re-announce. Transient upstream errors (a 429 without a credit signal,
-// 5xx) are NOT sticky — relay rotation handles those and they self-heal.
+// Sticky credit/auth faults de-announce the provider and reject before payment.
+// Background probes close the breaker; transient upstream failures do not open it.
 const PROVIDER_REPROBE_INTERVAL_MS = 60_000;
 
-// Trip the breaker and log the transition (the pure trip() only mutates state).
 function tripBreakerLogged(slug: string, code: UpstreamProviderErrorCode | null): void {
   if (!tripBreaker(slug, code)) return;
   const why =
@@ -279,11 +554,7 @@ function breakerDeannouncedModels(cfg: HaloConfig): Set<string> {
   return out;
 }
 
-// Best-effort 1-token health probe for a single provider. Returns true when the
-// account looks servable again (2xx, or any non-2xx that is NOT a credit/auth
-// fault — e.g. a 400 from the throwaway payload still proves the key + credits
-// work). A network/timeout error is inconclusive → treated as still-unhealthy
-// so the breaker stays open. Mirrors the startup key probe.
+// Sends an active max_tokens:1 request; true means no sticky credit/auth fault was detected.
 async function probeProviderHealthy(provider: ProviderConfig): Promise<boolean> {
   const k = typeof provider.apiKey === "string" ? provider.apiKey : undefined;
   if (!k) return true; // keyless/local provider — nothing to authenticate
@@ -324,12 +595,10 @@ async function probeProviderHealthy(provider: ProviderConfig): Promise<boolean> 
     }
     return !isStickyUpstreamCode(classifyUpstreamProviderError(res.status, parsed));
   } catch {
-    return false; // inconclusive — keep the breaker open
+    return false;
   }
 }
 
-// Long-lived loop (started once, alongside the heartbeat): periodically re-probes
-// every open breaker and closes the ones that recovered.
 async function startBreakerReprobe(cfg: HaloConfig): Promise<void> {
   const providers = configProviders(cfg);
   for (;;) {
@@ -359,19 +628,12 @@ async function callUpstream(
   const wire = wireFormatFor(provider.slug);
   const base = provider.baseUrl.replace(/\/+$/, "");
 
-  // Privacy boundary: strip consumer-identifying or tracking metadata from
-  // the request body before it leaves the operator's process. The allowlist
-  // applies to both wire formats — for the anthropic path the chat→messages
-  // translator already picks its own fields, but sanitizing first means we
-  // never carry stripped fields through any code path that touches the body.
+  // Apply the identity-metadata allowlist before either upstream wire-format path.
   const { sanitized, report } = sanitizeChatRequest(body);
   if (sanitized.messages !== undefined) {
     sanitized.messages = sanitizeMessages(sanitized.messages);
   }
-  // This is the BUFFERED call — it parses one JSON response. `stream` is in
-  // the sanitizer allowlist, so a consumer's stream:true would otherwise reach
-  // the upstream, make it answer SSE, and break the parse. Strip it here;
-  // streaming requests go through streamUpstream (which forces stream:true).
+  // Buffered calls remove `stream`; the streaming path forces it independently.
   delete sanitized.stream;
   if (report.dropped.length > 0) {
     // Log field names only, never values. Counts are auditable; contents are not.
@@ -445,18 +707,9 @@ async function callUpstream(
     parsed = { error: { message: text } };
   }
 
-  // On non-2xx, never pass the raw upstream body to the consumer. A misbehaving
-  // or hostile upstream (custom proxy, self-hosted gateway, dev fork) could echo
-  // request headers or other operator-side metadata in its error body. We
-  // sanitize consumer-fault errors to safe `message`/`type`/`code` fields, and
-  // collapse provider-side infrastructure failures to structured Halo codes.
-  // The full original body is only printed to the operator terminal when
-  // HALO_DEBUG_UPSTREAM_ERRORS=1 is set.
+  // Sanitize non-2xx bodies; raw debug detail may reach the live terminal but never the consumer or log file.
   if (!res.ok) {
-    // Auth failures are almost always a stale/wrong key configured for THIS
-    // provider — name it explicitly (with a masked fingerprint of the key that
-    // was actually sent) so the operator can compare against a known-good key
-    // and re-set the right gateway, instead of seeing a generic browser error.
+    // Attribute auth failures to the selected provider and expose only a masked key fingerprint.
     if (res.status === 401 || res.status === 403) {
       const masked = maskApiKeyForLog(apiKey);
       console.error(
@@ -514,14 +767,101 @@ async function callUpstream(
   };
 }
 
-/**
- * Streaming upstream call (Phase 2.2) — OpenAI wire format only. Calls upstream
- * with stream:true + usage, parses the SSE deltas, invokes `onDelta(deltaObj)`
- * for each content delta (the caller seals + forwards it), and captures the
- * final usage. Returns ok:false with a sanitized error body when upstream fails;
- * the caller falls back to (or surfaces) a buffered error. Anthropic wire and
- * non-streaming requests use the buffered `callUpstream` path unchanged.
- */
+export async function callUpstreamImage(
+  cfg: HaloConfig,
+  _apiKey: string | undefined,
+  body: InferenceRequestMessage["body"]
+): Promise<{ status: number; data: unknown; usage: UpstreamUsage; respHeaders: Record<string, string> }> {
+  const zeroUsage: UpstreamUsage = { total_tokens: 0, prompt_tokens: 0, completion_tokens: 0 };
+  const { provider, apiKey } = resolveProvider(cfg, body);
+  const wire = wireFormatFor(provider.slug);
+  const imagePath = imageEndpointPathFor(provider.slug);
+  if (wire === "anthropic" || imagePath === null) {
+    return {
+      status: 502,
+      data: {
+        error: {
+          message: `provider "${provider.slug}" does not expose a supported inline image generation endpoint`,
+          type: "unsupported_image_provider",
+        },
+      },
+      usage: zeroUsage,
+      respHeaders: {},
+    };
+  }
+
+  const { sanitized, report } = sanitizeChatRequest(body);
+  delete sanitized.stream;
+  sanitized.response_format = "b64_json";
+  if (report.dropped.length > 0) {
+    console.warn(
+      `  ⚠ stripped ${report.dropped.length} non-allowlisted image field(s) from request: ${report.dropped.join(", ")}`
+    );
+  }
+
+  const base = provider.baseUrl.replace(/\/+$/, "");
+  const url = `${base}${imagePath}`;
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Accept: "application/json",
+  };
+  if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
+  let res: Awaited<ReturnType<typeof fetch>>;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(sanitized),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    clearTimeout(timer);
+    const msg =
+      err instanceof Error && err.name === "AbortError"
+        ? `upstream image timeout after ${UPSTREAM_TIMEOUT_MS / 1000}s`
+        : err instanceof Error
+          ? err.message
+          : String(err);
+    return { status: 504, data: { error: { message: msg } }, usage: zeroUsage, respHeaders: {} };
+  }
+  clearTimeout(timer);
+
+  const text = await res.text();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    parsed = { error: { message: text } };
+  }
+
+  if (!res.ok) {
+    if (process.env.HALO_DEBUG_UPSTREAM_ERRORS === "1") {
+      debugToTerminal(`  upstream(image) ${res.status} body: ${text.slice(0, 2000)}`);
+    } else {
+      console.error(
+        `  upstream(image) ${res.status} (set HALO_DEBUG_UPSTREAM_ERRORS=1 to print body to this terminal)`
+      );
+    }
+    return {
+      status: res.status,
+      data: sanitizeUpstreamError(parsed, res.status),
+      usage: zeroUsage,
+      respHeaders: {},
+    };
+  }
+
+  return {
+    status: res.status,
+    data: parsed,
+    usage: zeroUsage,
+    respHeaders: passthroughResponseHeaders(res),
+  };
+}
+
+/** Stream OpenAI-format deltas and capture final usage. */
 async function streamUpstream(
   cfg: HaloConfig,
   _apiKey: string | undefined,
@@ -645,23 +985,45 @@ async function streamUpstream(
   return { status: 200, usage, ok: true };
 }
 
-// Reconnect strategy: try forever by default, with exponential backoff capped
-// at BACKOFF_MAX_MS. A successful connect (we got an "announce" through)
-// resets the counter so a long-running operator that flakes once doesn't
-// accumulate failures across days.
-//
-// Earlier versions hard-capped at 10 attempts and then `process.exit(1)`.
-// That hurt persistence: a 5-minute network outage or a relay redeploy was
-// enough to silently drop the operator offline permanently. Now the default
-// is unlimited — the only ways serve stops are SIGINT/SIGTERM or an explicit
-// --max-reconnect-attempts limit. For unattended operators this is the right
-// default; for CI smoke tests you can still set a cap.
-//
-// BASE = 500ms because a clean disconnect is usually a momentary blip; we'd
-// rather come back online in half a second than wait a full one.
+/** Reduce an upstream error body to a fixed {message,type,code} shape so a hostile or
+ *  misconfigured upstream cannot leak operator-side request metadata to the consumer. */
+function sanitizeUpstreamError(parsed: unknown, status: number): unknown {
+  const src = (parsed as { error?: unknown })?.error;
+  const safe: { message: string; type?: string; code?: string } = {
+    message: `upstream provider returned ${status}`,
+  };
+  if (src && typeof src === "object") {
+    const e = src as Record<string, unknown>;
+    if (typeof e.message === "string" && e.message.length > 0 && e.message.length < 500) {
+      safe.message = e.message;
+    }
+    if (typeof e.type === "string" && e.type.length < 100) safe.type = e.type;
+    if (typeof e.code === "string" && e.code.length < 100) safe.code = e.code;
+  } else if (typeof (parsed as { message?: unknown })?.message === "string") {
+    const m = (parsed as { message: string }).message;
+    if (m.length > 0 && m.length < 500) safe.message = m;
+  }
+  return { error: safe };
+}
+
+function sendWsJson(ws: WebSocket, message: unknown): Promise<void> {
+  if (ws.readyState !== WebSocket.OPEN) {
+    return Promise.reject(new Error("relay websocket is not open"));
+  }
+  const payload = JSON.stringify(message);
+  return new Promise((resolve, reject) => {
+    ws.send(payload, (err) => {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
+}
+
+// Reconnect indefinitely with capped exponential backoff unless an explicit attempt limit is set.
+// A successful announcement resets the failure count.
 const BACKOFF_BASE_MS = 500;
 const BACKOFF_MAX_MS = 30_000;
-const DEFAULT_MAX_RECONNECT_ATTEMPTS = 0; // 0 = unlimited
+const DEFAULT_MAX_RECONNECT_ATTEMPTS = 0;
 
 /** Resolve the reconnect-attempt cap. Env var HALO_MAX_RECONNECT_ATTEMPTS wins, then default. */
 function resolveMaxReconnectAttempts(): number {
@@ -673,20 +1035,8 @@ function resolveMaxReconnectAttempts(): number {
   return DEFAULT_MAX_RECONNECT_ATTEMPTS;
 }
 
-// Application-level keepalive between the operator and the relay. The `ws`
-// library auto-pongs at the protocol layer, but that doesn't tell *us* the
-// relay is still reachable — so we send `{type:"ping"}` on a timer and
-// expect `{type:"pong"}` back, force-closing the socket if the relay falls
-// silent.
-//
-// 5s ping cadence (was 10s): keeps the connection actively non-idle from the
-// perspective of any intermediate proxy / NAT / Fly edge that might prune
-// "quiet" connections at 30-60s idle. Doubling the rate is cheap (2 ws frames
-// of ~30 bytes per peer per second relay-wide) and dramatically shrinks the
-// window where a silently-dead connection goes undetected.
-//
-// 12s pong timeout (was 15s): still > 2× ping interval, so a single dropped
-// ping doesn't false-evict, but cuts detection lag if pings stop landing.
+// Application pings detect silent relay/proxy loss that protocol-level auto-pongs cannot expose.
+// Close after the pong timeout so the reconnect loop can recover.
 const WS_PING_INTERVAL_MS = 5_000;
 const WS_PONG_TIMEOUT_MS = 12_000;
 
@@ -697,25 +1047,20 @@ function backoffDelayMs(attempt: number): number {
 
 export async function cmdServe(): Promise<void> {
   installProxyFromEnv(); // honor HTTP(S)_PROXY for upstream/relay/facilitator calls
+  const reportedRelayVersion = relayCliVersion();
   const cfg = loadConfig();
 
   // Point vault reads + receipt verification at the configured vault (defaults to
   // the consensus-pinned address). Throws on a malformed override so a typo fails
   // here rather than silently rejecting every vault request at serve time.
   setActiveVaultAddress(cfg.vaultAddress);
+  const selectedVaultAddress = getVaultAddress();
 
-  // File logging + PID file. Both survive terminal close and process exit
-  // so post-hoc diagnosis works (Hermes / doctor / `tail -f`). Rotation is
-  // size-based: when the active log crosses LOG_ROTATE_BYTES we move it to
-  // serve.log.1 (overwriting any previous .1) and open a fresh one. Keeps
-  // disk usage bounded at ~2 × LOG_ROTATE_BYTES.
+  // Persistent logs rotate to one backup; the PID file supports deterministic status checks.
   setupFileLogging();
   writePidFile();
 
-  // Unattended mode: the operator opted out of a wallet passphrase at setup
-  // time. The keystore was created with empty-string encryption so we can
-  // unlock it without prompting. The security trade-off was documented and
-  // accepted then; no point repeating the warning every restart.
+  // Empty-passphrase unattended keystores unlock without prompting.
   let passphrase: string;
   if (cfg.operator.noPassphrase) {
     passphrase = "";
@@ -741,22 +1086,53 @@ export async function cmdServe(): Promise<void> {
     );
   }
 
-  // Probe vault-read capability in parallel with the rest of startup so a slow
-  // RPC never delays the relay connection. Using the operator as both keys is a
-  // harmless read: an empty reservation still proves RPC + pinned-vault access.
-  // A failed probe is retried while connected; success re-announces on the live
-  // socket, so a transient boot failure does not latch until process restart.
+  // Probe selected-vault identity and reads asynchronously; keep revalidating so
+  // a facilitator rotation cannot leave a stale capability advertised forever.
   let vaultPayments = false;
+  let vaultRpcCapable = false;
+  let vaultIdentityCapable = false;
   let vaultProbeInFlight: Promise<boolean> | null = null;
-  const probeVaultCapability = (): Promise<boolean> => {
-    if (vaultPayments) return Promise.resolve(true);
+  let lastVaultIdentityDiagnostic = "";
+  let syncAnnouncedVaultCapability: ((capability: boolean) => Promise<void>) | null = null;
+  const vaultIdentityProbe = new FacilitatorIdentityProbe(() =>
+    inspectFacilitatorVault(cfg.facilitator.url, selectedVaultAddress)
+  );
+  const applyVaultIdentity = (
+    identity: Awaited<ReturnType<typeof inspectFacilitatorVault>>
+  ): void => {
+    if (identity.status === "match") {
+      vaultIdentityCapable = true;
+      lastVaultIdentityDiagnostic = "";
+    } else {
+      const diagnostic = facilitatorVaultError(selectedVaultAddress, identity);
+      if (diagnostic !== lastVaultIdentityDiagnostic) {
+        console.error(`  ✗ ${diagnostic}`);
+        lastVaultIdentityDiagnostic = diagnostic;
+      }
+      vaultIdentityCapable = retainVaultIdentityAnnouncement(
+        identity,
+        vaultIdentityCapable,
+        vaultIdentityProbe.lastMatchAt,
+        Date.now()
+      );
+    }
+    vaultPayments = vaultIdentityCapable && vaultRpcCapable;
+  };
+  const probeVaultCapability = (forceFreshIdentity = true): Promise<boolean> => {
     if (vaultProbeInFlight) return vaultProbeInFlight;
-    const probe = readReservation(cfg.operator.address, cfg.operator.address)
-      .then(() => {
-        vaultPayments = true;
-        return true;
+    const probe = vaultIdentityProbe.check(forceFreshIdentity)
+      .then(async (identity) => {
+        applyVaultIdentity(identity);
+        if (identity.status === "match") {
+          await readReservation(cfg.operator.address, cfg.operator.address);
+          vaultRpcCapable = true;
+        }
+        vaultPayments = vaultIdentityCapable && vaultRpcCapable;
+        return vaultPayments;
       })
       .catch((err) => {
+        vaultRpcCapable = false;
+        vaultPayments = false;
         logError("vault capability probe failed; will retry in background", err);
         return false;
       })
@@ -768,16 +1144,7 @@ export async function cmdServe(): Promise<void> {
   };
   void probeVaultCapability();
 
-  // Resolve the plaintext upstream API key(s) for this serve session. Two
-  // on-disk shapes are supported per provider:
-  //   - plaintext string (legacy / explicit opt-out)
-  //   - EncryptedSecret  → decrypted with the keystore passphrase we just used
-  //                        to unlock the wallet (same passphrase, same scrypt
-  //                        KDF as encryptSecret in setup).
-  // A multi-provider operator may carry several keys (e.g. OpenRouter + NEAR);
-  // each is decrypted IN PLACE on the runtime config object so `resolveProvider`
-  // hands `callUpstream` a usable Bearer token per model. The plaintext lives
-  // only in this process for its lifetime; the on-disk config is unchanged.
+  // Decrypt provider keys in the runtime config only; the stored config remains encrypted.
   const decryptKey = (label: string, apiKey: ProviderConfig["apiKey"]): string | undefined => {
     if (!isEncryptedSecret(apiKey)) return apiKey;
     try {
@@ -799,13 +1166,9 @@ export async function cmdServe(): Promise<void> {
   // single-provider configs, so it's already decrypted there; mirror for the
   // multi-provider case where cfg.provider is a separate object).
   cfg.provider.apiKey = configProviders(cfg)[0].apiKey;
-  // Back-compat handle still referenced by warm-up + a few call sites.
   const upstreamApiKey: string | undefined =
     typeof cfg.provider.apiKey === "string" ? cfg.provider.apiKey : undefined;
-  // Per-provider key fingerprint so the operator can eyeball that the RIGHT key
-  // is loaded for each gateway (the #1 cause of upstream 401s is a stale/rotated
-  // key in the running process vs the one the operator tests by hand). Masked —
-  // first 6 + last 4 + length — never the full secret.
+  // Show only a masked key fingerprint for operator diagnostics.
   const maskKey = (k: string | undefined): string => {
     if (!k) return "(none)";
     if (k.length <= 12) return `set, len ${k.length}`;
@@ -818,12 +1181,7 @@ export async function cmdServe(): Promise<void> {
     console.log(`  • ${p.slug}: key ${maskKey(k)}, ${p.models.length} model(s) → ${p.baseUrl}`);
   }
 
-  // Live auth probe: settle "is the stored key valid?" with the upstream itself,
-  // BEFORE any consumer request, so a stale/typo'd key (which looks right in the
-  // masked fingerprint — same prefix/suffix/length, different middle) surfaces as
-  // a clear startup failure instead of a confusing "Invalid or expired API key"
-  // in the consumer's browser. One ~free 1-token call per keyed
-  // provider; best-effort (a network blip just skips, never blocks serve).
+  // Probe each keyed provider with a minimal request; network failure never blocks serve.
   await Promise.all(
     configProviders(cfg).map(async (p) => {
       const k = typeof p.apiKey === "string" ? p.apiKey : undefined;
@@ -867,8 +1225,7 @@ export async function cmdServe(): Promise<void> {
               `Compare it to a key that works in a direct curl (a 1-char typo keeps the same length/prefix). ` +
               `Re-set: halo setup --add-provider --provider ${p.slug} --api-key <key>  then restart serve.`
           );
-          // Don't announce models we can't serve; the background re-probe closes
-          // the breaker once the key is fixed (issue #459).
+          // Do not announce models whose provider authentication is broken.
           tripBreakerLogged(p.slug, "operator_auth_failure");
         } else if (res.status === 402) {
           console.error(
@@ -896,19 +1253,11 @@ export async function cmdServe(): Promise<void> {
     })
   );
 
-  // Generate the session-scoped X25519 keypair for end-to-end prompt
-  // encryption. The pubkey rides in `announce`; the privkey lives only in
-  // this process for the lifetime of `serve`. On process restart both are
-  // gone — past ciphertext is provably unbreakable, even by us.
+  // The X25519 private key remains process-scoped for this serve session.
   const encryptionKeys: OperatorKeyPair = generateOperatorKeypair();
   console.log(`  ✓ E2E encryption pubkey ${encryptionKeys.publicKeyHex.slice(0, 16)}…`);
 
-  // Bind the E2E pubkey to the operator's on-chain identity: sign
-  // `halo-pubkey:{address}:{pubkey}` once (the pubkey is stable for this serve
-  // process). The relay forwards this to consumers so they can verify the key is
-  // genuinely ours — a relay can't substitute its own key to read plaintext
-  // (MITM) without an operator signature it can't forge. Normalized (no 0x,
-  // lowercase) to match what the relay reconstructs from the announced pubkey.
+  // Sign the normalized session key so clients can verify its operator binding.
   const pubkeyNorm = encryptionKeys.publicKeyHex.replace(/^0x/, "").toLowerCase();
   const pubkeyAttestation = await wallet.signMessage(
     `halo-pubkey:${cfg.operator.address.toLowerCase()}:${pubkeyNorm}`
@@ -920,15 +1269,88 @@ export async function cmdServe(): Promise<void> {
     cfg.facilitator.failoverUrls
   );
 
-  // Operator-driven vault redeem (issue #369): the operator holds the consumer's
-  // signed cumulative receipts, bounds un-receipted serving via a per-consumer
-  // credit window, and redeems the receipts itself (with retry) — so served work
-  // can never go uncollected because a consumer didn't bother to redeem.
-  const creditLedger = new VaultCreditLedger();
+  const receiptStore = new VaultReceiptStore(path.join(configDir(), "vault-receipts.json"));
+
+  const pendingRehydration = new Map<string, PendingHeldReceipt>();
+  for (const r of receiptStore.load()) {
+    if (r.operator.toLowerCase() !== cfg.operator.address.toLowerCase()) continue;
+    pendingRehydration.set(receiptPairKey(r.consumer, r.operator), {
+      consumer: r.consumer,
+      operator: r.operator,
+      ...r.receipt,
+    });
+  }
+  const persistReceiptSnapshot = (ledgerSnap: ReceiptSnapshot): void =>
+    receiptStore.save(durableReceiptSnapshot(pendingRehydration, ledgerSnap));
+  const creditLedger = new VaultCreditLedger(persistReceiptSnapshot);
   const redeemer = new OperatorRedeemer(cfg.facilitator.url, creditLedger, (m) => console.log(m));
-  // Periodic sweep: re-attempt any receipt whose redeem failed transiently and
-  // got no follow-up receipt, so it's collected before the reservation expires.
-  const redeemSweep = setInterval(() => redeemer.sweep(), 30_000);
+
+  // Re-verification is non-blocking and serialized across the boot pass and sweeps.
+  let rehydrating = false;
+  const rehydrateReceipts = async (): Promise<void> => {
+    if (rehydrating) return;
+    rehydrating = true;
+    try {
+      for (const [k, p] of [...pendingRehydration]) {
+        const expected = {
+          cumulative: p.cumulative,
+          signature: p.signature,
+          cycle: p.cycle,
+        };
+        const v = await verifyReceipt({
+          consumer: p.consumer,
+          operator: p.operator,
+          cumulative: p.cumulative,
+          signature: p.signature,
+        });
+        if (!v.ok) {
+          if (shouldRetryRehydration(p, v)) continue;
+          pendingRehydration.delete(k);
+          creditLedger.dropReceipt(p.consumer, p.operator, expected);
+          console.log(
+            `  ⚠ vault: dropping unrecoverable held receipt from ${abbrevAddr(p.consumer)} (${v.reason})`
+          );
+          continue;
+        }
+        if (handoffRehydratedReceipt({
+          key: k,
+          pending: pendingRehydration,
+          receipt: p,
+          verification: v,
+          ledger: creditLedger,
+          persistCurrent: persistReceiptSnapshot,
+        })) {
+          redeemer.kick(p.consumer, p.operator);
+        }
+      }
+    } finally {
+      rehydrating = false;
+    }
+  };
+  void rehydrateReceipts().then(() => {
+    let receipts = 0;
+    const consumers = new Set<string>();
+    let pending = 0n;
+    for (const { consumer, operator } of creditLedger.pairsWithRedeemable()) {
+      const s = creditLedger.snapshot(consumer, operator);
+      if (!s) continue;
+      receipts++;
+      consumers.add(consumer.toLowerCase());
+      const cap = s.ceiling >= 0n && s.held > s.ceiling ? s.ceiling : s.held;
+      if (cap > s.redeemed) pending += cap - s.redeemed;
+    }
+    if (receipts > 0) {
+      console.log(
+        `  ↻ vault: rehydrated ${receipts} held receipt(s) across ${consumers.size} consumer(s), ${formatUsdcBase(pending, { withDollarSign: true })} pending collection`
+      );
+    }
+  });
+
+  // Retry transient startup verification alongside pending redeems.
+  const redeemSweep = setInterval(() => {
+    if (pendingRehydration.size > 0) void rehydrateReceipts();
+    redeemer.sweep();
+  }, 30_000);
   redeemSweep.unref?.();
   // Verify a consumer-pushed receipt against on-chain state, record it (freeing
   // this pair's credit window), and trigger collection. Shared by the WS receipt
@@ -940,10 +1362,7 @@ export async function cmdServe(): Promise<void> {
       console.warn(`  ⚠ rejecting vault receipt from ${abbrevAddr(consumer)}: ${v.reason}`);
       return false;
     }
-    // Seed the collectable ceiling from this FRESH (uncached) on-chain read before
-    // recording, so a receipt whose cumulative runs past the reservation frees the
-    // credit window only up to what it can actually redeem (`redeemed + locked`),
-    // never the uncollectable tail (#437).
+    // A fresh chain read prevents uncollectable receipt tails from freeing credit.
     creditLedger.syncOnchain(consumer, cfg.operator.address, v.cycle, v.redeemed, v.locked);
     if (creditLedger.recordReceipt(consumer, cfg.operator.address, { cumulative, signature, cycle: v.cycle })) {
       redeemer.kick(consumer, cfg.operator.address);
@@ -951,21 +1370,7 @@ export async function cmdServe(): Promise<void> {
     return true;
   };
 
-  // Warm the facilitator address cache at startup so the first inference
-  // request doesn't pay the latency of a /supported fetch.
-  const facilitatorAddress = await facilitator.getFacilitatorAddress();
-  if (facilitatorAddress) {
-    console.log(`  ✓ facilitator address ${abbrevAddr(facilitatorAddress)} (upto scheme enabled)`);
-  } else {
-    console.log(`  ⚠ facilitator /supported not available — falling back to exact scheme`);
-  }
-
-  // Keep LOCAL models resident so the first paid inference doesn't also pay a
-  // cold model load (Ollama unloads after ~5 min idle; LM Studio JIT-loads).
-  // Hosted providers are always warm and a ping there costs real money — never
-  // ping them. Fire-and-forget; a failed warm just means a slower first serve.
-  // Multi-provider: warm only the local providers' models (callUpstream routes
-  // each ping to its provider by model).
+  // Fire-and-forget warmups apply only to local providers; never spend on hosted-provider probes.
   const localModels = configProviders(cfg)
     .filter((p) => p.slug === "ollama" || p.slug === "lmstudio")
     .flatMap((p) => p.models);
@@ -979,7 +1384,6 @@ export async function cmdServe(): Promise<void> {
             max_tokens: 1,
           });
         } catch {
-          // best-effort
         }
       }
     };
@@ -1004,9 +1408,7 @@ export async function cmdServe(): Promise<void> {
     shuttingDown = true;
     stopUpdateMonitor();
     console.log("\n  shutting down");
-    // Best-effort: collect any held receipts before exit (issue #369), bounded
-    // so shutdown never hangs on a slow facilitator. Auto-update deliberately
-    // uses this exact same drain as an operator-requested restart.
+    // Bound receipt flushing so shutdown cannot hang on the facilitator.
     shutdownPromise = Promise.race([
       redeemer.flush().then(() => undefined),
       new Promise<void>((resolve) => setTimeout(resolve, 3000)),
@@ -1026,26 +1428,18 @@ export async function cmdServe(): Promise<void> {
     restartIntoManagedInstall();
   });
 
-  // Run the WS lifecycle. Resolves when the socket closes; never rejects —
-  // failures bubble up as a close event so the supervisor can decide whether
-  // to retry. Returns true if we got far enough to announce (which resets
-  // the retry counter).
+  // Resolve, rather than reject, on close; report whether announcement succeeded for retry reset.
   const runOnce = (): Promise<{ announced: boolean }> =>
     new Promise((resolve) => {
       let announced = false;
-      // Flag flipped by the close handler. Async inference handlers check this
-      // before calling x402Settle — if the WS dropped mid-request (relay
-      // superseded our peer, network blip, etc.), we MUST NOT settle. The
-      // consumer can no longer receive the response, so charging them would
-      // be theft. This is checked at multiple points because settle is the
-      // last thing that runs and the WS can close at any point during the
-      // upstream call.
+      // Async handlers re-check this before settlement so an undeliverable response is not charged.
       let wsClosed = false;
+      const abortedStreams = new Set<string>();
       console.log(`  connecting to relay: ${wsUrl}`);
       const ws = new WebSocket(wsUrl, {
-        perMessageDeflate: false, // small JSON frames don't compress; skip the CPU cost
+        perMessageDeflate: false,
         handshakeTimeout: 10_000, // fail upgrade fast if relay is unreachable
-        headers: { "X-Halo-Cli-Version": HALO_VERSION },
+        headers: { "X-Halo-Cli-Version": reportedRelayVersion },
       });
 
       // Application-level keepalive state. lastPongAt seeds at connect time
@@ -1061,11 +1455,7 @@ export async function cmdServe(): Promise<void> {
       };
 
       ws.on("open", () => {
-        // TCP keepalive: OS sends probes every 3s (was 5s) so dead sockets
-        // are detected at the kernel level fast. Combined with the app-level
-        // 5s ping/pong above, the operator catches silent drops in ~6-12s
-        // worst case rather than the previous ~15-25s.
-        // setNoDelay disables Nagle so ping frames are sent immediately.
+        // Combine kernel keepalive with application ping/pong; disable Nagle for immediate control frames.
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const rawSocket = (ws as any)._socket;
         if (rawSocket) {
@@ -1129,23 +1519,28 @@ export async function cmdServe(): Promise<void> {
           ): Promise<void> => {
             const signature = await wallet.signMessage(announceMsg);
             const providers = configProviders(cfg);
-            // De-announce models whose provider circuit breaker is open (issue
-            // #459) so the relay routes them to healthy operators instead of us;
-            // re-announced (via the breaker change hook below) once it recovers.
+            // De-announce unavailable provider models until their breaker recovers.
             const deannounced = breakerDeannouncedModels(cfg);
             const announceModels = allConfiguredModels(cfg).filter((m) => !deannounced.has(m));
+            const pricing = await buildPricingAnnounce(cfg);
+            const imagePricing = buildImagePricingAnnounce(cfg);
             // Models served by a TEE provider → advertised as confidential-capable
             // so the relay can classify TEE PER MODEL (a multi-provider operator
             // may serve openrouter + near; only the near models are confidential).
             const teeModels = providers
               .filter((p) => isTeeProviderSlug(p.slug) && !isBreakerOpen(p.slug))
               .flatMap((p) => p.models);
+            // Also exclude image models whose provider breaker is open, so a
+            // broken provider isn't advertised as image-capable.
+            const imageModels = providers
+              .flatMap((p) => p.imageModels ?? [])
+              .filter((m) => !deannounced.has(m));
             ws.send(
               JSON.stringify({
                 type: "announce",
                 data: {
                   address: cfg.operator.address,
-                  cliVersion: HALO_VERSION,
+                  cliVersion: reportedRelayVersion,
                   // Primary slug (back-compat single-provider classification).
                   provider: cfg.provider.slug,
                   // Every distinct provider slug this operator fronts.
@@ -1153,23 +1548,18 @@ export async function cmdServe(): Promise<void> {
                   models: announceModels,
                   // Subset of `models` that route to a hardware-TEE provider.
                   teeModels: [...new Set(teeModels)],
-                  pricing: await buildPricingAnnounce(cfg),
+                  // Subset of `models` served through the image-generation adapter.
+                  ...([...new Set(imageModels)].length > 0
+                    ? { imageModels: [...new Set(imageModels)] }
+                    : {}),
+                  pricing,
+                  ...(Object.keys(imagePricing).length > 0 ? { imagePricing } : {}),
                   // Per-model context window (tokens) so the relay's /v1/models
                   // can expose it for agents to size context / decide compression.
                   contextLength: await buildContextLengthAnnounce(cfg),
-                  // We serve stream:true vault requests as inference-chunk
-                  // frames on the OpenAI wire (streamUpstream doesn't speak
-                  // the anthropic SSE shape). Consumers gate stream:true on
-                  // this flag so operators without it never receive the flag.
-                  // True when ANY provider speaks the OpenAI wire; per-request
-                  // serving still re-checks the model's own provider.
+                  // Advertise vault streaming when any provider supports the OpenAI wire; requests re-check their provider.
                   streaming: providers.some((p) => wireFormatFor(p.slug) !== "anthropic"),
-                  // Rollout capability marker: the relay routes vault-mode requests
-                  // ONLY to operators that announce on-chain reservation verification —
-                  // there is NO legacy fallback (a vault reservation is bound on-chain
-                  // to a specific operator, so a legacy operator can't honor it). While
-                  // a model has no eligible operator, vault requests for it 503
-                  // (no_vault_operator); non-vault requests are unaffected.
+                  // Vault routing requires this reservation-verification capability; no legacy fallback is valid.
                   vaultPayments: capability,
                   label: cfg.operator.label,
                   dataRetention: cfg.operator.dataRetention ?? "unknown",
@@ -1184,7 +1574,7 @@ export async function cmdServe(): Promise<void> {
               console.log("  ✓ vault RPC recovered; re-announced vaultPayments capability");
             } else {
               console.log(
-                `  ✓ announced as ${abbrevAddr(cfg.operator.address)} (${providers.map((p) => p.slug).join("+")}, ${announceModels.length} models${teeModels.length ? `, ${new Set(teeModels).size} confidential` : ""})`
+                `  ✓ announced as ${abbrevAddr(cfg.operator.address)} (${providers.map((p) => p.slug).join("+")}, ${announceModels.length} models${teeModels.length ? `, ${new Set(teeModels).size} confidential` : ""}${imageModels.length ? `, ${new Set(imageModels).size} image` : ""})`
               );
               announced = true;
               reconnectAttempt = 0;
@@ -1192,9 +1582,6 @@ export async function cmdServe(): Promise<void> {
           };
 
           const initialVaultCapability = vaultPayments;
-          // Last capability we announced — a breaker re-announce must preserve
-          // it (don't silently drop a vault promotion that already landed).
-          let announcedCapability = initialVaultCapability;
           try {
             await sendAnnouncement(initialVaultCapability, false);
           } catch (err) {
@@ -1202,41 +1589,41 @@ export async function cmdServe(): Promise<void> {
             ws.close(4000, "announce sign failed");
             return;
           }
-          // Re-announce (with the breaker-filtered model set) whenever a
-          // provider trips or recovers, so the relay's routing table tracks
-          // which of our models are actually servable (issue #459).
+          const capabilityAnnouncements = new CapabilityAnnouncementSync(
+            initialVaultCapability,
+            sendAnnouncement
+          );
+          syncAnnouncedVaultCapability = async (capability: boolean) => {
+            if (wsClosed || ws.readyState !== WebSocket.OPEN) return;
+            await capabilityAnnouncements.sync(capability);
+          };
+          // Keep relay capabilities synchronized with provider breaker state.
           setBreakerChangeHandler(() => {
             if (wsClosed || ws.readyState !== WebSocket.OPEN) return;
-            void sendAnnouncement(announcedCapability, false).catch((err) =>
+            void capabilityAnnouncements.refresh().catch((err) =>
               logError("circuit-breaker re-announce failed", err)
             );
           });
-          if (!initialVaultCapability) {
-            void (async () => {
-              while (!shuttingDown && !wsClosed) {
-                if (await probeVaultCapability()) {
-                  if (ws.readyState !== WebSocket.OPEN || wsClosed) return;
-                  try {
-                    announcedCapability = true;
-                    await sendAnnouncement(true, true);
-                    return;
-                  } catch (err) {
-                    logError("vault capability re-announce failed; will retry", err);
-                  }
-                }
-                await new Promise((resolve) =>
-                  setTimeout(resolve, VAULT_CAPABILITY_RETRY_MS)
-                );
+          void (async () => {
+            while (!shuttingDown && !wsClosed) {
+              const capability = await probeVaultCapability();
+              if (ws.readyState !== WebSocket.OPEN || wsClosed) return;
+              try {
+                await capabilityAnnouncements.sync(capability);
+              } catch (err) {
+                logError("vault capability re-announce failed; will retry", err);
               }
-            })();
-          }
+              await new Promise((resolve) =>
+                setTimeout(resolve, VAULT_CAPABILITY_RETRY_MS)
+              );
+            }
+          })();
           if (!heartbeatStarted) {
             heartbeatStarted = true;
             startHeartbeat(cfg, wallet).catch((err) =>
               logError("heartbeat loop crashed", err)
             );
-            // Re-probe any open provider breakers in the background; closing one
-            // re-announces its models via the breaker change hook (issue #459).
+            // Re-probe open breakers; recovery triggers re-announcement.
             startBreakerReprobe(cfg).catch((err) =>
               logError("breaker re-probe loop crashed", err)
             );
@@ -1244,10 +1631,7 @@ export async function cmdServe(): Promise<void> {
           return;
         }
 
-        // Consumer-pushed cumulative receipt for prior vault work, routed by the
-        // relay (operator-driven redeem, issue #369). Off the serve path: verify,
-        // record (frees the credit window), and collect. The tail of a burst (no
-        // follow-up request to piggyback on) relies on this dedicated push.
+        // Dedicated receipt pushes collect the final tail when no request follows.
         if (msg.type === "receipt") {
           const m = msg as { receiptId?: string; consumer?: string; cumulative?: string; signature?: string };
           let cumulative: bigint;
@@ -1266,14 +1650,23 @@ export async function cmdServe(): Promise<void> {
           return;
         }
 
+        if (msg.type === "stream-abort") {
+          const m = msg as StreamAbortMessage;
+          if (typeof m.requestId === "string" && m.requestId.length > 0) {
+            abortedStreams.add(m.requestId);
+            console.warn(
+              `  ⚠ relay aborted stream ${m.requestId}${m.reason ? ` (${m.reason})` : ""}; releasing any admitted vault credit`
+            );
+          }
+          return;
+        }
+
         if (msg.type !== "inference-request") return;
         const req = msg as InferenceRequestMessage;
         const requestStartedAt = Date.now();
+        await withAbortedStreamCleanup(abortedStreams, req.requestId, async () => {
 
-        // Early bail: if the WS is already gone by the time the handler runs,
-        // there's nothing useful we can do. Don't decrypt, don't verify, don't
-        // call upstream (which would cost the operator real money for a request
-        // that can't be answered), don't settle.
+        // A closed relay socket cannot deliver a response, so skip all paid work and settlement.
         if (wsClosed || ws.readyState !== WebSocket.OPEN) {
           console.warn(
             `  ⚠ WS closed before inference-request could be processed; aborting (consumer not charged)`
@@ -1281,14 +1674,7 @@ export async function cmdServe(): Promise<void> {
           return;
         }
 
-        // ── E2E decryption (Phase 0) ────────────────────────────────────────
-        // If the consumer sent an `_enc` envelope, decrypt it now so the rest
-        // of the handler sees a normal OpenAI-compat body. The relay tunneled
-        // ciphertext blindly; we are the first party in the chain that can
-        // read the prompt.
-        //
-        // The outer body carries `model` in cleartext (the relay needs it for
-        // routing). The decrypted plaintext carries everything else.
+        // Decrypt `_enc` after routing; only the outer `model` remains cleartext.
         let consumerPublicKey: Uint8Array | undefined;
         const encEnvelope = (req.body as { _enc?: unknown })?._enc;
         if (isEncryptedEnvelope(encEnvelope)) {
@@ -1324,15 +1710,7 @@ export async function cmdServe(): Promise<void> {
         const requestedModel =
           typeof req.body.model === "string" ? req.body.model : allConfiguredModels(cfg)[0] || "unknown";
 
-        // Circuit breaker (issue #459): if this model's provider is known to be
-        // out of credits / rejecting its key, don't verify payment or call
-        // upstream — instant-reject BEFORE the consumer is charged. The response
-        // is byte-for-byte what a live upstream failure would have produced
-        // (structured 502 upstream_provider_error), so the consumer/frontend
-        // classify it identically. The real failover is that we've de-announced
-        // this model, so the relay routes the consumer's next attempt to a
-        // healthy operator; a request already in flight when the breaker tripped
-        // still lands here and gets the fast, un-charged rejection.
+        // Reject open-breaker requests before payment verification or upstream work.
         const brokenSlug = providerForModel(configProviders(cfg), requestedModel).slug;
         if (isBreakerOpen(brokenSlug)) {
           const code = breakerCode(brokenSlug) ?? "provider_error";
@@ -1354,73 +1732,72 @@ export async function cmdServe(): Promise<void> {
           return;
         }
 
-        // Completion ceiling drives the prompt-blind 402 quote. The consumer
-        // sends max_tokens on BOTH the challenge probe and the retry, so this
-        // value is identical across the two calls and the quote stays stable.
-        // NB: this feeds the x402/exact quote too, where the consumer pays the
-        // QUOTE (not actual) — so it must stay the raw request budget. The vault
-        // gate applies its own reasoning-headroom ceiling below (#421); it can,
-        // because vault settles ACTUAL (never the quote).
+        // Price against the stable raw completion budget forwarded by the relay.
         const estimatedCompletionTokens =
           typeof req.body.max_tokens === "number" ? req.body.max_tokens : 500;
         let out: { status: number; headers: Record<string, string>; body: unknown };
 
-        // Payment-mode detection. Budget mode (Permit2 pre-authorization) and
-        // per-request mode (EIP-3009 single-use) coexist; the consumer's
-        // x-halo-payment-mode header (default "exact") picks. See
-        // docs/BUDGET_MODE.md.
-        // Normalize identically to the relay (trim + lowercase) so a whitespace
-        // variant like "vault " can't fall through to the exact/x402 path after
-        // the relay already routed it as vault. The relay normalizes before
-        // forwarding too; this is defense-in-depth for any non-relay caller.
+        // Match relay normalization so whitespace/case variants cannot select a different rail here.
         const paymentMode = (
-          (req.headers["x-halo-payment-mode"] as string) || "exact"
+          (req.headers["x-halo-payment-mode"] as string) || ""
         )
           .trim()
           .toLowerCase();
 
-        // Confidential (TEE) E2EE request: the consumer encrypted the content to
-        // the upstream enclave's key (NEAR). We forward the E2EE headers + the
-        // upstream's response signature untouched, and force the BUFFERED path so
-        // the model TEE's byte-exact response signature survives (the relay
-        // re-frames streamed SSE, which would invalidate it).
-        // A confidential request is signalled by the consumer's E2EE client
-        // pubkey (the canonical marker; x-encryption-version is an alt some
-        // clients send). Drives the signature fetch + buffered path.
+        // Confidential requests stay buffered because SSE reframing would invalidate the byte-exact proof.
+        // The client E2EE public key is the canonical confidential-request marker.
         const teeRequest =
           typeof req.headers["x-client-pub-key"] === "string" ||
           typeof req.headers["x-encryption-version"] === "string";
+        const acceptsMedia = requestAcceptsMedia(
+          req.body,
+          req.headers as Record<string, string | undefined>
+        );
         const reqHeaders = req.headers as Record<string, string>;
 
-        // Credit-window reservation held across this serve (issue #369): set when
-        // a vault request is admitted, cleared once it's settled/released. The
-        // catch releases it so a thrown serve can't strand the window.
+        // Track admission so every thrown serve releases its credit reservation.
         let creditAdmitted: { consumer: string; ceiling: bigint; cycle: bigint } | null = null;
         let creditAdmit: AdmitResult;
+        const imagePrice = imagePriceForModel(cfg, requestedModel);
 
         try {
           if (paymentMode === "vault") {
-            // ── VAULT MODE PATH (RFC v2) ──────────────────────────────────
-            // The consumer has locked funds on-chain reserved exclusively to
-            // this operator and settles afterward with a session-key receipt
-            // (the facilitator submits it). We GATE: read the on-chain
-            // reservation and refuse unless it covers this request's cost
-            // ceiling and hasn't expired — so we never serve value we can't
-            // collect. No x402 verify/settle on this path.
+            // Vault mode gates pre-work on a live operator reservation; collection still requires a signed receipt.
             const consumerAddr = (req.headers["x-halo-vault-consumer"] || "").toLowerCase();
             const fmtUsd = (b: bigint) => formatUsdcBase(b, { withDollarSign: true });
-            if (!isAddress(consumerAddr)) {
+            // Concurrent requests share one facilitator identity check; a recent
+            // match is reused briefly while deterministic mismatches invalidate it.
+            const requestVaultIdentity = await vaultIdentityProbe.check();
+            applyVaultIdentity(requestVaultIdentity);
+            if (requestVaultIdentity.status === "match" && !vaultRpcCapable) {
+              await probeVaultCapability(false);
+            }
+            const capabilitySync = syncAnnouncedVaultCapability;
+            if (capabilitySync) {
+              void capabilitySync(vaultPayments).catch((err) =>
+                logError("vault capability re-announce failed", err)
+              );
+            }
+            if (!vaultRpcCapable || requestVaultIdentity.status !== "match") {
+              out = {
+                status: 503,
+                headers: {},
+                body: {
+                  error: {
+                    message: "vault payments are unavailable because the configured vault could not be verified against the facilitator",
+                    type: "vault_identity_unverified",
+                    vault: selectedVaultAddress,
+                  },
+                },
+              };
+            } else if (!isAddress(consumerAddr)) {
               out = {
                 status: 400,
                 headers: {},
                 body: { error: { message: "vault mode requires a valid X-Halo-Vault-Consumer header" } },
               };
             } else {
-              // Piggybacked receipt for prior work (issue #369): `x-halo-receipt`
-              // is base64(JSON{cumulative, signature}) for THIS consumer. Process
-              // it BEFORE gating so a receipt riding on this request frees the
-              // credit window in time to admit it. Free for mid-burst calls; the
-              // burst tail uses the dedicated WS `receipt` push instead.
+              // Process a piggybacked prior receipt before gating this request.
               const rcptHeader = req.headers["x-halo-receipt"];
               if (typeof rcptHeader === "string" && rcptHeader) {
                 try {
@@ -1433,17 +1810,7 @@ export async function cmdServe(): Promise<void> {
                   /* malformed piggyback receipt — ignore; the gate still protects us */
                 }
               }
-              // Cost ceiling = exact prompt tokens + the completion ceiling.
-              // Size the completion ceiling with reasoning headroom (#421): a small
-              // max_tokens does not bound a reasoning model's reasoning tokens, so
-              // gating on max_tokens alone under-prices the ceiling and the operator
-              // undercollects. SHARED with the consumer's reserve sizing
-              // (@halo/vault-core `completionCeilingTokens`) so the reservation covers
-              // this gate price without a reserve-and-replay round trip (invariant
-              // #5/#7). Vault-only: unlike the x402/exact quote above, the vault path
-              // settles ACTUAL (capped to this ceiling), so headroom never overcharges
-              // — it only reserves/locks more (reclaimable). Deterministic in the
-              // request body, so the challenge-probe and retry quotes still match.
+              // Shared reasoning headroom keeps consumer reservation and serve gate equal.
               const vaultCompletionCeiling = completionCeilingTokens(
                 requestedModel,
                 estimatedCompletionTokens,
@@ -1451,12 +1818,15 @@ export async function cmdServe(): Promise<void> {
                   ? req.body.max_completion_tokens
                   : undefined
               );
-              const ceilingCost = await priceRequest({
-                cfg,
-                model: requestedModel,
-                promptTokens: estimatePromptTokens((req.body as { messages?: unknown }).messages),
-                completionTokens: vaultCompletionCeiling,
-              });
+              const ceilingCost =
+                imagePrice !== null
+                  ? priceImages(imagePrice, requestedImageCount(req.body))
+                  : await priceRequest({
+                      cfg,
+                      model: requestedModel,
+                      promptTokens: estimatePromptTokens((req.body as { messages?: unknown }).messages),
+                      completionTokens: vaultCompletionCeiling,
+                    });
               let chk: ReservationCheck;
               try {
                 chk = await checkReservationCached(consumerAddr, cfg.operator.address, ceilingCost);
@@ -1468,12 +1838,7 @@ export async function cmdServe(): Promise<void> {
                 console.warn(
                   `  ⚠ rejecting vault request ${req.requestId}: ${chk.reason} (need ${fmtUsd(ceilingCost)}, have ${fmtUsd(chk.remaining)})`
                 );
-                // An EXPIRED reservation is usually revived by re-reserving (a
-                // top-up extends its expiry) — UNLESS it has reached its on-chain
-                // lifetime cap (created + maxReserveTtl), in which case only a
-                // reclaim + fresh reserve recovers the funds (#473). The operator
-                // doesn't read the cap here, so name both paths rather than
-                // over-claiming that a top-up can't revive (PR #481 review).
+                // At the lifetime cap, reclaim and fresh reserve replace ordinary extension.
                 const advice =
                   chk.reason === "reservation expired"
                     ? "re-reserve to extend it — or, if it has reached its on-chain lifetime cap, reclaim it from your vault first, then re-reserve"
@@ -1492,20 +1857,11 @@ export async function cmdServe(): Promise<void> {
                   },
                 };
               } else {
-                // Window = configured credit cap, never above the on-chain
-                // collectible (`locked`) — we won't float more than funds exist
-                // to back. Caps the ACCUMULATION of un-receipted work; a lone
-                // request larger than the window is still admitted (bounded by
-                // `locked`), so worst-case ghosting loss is max(window, one
-                // request's ceiling) — see vaultCredit.ts admit().
-                // Recomputed from `chk` so a stale-cycle refresh below uses the
-                // refreshed reservation's `remaining`.
+                // Cap accumulated unreceipted work by configured credit and on-chain locked funds.
+                // One larger request may be admitted when nothing is outstanding; refresh from current cycle state.
                 const creditWindow = (): bigint =>
                   creditWindowBase() < chk.remaining ? creditWindowBase() : chk.remaining;
-                // Align process-local cumulative accounting with the durable
-                // on-chain baseline before the synchronous admission check —
-                // `redeemed` and `locked` (== chk.remaining) together bound the
-                // collectable ceiling a held receipt may free the window to (#437).
+                // Align local cumulative accounting with the on-chain collectible ceiling.
                 creditLedger.syncOnchain(consumerAddr, cfg.operator.address, chk.cycle, chk.redeemed, chk.remaining);
                 creditAdmit = creditLedger.admit(
                   consumerAddr,
@@ -1515,11 +1871,7 @@ export async function cmdServe(): Promise<void> {
                   creditWindow()
                 );
                 if (!creditAdmit.ok && creditAdmit.stale) {
-                  // Our cached reservation view lagged a cycle bump: a receipt for
-                  // the NEW generation advanced the ledger (via the uncached verify
-                  // path) while this request read the gate cache. Don't serve on
-                  // stale coverage or strand the window — drop the cache, refresh
-                  // from chain, and re-gate ONCE against the current cycle.
+                  // On a stale-cycle refusal, invalidate cache and re-gate once against current chain state.
                   invalidateGate(consumerAddr, cfg.operator.address);
                   try {
                     chk = await checkReservationCached(consumerAddr, cfg.operator.address, ceilingCost);
@@ -1563,13 +1915,41 @@ export async function cmdServe(): Promise<void> {
                 // Admitted — the ceiling is reserved against the window until we
                 // settle (served) or release (failed). Remember it for both.
                 creditAdmitted = { consumer: consumerAddr, ceiling: ceilingCost, cycle: chk.cycle };
-                // Reservation covers it — serve. stream:true pumps deltas to
-                // the consumer as inference-chunk frames (relay → SSE). Unlike
-                // budget mode this needs no opt-in flag: the reservation
-                // already locks funds on-chain BEFORE serving, and redeem
-                // happens after delivery on the buffered path too — streaming
-                // adds no new funds risk.
+                if (imagePrice !== null && !acceptsMedia) {
+                  creditLedger.releaseInflight(
+                    consumerAddr,
+                    cfg.operator.address,
+                    chk.cycle,
+                    ceilingCost
+                  );
+                  creditAdmitted = null;
+                  out = {
+                    status: 400,
+                    headers: {},
+                    body: {
+                      error: {
+                        message:
+                          "Image generation requires a media-capable consumer. Send X-Halo-Accept-Media: 1 and consume halo-media frames.",
+                        type: "media_client_required",
+                      },
+                    },
+                  };
+                  if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(
+                      JSON.stringify({
+                        type: "inference-response",
+                        requestId: req.requestId,
+                        status: out.status,
+                        headers: out.headers,
+                        body: out.body,
+                      })
+                    );
+                  }
+                  return;
+                }
+                // Vault streaming emits inference chunks; pre-locked funds preserve the buffered path's risk bound.
                 const wantsVaultStream =
+                  imagePrice === null &&
                   !teeRequest &&
                   !!req.body &&
                   typeof req.body === "object" &&
@@ -1583,6 +1963,7 @@ export async function cmdServe(): Promise<void> {
                 };
                 if (wantsVaultStream) {
                   const sres = await streamUpstream(cfg, upstreamApiKey, req.body, (deltaObj) => {
+                    if (abortedStreams.has(req.requestId)) return;
                     if (ws.readyState !== WebSocket.OPEN) return;
                     const data =
                       consumerPublicKey !== undefined
@@ -1606,7 +1987,10 @@ export async function cmdServe(): Promise<void> {
                     respHeaders: {},
                   };
                 } else {
-                  upstream = await callUpstream(cfg, upstreamApiKey, req.body, reqHeaders);
+                  upstream =
+                    imagePrice !== null
+                      ? await callUpstreamImage(cfg, upstreamApiKey, req.body)
+                      : await callUpstream(cfg, upstreamApiKey, req.body, reqHeaders);
                 }
                 const encryptIfNeeded = (data: unknown): unknown =>
                   consumerPublicKey !== undefined
@@ -1624,33 +2008,150 @@ export async function cmdServe(): Promise<void> {
                     body: encryptIfNeeded(upstream.data),
                   };
                 } else {
-                  // Price the actual usage, then cap it to THIS request's gated
-                  // ceiling (issue #421). `ceilingCost` is what the serve gate
-                  // verified against the reservation and what the credit ledger
-                  // reserved as in-flight (`admit`), so capping here keeps
-                  // `settleServed` symmetric with the admission — it never books
-                  // more `served` than was gated. A small `max_tokens` gate never
-                  // bounds a reasoning model's reasoning tokens, so the priced
-                  // actual can exceed the ceiling; awarding the uncapped price would
-                  // over-count the credit ledger and strand a permanent txHash:null
-                  // indexer row (the consumer's cumulative receipt is itself capped
-                  // to locked+redeemed). `ceilingCost <= chk.remaining` (the gate
-                  // required it to admit), so the cap is always collectible on-chain
-                  // too. Mirrors the budget (witnessCap) and x402
-                  // (computeActualAmount) paths, which cap actual settlement to the
-                  // per-request ceiling.
-                  const uncappedAmount = await priceRequest({
-                    cfg,
-                    model: requestedModel,
-                    promptTokens: upstream.usage.prompt_tokens,
-                    completionTokens: upstream.usage.completion_tokens,
-                    cachedPromptTokens: upstream.usage.cached_prompt_tokens,
-                  });
-                  const actualAmount = collectibleServeAmount(uncappedAmount, ceilingCost);
+                  // Cap actual usage to the amount gated and reserved for this request.
+                  // A small max_tokens gate never bounds a reasoning model's tokens, so the
+                  // priced actual can exceed the ceiling; awarding the uncapped price would
+                  // over-count the credit ledger and strand a permanent txHash:null indexer row.
+                  const imageSettlement =
+                    imagePrice !== null
+                      ? priceServedImagesForVault(imagePrice, upstream.data, ceilingCost)
+                      : null;
+                  if (imageSettlement && imageSettlement.servedImageCount === 0) {
+                    creditLedger.releaseInflight(
+                      consumerAddr,
+                      cfg.operator.address,
+                      chk.cycle,
+                      ceilingCost
+                    );
+                    creditAdmitted = null;
+                    console.warn(
+                      `  ⚠ image vault request ${req.requestId} returned no detectable images; released ${fmtUsd(ceilingCost)} reserved credit without settlement`
+                    );
+                    out = {
+                      status: 502,
+                      headers: { ...(upstream.respHeaders ?? {}) },
+                      body: buildNoImageTerminalBody(),
+                    };
+                    if (ws.readyState === WebSocket.OPEN) {
+                      ws.send(
+                        JSON.stringify({
+                          type: "inference-response",
+                          requestId: req.requestId,
+                          status: out.status,
+                          headers: out.headers,
+                          body: out.body,
+                        })
+                      );
+                    }
+                    return;
+                  }
+                  const uncappedAmount =
+                    imageSettlement?.uncappedAmount ??
+                    (await priceRequest({
+                      cfg,
+                      model: requestedModel,
+                      promptTokens: upstream.usage.prompt_tokens,
+                      completionTokens: upstream.usage.completion_tokens,
+                      cachedPromptTokens: upstream.usage.cached_prompt_tokens,
+                    }));
+                  const actualAmount =
+                    imageSettlement?.actualAmount ??
+                    collectibleServeAmount(uncappedAmount, ceilingCost);
+                  const servedTokens = imageSettlement?.tokens ?? upstream.usage.total_tokens;
                   if (uncappedAmount > actualAmount) {
                     console.warn(
-                      `  ⚠ vault-served at a loss on ${req.requestId}: actual cost ${fmtUsd(uncappedAmount)} (${upstream.usage.completion_tokens} completion tok) exceeds this request's reserved ceiling ${fmtUsd(ceilingCost)}; collecting ${fmtUsd(actualAmount)} — the model's output ran past the reserved headroom for "${requestedModel}" (raise the reservation ceiling for this model)`
+                      imageSettlement
+                        ? `  ⚠ vault-served at a loss on ${req.requestId}: actual image cost ${fmtUsd(uncappedAmount)} (${imageSettlement.servedImageCount} image(s)) exceeds this request's reserved ceiling ${fmtUsd(ceilingCost)}; collecting ${fmtUsd(actualAmount)} — the model returned more images than the reservation covered for "${requestedModel}"`
+                        : `  ⚠ vault-served at a loss on ${req.requestId}: actual cost ${fmtUsd(uncappedAmount)} (${upstream.usage.completion_tokens} completion tok) exceeds this request's reserved ceiling ${fmtUsd(ceilingCost)}; collecting ${fmtUsd(actualAmount)} — the model's output ran past the reserved headroom for "${requestedModel}" (raise the reservation ceiling for this model)`
                     );
+                  }
+                  if (imageSettlement) {
+                    let mediaFrames: MediaChunkFrame[];
+                    try {
+                      const prepared = prepareImageDeliveryFrames({
+                        requestId: req.requestId,
+                        responseData: upstream.data,
+                        imageSettlement,
+                        consumerPublicKey,
+                        operatorKeys: encryptionKeys,
+                      });
+                      mediaFrames = prepared.frames;
+                    } catch (err) {
+                      creditLedger.releaseInflight(
+                        consumerAddr,
+                        cfg.operator.address,
+                        chk.cycle,
+                        ceilingCost
+                      );
+                      creditAdmitted = null;
+                      const type =
+                        err instanceof UndeliverableImageResponseError
+                          ? err.type
+                          : err instanceof UnsupportedImageFormatError
+                            ? "unsupported_image_format"
+                            : err instanceof MalformedImageError
+                              ? "malformed_image"
+                              : "image_delivery_failed";
+                      const message = err instanceof Error ? err.message : String(err);
+                      console.warn(
+                        `  ⚠ image vault request ${req.requestId} could not prepare deliverable media (${type}); released ${fmtUsd(ceilingCost)} reserved credit without settlement`
+                      );
+                      out = {
+                        status: type === "image_encryption_required" ? 400 : 502,
+                        headers: {},
+                        body: { error: { message, type } },
+                      };
+                      if (ws.readyState === WebSocket.OPEN) {
+                        ws.send(
+                          JSON.stringify({
+                            type: "inference-response",
+                            requestId: req.requestId,
+                            status: out.status,
+                            headers: out.headers,
+                            body: out.body,
+                          })
+                        );
+                      }
+                      return;
+                    }
+
+                    try {
+                      for (const frame of mediaFrames) {
+                        if (abortedStreams.has(req.requestId)) break;
+                        await sendWsJson(ws, frame);
+                      }
+                    } catch (err) {
+                      creditLedger.releaseInflight(
+                        consumerAddr,
+                        cfg.operator.address,
+                        chk.cycle,
+                        ceilingCost
+                      );
+                      creditAdmitted = null;
+                      logError("image media delivery failed", err);
+                      out = {
+                        status: 502,
+                        headers: {},
+                        body: {
+                          error: {
+                            message: "image media delivery failed before settlement",
+                            type: "image_media_delivery_failed",
+                          },
+                        },
+                      };
+                      if (ws.readyState === WebSocket.OPEN) {
+                        ws.send(
+                          JSON.stringify({
+                            type: "inference-response",
+                            requestId: req.requestId,
+                            status: out.status,
+                            headers: out.headers,
+                            body: out.body,
+                          })
+                        );
+                      }
+                      return;
+                    }
                   }
                   // Confidential path: fetch the TEE response signature with the
                   // operator's key and forward it (key never leaves the operator).
@@ -1664,67 +2165,85 @@ export async function cmdServe(): Promise<void> {
                         requestedModel
                       )
                     : null;
-                  // Tell the consumer what to redeem: this request's cost +
-                  // token usage. The consumer advances its cumulative receipt by
-                  // this and the facilitator submits the redeem (operator paid).
-                  out = {
-                    status: upstream.status,
-                    headers: {
-                      ...(upstream.respHeaders ?? {}),
-                      ...(teeSig ? { "X-Halo-TEE-Signature": teeSig } : {}),
-                      "PAYMENT-RESPONSE": Buffer.from(
-                        JSON.stringify({
-                          success: true,
-                          mode: "vault",
-                          amountUsdc: actualAmount.toString(),
-                          tokens: upstream.usage.total_tokens,
-                          operator: cfg.operator.address,
-                        }),
-                        "utf-8"
-                      ).toString("base64"),
-                    },
-                    body: encryptIfNeeded(upstream.data),
-                  };
-                  // Discount what we just served from the cached reservation
-                  // headroom so the gate cache never approves past coverage.
-                  noteServed(consumerAddr, cfg.operator.address, actualAmount);
-                  // True up the credit window: replace this request's reserved
-                  // ceiling with its ACTUAL served cost (issue #369). The returned
-                  // post-settle cumulative is this serve's on-chain checkpoint —
-                  // emitted on the event so the indexer matches it to the redeem that
-                  // pays it WITHOUT summing amounts (drift-immune; issue #379).
-                  const servedCumulative = creditLedger.settleServed(consumerAddr, cfg.operator.address, chk.cycle, ceilingCost, actualAmount);
-                  creditAdmitted = null;
-                  console.log(
-                    `  ✓ vault-served ${req.requestId} for ${abbrevAddr(consumerAddr)} — ${fmtUsd(actualAmount)} (${upstream.usage.total_tokens} tok); awaiting redeem`
-                  );
-                  // Fire-and-forget indexer event. txHash is null — the redeem
-                  // happens async (consumer-driven); the verifier reconciles.
-                  const durationMs = Date.now() - requestStartedAt;
-                  const eventPayload = {
-                    id: req.requestId,
-                    operator: cfg.operator.address,
-                    consumer: consumerAddr,
-                    model: req.body.model ?? null,
-                    tokens: upstream.usage.total_tokens,
-                    amountUsdc: actualAmount.toString(),
-                    durationMs,
-                    timestamp: Date.now(),
-                    txHash: null,
-                    mode: "vault" as const,
-                    // On-chain cumulative AFTER this serve — lets the indexer attach
-                    // the paying redeem by interval containment, not by summing
-                    // amounts (issue #379). Informational, not signed. `null` on a
-                    // stale-cycle settle (dead reservation) → omitted, so that row
-                    // falls to the pending/tiler path rather than risk a wrong stamp.
-                    cumulativeCheckpoint:
-                      servedCumulative === null ? undefined : servedCumulative.toString(),
-                  };
-                  const sigMessage = canonicalEventMessage(eventPayload);
-                  wallet
-                    .signMessage(sigMessage)
-                    .then((signature) => postEvent(cfg, { ...eventPayload, signature }))
-                    .catch((err) => logError("event post failed", err));
+                  if (
+                    releaseAbortedVaultServe({
+                      abortedRequestIds: abortedStreams,
+                      requestId: req.requestId,
+                      creditLedger,
+                      consumer: consumerAddr,
+                      operator: cfg.operator.address,
+                      cycle: chk.cycle,
+                      ceiling: ceilingCost,
+                    })
+                  ) {
+                    creditAdmitted = null;
+                    console.warn(
+                      `  ⚠ vault stream ${req.requestId} aborted by relay; released ${fmtUsd(ceilingCost)} reserved credit without settlement`
+                    );
+                    out = {
+                      status: 499,
+                      headers: {},
+                      body: { error: { message: "stream aborted before confirmed delivery" } },
+                    };
+                  } else {
+                    // Tell the consumer what to redeem: this request's cost +
+                    // token usage. The consumer advances its cumulative receipt by
+                    // this and the facilitator submits the redeem (operator paid).
+                    out = {
+                      status: upstream.status,
+                      headers: {
+                        ...(upstream.respHeaders ?? {}),
+                        ...(teeSig ? { "X-Halo-TEE-Signature": teeSig } : {}),
+                        "PAYMENT-RESPONSE": Buffer.from(
+                          JSON.stringify({
+                            success: true,
+                            mode: "vault",
+                            amountUsdc: actualAmount.toString(),
+                            tokens: servedTokens,
+                            operator: cfg.operator.address,
+                          }),
+                          "utf-8"
+                        ).toString("base64"),
+                      },
+                      body: imageSettlement
+                        ? buildImageTerminalBody(imageSettlement)
+                        : encryptIfNeeded(upstream.data),
+                    };
+                    // Discount what we just served from the cached reservation
+                    // headroom so the gate cache never approves past coverage.
+                    noteServed(consumerAddr, cfg.operator.address, actualAmount);
+                    // Replace admitted ceiling with actual cost and retain its checkpoint.
+                    const servedCumulative = creditLedger.settleServed(consumerAddr, cfg.operator.address, chk.cycle, ceilingCost, actualAmount);
+                    creditAdmitted = null;
+                    console.log(
+                      imageSettlement
+                        ? `  ✓ vault-served ${req.requestId} for ${abbrevAddr(consumerAddr)} — ${fmtUsd(actualAmount)} (${imageSettlement.servedImageCount} image(s)); awaiting redeem`
+                        : `  ✓ vault-served ${req.requestId} for ${abbrevAddr(consumerAddr)} — ${fmtUsd(actualAmount)} (${upstream.usage.total_tokens} tok); awaiting redeem`
+                    );
+                    // Fire-and-forget indexer event. txHash is null — the redeem
+                    // happens async (consumer-driven); the verifier reconciles.
+                    const durationMs = Date.now() - requestStartedAt;
+                    const eventPayload = {
+                      id: req.requestId,
+                      operator: cfg.operator.address,
+                      consumer: consumerAddr,
+                      model: req.body.model ?? null,
+                      tokens: servedTokens,
+                      amountUsdc: actualAmount.toString(),
+                      durationMs,
+                      timestamp: Date.now(),
+                      txHash: null,
+                      mode: "vault" as const,
+                      // Omit stale-cycle checkpoints rather than risk incorrect attribution.
+                      cumulativeCheckpoint:
+                        servedCumulative === null ? undefined : servedCumulative.toString(),
+                    };
+                    const sigMessage = canonicalEventMessage(eventPayload);
+                    wallet
+                      .signMessage(sigMessage)
+                      .then((signature) => postEvent(cfg, { ...eventPayload, signature }))
+                      .catch((err) => logError("event post failed", err));
+                  }
                 }
                 }
               }
@@ -1743,13 +2262,20 @@ export async function cmdServe(): Promise<void> {
             return;
           }
           if (paymentMode === "budget") {
-            // ── BUDGET MODE PATH ──────────────────────────────────────────
-            // Consumer pre-authorized a Permit2 budget; this inference draws
-            // down per-prompt amount via /settle-budget. No 402 dance, no
-            // per-request signature verification — the facilitator validates
-            // the budget on every settle call.
+            // Budget mode draws through `/settle-budget`; the facilitator validates authorization per settlement.
             const sigHeader = req.headers["payment-signature"];
-            if (!sigHeader) {
+            if (imagePrice !== null) {
+              out = {
+                status: 402,
+                headers: {},
+                body: {
+                  error: {
+                    message: "Image generation is vault-only; send x-halo-payment-mode: vault for image-priced models.",
+                    type: "image_vault_required",
+                  },
+                },
+              };
+            } else if (!sigHeader) {
               out = {
                 status: 400,
                 headers: {},
@@ -1799,10 +2325,7 @@ export async function cmdServe(): Promise<void> {
                 return;
               }
 
-              // Budget mode is operator-unbound — the facilitator selects
-              // which operator can settle (via the relay's routing). The
-              // operator processes whatever budget-mode request the relay
-              // forwards and tags itself as the recipient at settle time.
+              // Budget authorization is operator-unbound; the routed operator identifies itself as recipient at settlement.
 
               // Activate (or re-confirm) the budget by submitting the permit
               // onchain. Idempotent — repeated calls for the same
@@ -1840,14 +2363,7 @@ export async function cmdServe(): Promise<void> {
                 return;
               }
 
-              // Operator self-protection: never serve at a GUARANTEED loss. The
-              // consumer's signed per-settlement cap is the most we can collect
-              // for this step. If the INPUT cost alone (exact prompt tokens,
-              // margin included) already meets/exceeds that cap, any completion
-              // makes us lose money — so reject up front with an actionable
-              // error instead of serving and silently capping to a loss. (A big
-              // COMPLETION can still push actual over the cap after the fact;
-              // that case is logged as a loss at settle time below.)
+              // Reject when input cost already exhausts the collectible cap; completion can only increase the loss.
               const witnessCap = BigInt(budgetPayload.policy.maxPerSettlement);
               const fmtUsd = (b: bigint) => formatUsdcBase(b, { withDollarSign: true });
               const inputFloor = await priceRequest({
@@ -1888,12 +2404,7 @@ export async function cmdServe(): Promise<void> {
                 return;
               }
 
-              // Streaming (Phase 2.2): pump deltas to the consumer as they arrive
-              // when the operator enabled it (HALO_ENABLE_STREAMING) AND the
-              // consumer asked (stream:true) AND the provider uses the OpenAI
-              // wire. Each delta is sealed per-chunk by reusing encryptResponse.
-              // Bounded funds-safety tradeoff — content is delivered BEFORE
-              // settle — so it's operator-opt-in until escrow locks funds.
+              // Streaming is opt-in because content is delivered before settlement.
               const wantsStream =
                 !!req.body &&
                 typeof req.body === "object" &&
@@ -1906,6 +2417,7 @@ export async function cmdServe(): Promise<void> {
               let streamed = false;
               if (useStreaming) {
                 const sres = await streamUpstream(cfg, upstreamApiKey, req.body, (deltaObj) => {
+                  if (abortedStreams.has(req.requestId)) return;
                   if (ws.readyState !== WebSocket.OPEN) return;
                   const data =
                     consumerPublicKey !== undefined
@@ -1957,12 +2469,7 @@ export async function cmdServe(): Promise<void> {
                   body: encryptIfNeeded(upstream.data),
                 };
               } else {
-                // Price the actual usage, then cap at the witness per-settlement
-                // limit (defense-in-depth; the facilitator also enforces it).
-                // We compute the UNCAPPED price first so a completion that pushes
-                // cost over the cap is surfaced as a loss — the pre-serve floor
-                // only catches input-only overruns, so this is the post-hoc
-                // signal that the consumer's per-prompt cap is too low.
+                // Compute uncapped actual cost for loss visibility, then enforce the witness cap.
                 const uncappedAmount = await priceRequest({
                   cfg,
                   model: requestedModel,
@@ -1978,89 +2485,96 @@ export async function cmdServe(): Promise<void> {
                   );
                 }
 
-                // WS-closed guard right before money moves.
-                if (wsClosed || ws.readyState !== WebSocket.OPEN) {
+                if (abortedStreams.has(req.requestId)) {
                   console.warn(
-                    `  ⚠ WS closed mid-budget-request after upstream succeeded; skipping settlement`
+                    `  ⚠ budget stream ${req.requestId} aborted by relay; skipping settlement`
                   );
-                  return;
-                }
-
-                const settle = await facilitator.settleBudget({
-                  budgetId: submit.budgetId,
-                  operator: cfg.operator.address,
-                  amount: actualAmount.toString(),
-                  voucher: parseVoucherHeader(req.headers["x-halo-voucher"]),
-                  metadata: {
-                    inferenceId: req.requestId,
-                    model: typeof req.body.model === "string" ? req.body.model : undefined,
-                    tokens: upstream.usage.total_tokens,
-                  },
-                });
-
-                if (wsClosed || ws.readyState !== WebSocket.OPEN) {
-                  console.error(
-                    `  ⚠⚠ WS closed during /settle-budget; settlement tx ${settle.transaction || "?"} may have completed onchain but response cannot reach the consumer`
-                  );
-                  return;
-                }
-
-                if (!settle.success) {
-                  logError("budget settlement failed", settle.errorReason);
                   out = {
-                    status: 502,
+                    status: 499,
                     headers: {},
-                    body: {
-                      error: {
-                        message: `settlement failed: ${settle.errorReason || "unknown"}`,
-                      },
-                    },
+                    body: { error: { message: "stream aborted before confirmed delivery" } },
                   };
                 } else {
-                  out = {
-                    status: upstream.status,
-                    headers: {
-                      "PAYMENT-RESPONSE": Buffer.from(
-                        JSON.stringify({
-                          success: true,
-                          transaction: settle.transaction,
-                          spent: settle.spent,
-                          remaining: settle.remaining,
-                        }),
-                        "utf-8"
-                      ).toString("base64"),
-                    },
-                    // When streamed, the deltas already carried the content;
-                    // the terminal response only carries settlement (the relay
-                    // emits it as a final SSE event and ignores this body).
-                    body: streamed ? null : encryptIfNeeded(upstream.data),
-                  };
+                  // WS-closed guard right before money moves.
+                  if (wsClosed || ws.readyState !== WebSocket.OPEN) {
+                    console.warn(
+                      `  ⚠ WS closed mid-budget-request after upstream succeeded; skipping settlement`
+                    );
+                    return;
+                  }
 
-                  // Fire-and-forget indexer event for league attribution.
-                  const durationMs = Date.now() - requestStartedAt;
-                  const eventPayload = {
-                    id: req.requestId,
+                  const settle = await facilitator.settleBudget({
+                    budgetId: submit.budgetId,
                     operator: cfg.operator.address,
-                    // The facilitator recovers the real consumer (budget owner)
-                    // from the permit signature and returns it on permitSubmit.
-                    // Fall back to the operator only if an older facilitator
-                    // didn't supply it (keeps league attribution correct).
-                    consumer: submit.consumer ?? cfg.operator.address,
-                    model: req.body.model ?? null,
-                    tokens: upstream.usage.total_tokens,
-                    amountUsdc: actualAmount.toString(),
-                    durationMs,
-                    timestamp: Date.now(),
-                    txHash: settle.transaction || null,
-                    mode: "budget" as const,
-                  };
-                  const sigMessage = canonicalEventMessage(eventPayload);
-                  wallet
-                    .signMessage(sigMessage)
-                    .then((signature) =>
-                      postEvent(cfg, { ...eventPayload, signature })
-                    )
-                    .catch((err) => logError("event post failed", err));
+                    amount: actualAmount.toString(),
+                    voucher: parseVoucherHeader(req.headers["x-halo-voucher"]),
+                    metadata: {
+                      inferenceId: req.requestId,
+                      model: typeof req.body.model === "string" ? req.body.model : undefined,
+                      tokens: upstream.usage.total_tokens,
+                    },
+                  });
+
+                  if (wsClosed || ws.readyState !== WebSocket.OPEN) {
+                    console.error(
+                      `  ⚠⚠ WS closed during /settle-budget; settlement tx ${settle.transaction || "?"} may have completed onchain but response cannot reach the consumer`
+                    );
+                    return;
+                  }
+
+                  if (!settle.success) {
+                    logError("budget settlement failed", settle.errorReason);
+                    out = {
+                      status: 502,
+                      headers: {},
+                      body: {
+                        error: {
+                          message: `settlement failed: ${settle.errorReason || "unknown"}`,
+                        },
+                      },
+                    };
+                  } else {
+                    out = {
+                      status: upstream.status,
+                      headers: {
+                        "PAYMENT-RESPONSE": Buffer.from(
+                          JSON.stringify({
+                            success: true,
+                            transaction: settle.transaction,
+                            spent: settle.spent,
+                            remaining: settle.remaining,
+                          }),
+                          "utf-8"
+                        ).toString("base64"),
+                      },
+                      // When streamed, the deltas already carried the content;
+                      // the terminal response only carries settlement (the relay
+                      // emits it as a final SSE event and ignores this body).
+                      body: streamed ? null : encryptIfNeeded(upstream.data),
+                    };
+
+                    const durationMs = Date.now() - requestStartedAt;
+                    const eventPayload = {
+                      id: req.requestId,
+                      operator: cfg.operator.address,
+                      // Attribute to the facilitator-recovered budget owner; retain compatibility fallback if absent.
+                      consumer: submit.consumer ?? cfg.operator.address,
+                      model: req.body.model ?? null,
+                      tokens: upstream.usage.total_tokens,
+                      amountUsdc: actualAmount.toString(),
+                      durationMs,
+                      timestamp: Date.now(),
+                      txHash: settle.transaction || null,
+                      mode: "budget" as const,
+                    };
+                    const sigMessage = canonicalEventMessage(eventPayload);
+                    wallet
+                      .signMessage(sigMessage)
+                      .then((signature) =>
+                        postEvent(cfg, { ...eventPayload, signature })
+                      )
+                      .catch((err) => logError("event post failed", err));
+                  }
                 }
               }
             }
@@ -2080,237 +2594,21 @@ export async function cmdServe(): Promise<void> {
             return;
           }
 
-          // ── PER-REQUEST MODE PATH (unchanged) ───────────────────────────
-          // Phase 1: verify payment (no money movement).
-          // The 402 quote is intentionally PROMPT-BLIND. The consumer's first
-          // (challenge) request sends only { model, max_tokens } — the prompt
-          // never crosses the wire in plaintext (E2E privacy), so the operator
-          // cannot see prompt tokens at quote time. We therefore quote on the
-          // completion ceiling alone and MUST re-verify on the same basis,
-          // otherwise the retry (which carries the decrypted prompt) re-prices
-          // higher than the consumer signed and the payment is wrongly rejected
-          // (signed < required). In `exact` mode the operator collects exactly
-          // the signed amount regardless, so prompt-blind quoting costs nothing
-          // here; token-accurate per-prompt billing is what budget mode (Permit2
-          // sign-a-cap / settle-actual) is for. See docs/BUDGET_MODE.md.
-          const verified = await x402Verify({
-            cfg,
-            facilitator,
-            paymentSignatureHeader: req.headers["payment-signature"],
-            requestPath: req.path,
-            pricing: {
-              cfg,
-              model: requestedModel,
-              promptTokens: 0,
-              completionTokens: estimatedCompletionTokens,
+          out = {
+            status: 400,
+            headers: {},
+            body: {
+              error: {
+                message:
+                  paymentMode === ""
+                    ? "x-halo-payment-mode is required"
+                    : `unsupported payment mode: ${paymentMode}`,
+                type: "unsupported_payment_mode",
+              },
             },
-            facilitatorAddress,
-          });
-
-          if (verified.kind === "challenge") {
-            out = {
-              status: 402,
-              headers: {
-                "PAYMENT-REQUIRED": encodePaymentRequiredHeader(verified.paymentRequired),
-              },
-              body: {
-                error: "payment required",
-                amount: verified.paymentRequired.maxAmountRequired,
-                asset: verified.paymentRequired.asset,
-                network: verified.paymentRequired.network,
-              },
-            };
-          } else if (verified.kind === "rejected") {
-            out = {
-              status: 402,
-              headers: {
-                "PAYMENT-REQUIRED": encodePaymentRequiredHeader(verified.paymentRequired),
-              },
-              body: { error: "payment rejected", reason: verified.reason },
-            };
-          } else {
-            // Phase 2: run inference, then settle with actual token usage.
-            // Last-ditch check before spending real operator money on the
-            // upstream call. x402Verify above involves HTTP to the facilitator
-            // and can take a moment; the WS may have closed during it.
-            if (wsClosed || ws.readyState !== WebSocket.OPEN) {
-              console.warn(
-                `  ⚠ WS closed after verify but before upstream call; aborting (no upstream charge to operator, no settlement to consumer)`
-              );
-              return;
-            }
-            const upstream = await callUpstream(cfg, upstreamApiKey, req.body, reqHeaders);
-
-            // Encrypt the response body if the consumer used E2E. Shared
-            // between success and failure paths — failure responses (errors
-            // from the upstream) are also encrypted when E2E was requested.
-            const encryptIfNeeded = (data: unknown): unknown =>
-              consumerPublicKey !== undefined
-                ? {
-                    _enc: encryptResponse(
-                      data,
-                      consumerPublicKey,
-                      encryptionKeys.privateKey
-                    ),
-                  }
-                : data;
-
-            const inferenceSucceeded =
-              upstream.status >= 200 && upstream.status < 300;
-
-            if (!inferenceSucceeded) {
-              // Upstream failed (rate limit, auth error, model unavailable,
-              // provider outage, malformed response, …). Do NOT settle —
-              // the consumer should not pay for an inference that didn't run.
-              //
-              // The signed Permit2 / EIP-3009 authorization expires harmlessly
-              // at `validBefore`; no money moves; no gas burned. The consumer
-              // is free to retry with the same wallet (against this operator
-              // once it recovers, or against a different one).
-              //
-              // The whole point of the x402 `upto` scheme is to defer the
-              // settlement decision until after inference; this is the
-              // failure-branch use of that capability. Indexer event-post is
-              // also skipped — league points only accrue on settled work.
-              console.warn(
-                `  ⚠ upstream ${upstream.status}; skipping settlement (consumer not charged)`
-              );
-              out = {
-                status: upstream.status,
-                // No PAYMENT-RESPONSE header — nothing was settled. The
-                // consumer's frontend sees the absence and knows the
-                // signature is still spendable until validBefore.
-                headers: {},
-                body: encryptIfNeeded(upstream.data),
-              };
-            } else {
-              // Inference succeeded. Charge only for tokens actually consumed
-              // (upto invariant: actual ≤ signed max).
-              //
-              // CRITICAL: before settling, confirm our WebSocket to the relay
-              // is still open. If it dropped during the async upstream call
-              // (relay superseded us, network blip, etc.), the consumer can
-              // never receive the response — charging them would be theft.
-              // The relay has already returned 504 "operator dropped" to the
-              // consumer by the time we get here in that case. Skip settlement,
-              // skip the indexer event, and exit the handler cleanly.
-              if (wsClosed || ws.readyState !== WebSocket.OPEN) {
-                console.warn(
-                  `  ⚠ WS closed mid-request after upstream succeeded; skipping settlement (consumer not charged for an undeliverable response)`
-                );
-                return;
-              }
-
-              const actualAmount = await computeActualAmount(
-                {
-                  cfg,
-                  model: requestedModel,
-                  promptTokens: upstream.usage.prompt_tokens,
-                  completionTokens: upstream.usage.completion_tokens,
-                  cachedPromptTokens: upstream.usage.cached_prompt_tokens,
-                },
-                verified.signedAmount
-              );
-
-              // Settle after inference — money only moves if we got here.
-              const settlement = await x402Settle({
-                facilitator,
-                payload: verified.payload,
-                paymentRequired: verified.paymentRequired,
-                actualAmount,
-              });
-
-              // Belt-and-suspenders: x402Settle is an HTTP call to the
-              // facilitator and can take seconds. If the WS dropped during it,
-              // the settlement itself completed onchain (irreversible) but at
-              // least log the inconsistency so we can investigate. There's
-              // no in-protocol way to undo an already-completed settlement.
-              if (wsClosed || ws.readyState !== WebSocket.OPEN) {
-                console.error(
-                  `  ⚠⚠ WS closed during x402Settle call; settlement tx ${settlement.transaction || "?"} ` +
-                    `may have completed onchain but the response can no longer reach the consumer`
-                );
-                // Don't try to send response back; don't post event either.
-                return;
-              }
-
-              if (!settlement.success) {
-                // Settlement failed (e.g. authorization expired during a slow
-                // inference, or an onchain revert). Do NOT post an indexer event
-                // — there is no onchain transfer to verify, so it would be an
-                // orphan tx-less row that can never earn league points and just
-                // clutters the dashboard. The consumer still receives the
-                // inference (we already paid upstream and can't un-charge that),
-                // but with no PAYMENT-RESPONSE so it's recorded as unsettled.
-                logError("settlement failed after inference", settlement.errorReason);
-                out = {
-                  status: upstream.status,
-                  headers: {},
-                  body: encryptIfNeeded(upstream.data),
-                };
-              } else {
-                // What the consumer was ACTUALLY charged on-chain. EIP-3009
-                // (exact) can only settle the full signed `value`, so the charge
-                // is the signed ceiling regardless of token count — reporting the
-                // discounted actualAmount here would under-state the consumer's
-                // real spend AND give the indexer an amount that doesn't match the
-                // on-chain transfer. Only the upto/Permit2 scheme settles the
-                // discounted actual, so the discount applies there.
-                const chargedAmount =
-                  verified.paymentRequired.scheme === "exact"
-                    ? verified.signedAmount
-                    : actualAmount;
-                // Confidential path: forward the TEE response signature (operator
-                // fetches it with its key, which never leaves the operator).
-                // Resolve the model's own provider (multi-provider operators).
-                const teeProvX = resolveProvider(cfg, req.body);
-                const teeSig = teeRequest
-                  ? await fetchTeeSignature(
-                      teeProvX.provider.baseUrl,
-                      teeProvX.apiKey,
-                      (upstream.data as { id?: string })?.id ?? "",
-                      (req.body as { model?: string })?.model ?? ""
-                    )
-                  : null;
-                out = {
-                  status: upstream.status,
-                  headers: {
-                    ...upstream.respHeaders,
-                    ...(teeSig ? { "X-Halo-TEE-Signature": teeSig } : {}),
-                    "PAYMENT-RESPONSE": encodePaymentResponseHeader({
-                      ...settlement,
-                      amount: settlement.amount ?? chargedAmount.toString(),
-                    }),
-                  },
-                  body: encryptIfNeeded(upstream.data),
-                };
-
-                // Fire-and-forget signed event for indexer attribution — only on
-                // successful settlement (there is a real onchain transfer to verify).
-                const durationMs = Date.now() - requestStartedAt;
-                const eventPayload = {
-                  id: req.requestId,
-                  operator: cfg.operator.address,
-                  consumer: verified.consumer,
-                  model: req.body.model ?? null,
-                  tokens: upstream.usage.total_tokens,
-                  amountUsdc: chargedAmount.toString(),
-                  durationMs,
-                  timestamp: Date.now(),
-                  txHash: settlement.transaction || null,
-                  mode: "exact" as const,
-                };
-                const sigMessage = canonicalEventMessage(eventPayload);
-                wallet
-                  .signMessage(sigMessage)
-                  .then((signature) => postEvent(cfg, { ...eventPayload, signature }))
-                  .catch((err) => logError("event post failed", err));
-              }
-            }
-          }
+          };
         } catch (err) {
-          // A thrown serve must not strand the credit window — return the
-          // admitted request's reserved ceiling (issue #369).
+          // A thrown serve must release its admitted credit ceiling.
           if (creditAdmitted) {
             creditLedger.releaseInflight(
               creditAdmitted.consumer,
@@ -2342,6 +2640,7 @@ export async function cmdServe(): Promise<void> {
             })
           );
         }
+        });
       });
 
       // Protocol-level pings from the relay are auto-ponged by the ws
@@ -2354,9 +2653,6 @@ export async function cmdServe(): Promise<void> {
       ws.on("close", (code, reason) => {
         wsClosed = true;
         stopKeepalive();
-        // Drop the breaker re-announce hook for this (now-dead) socket; the next
-        // connection re-registers it, and its fresh announce reflects the
-        // current breaker state (issue #459).
         setBreakerChangeHandler(null);
         console.log(`  ✖ disconnected (code=${code}, reason=${reason.toString() || "-"})`);
         resolve({ announced });
@@ -2364,10 +2660,7 @@ export async function cmdServe(): Promise<void> {
       ws.on("error", (err) => console.error("  ws error:", err.message));
     });
 
-  // Supervisor: run, then retry on close with exponential backoff. By
-  // default this loop never exits on its own — only SIGINT/SIGTERM stops it.
-  // Set HALO_MAX_RECONNECT_ATTEMPTS to a positive integer to opt back into
-  // the old "exit after N failures" behavior (useful for CI smoke tests).
+  // Retry closes with exponential backoff; an explicit positive cap enables bounded CI behavior.
   const maxAttempts = resolveMaxReconnectAttempts();
   const capDisplay = maxAttempts === 0 ? "∞" : String(maxAttempts);
   while (!shuttingDown) {
@@ -2400,40 +2693,26 @@ export async function cmdServe(): Promise<void> {
   }
 }
 
-// Display-only ceiling (USD per 1K tokens) for the ADVERTISED price of a
-// margin-mode model the upstream doesn't price (no catalog entry). $0.001/1K =
-// $1/1M — roughly the honest effective rate of the $0.01 per-request fallback on
-// a realistic ~10k-token confidential request, and far saner than the ~$10/1M
-// the raw per-request fallback would otherwise show.
+// Display-only ceiling for margin-mode models without upstream catalog pricing.
 const MARGIN_UNPRICED_ANNOUNCE_CAP_PER_1K = 0.001;
 
-async function buildPricingAnnounce(
+export async function buildPricingAnnounce(
   cfg: HaloConfig
 ): Promise<Record<string, number>> {
   const out: Record<string, number> = {};
-  // Announce per-model prices in USDC per 1K tokens (float).
-  //   flat   — the explicit configured rate (model-agnostic).
-  //   margin — the REAL upstream per-model rate × (1 + margin), so expensive
-  //            models (e.g. Opus) advertise high and cheap models advertise
-  //            low. This is what lets the relay/frontend show price and gate
-  //            model choice against a per-prompt cap. Falls back to the
-  //            fallback-per-request proxy only when the upstream rate is
-  //            unknown (unsupported provider/model, network error) or the
-  //            provider is free (Ollama → operator should be on flat mode).
-  // Re-evaluated on every (re)announce; the upstream rate is cached ~5 min, so
-  // a long-lived connection can carry a slightly stale price until it
-  // reconnects — acceptable, as upstream prices change rarely.
+  // Announce flat rates directly and derive margin rates from available upstream prices.
   const fallbackPer1K = cfg.pricing.fallbackPerRequestUsdc / 1_000_000; // USDC units
 
   // Multi-provider: price each provider's models with that provider's own
   // pricing block when present (margins differ by gateway), falling back to the
   // operator-wide cfg.pricing.
   for (const provider of configProviders(cfg)) {
-    const pricing = provider.pricing ?? cfg.pricing;
-    const flat = pricing.flatUsdcPer1KTokens;
-    const marginPct = typeof pricing.marginPercent === "number" ? pricing.marginPercent : 25;
-    const proxy = flat !== undefined ? flat : fallbackPer1K;
     for (const m of provider.models) {
+      if (providerServesConfiguredImageModel(provider, m)) continue;
+      const pricing = provider.pricing ?? cfg.pricing;
+      const flat = pricing.flatUsdcPer1KTokens;
+      const marginPct = typeof pricing.marginPercent === "number" ? pricing.marginPercent : 25;
+      const proxy = flat !== undefined ? flat : fallbackPer1K;
       if (pricing.mode === "flat" && flat !== undefined) {
         out[m] = flat;
         continue;
@@ -2453,14 +2732,7 @@ async function buildPricingAnnounce(
           out[m] = upstreamPer1K * (1 + marginPct / 100);
           continue;
         }
-        // upstreamPer1K === 0 (free provider) or null (unknown — the model isn't
-        // in the upstream's price catalog, e.g. a NEAR model with no /v1/models
-        // pricing entry). The old behavior advertised `fallbackPer1K`, but that's
-        // the per-REQUEST fallback ($0.01) read as a per-1K rate → an absurd
-        // ~$10/1M. When the operator set no explicit flat, clamp the ADVERTISED
-        // per-1K to a sane ceiling so the catalog doesn't show a wild number.
-        // (Settlement is unaffected — priceRequest still charges the real
-        // per-request fallback; this only fixes the displayed/announced rate.)
+        // Cap only the announced rate; request-time resolution may recover or use its fixed fallback.
         out[m] =
           flat !== undefined
             ? proxy
@@ -2473,12 +2745,18 @@ async function buildPricingAnnounce(
   return out;
 }
 
-/**
- * Per-model context window (tokens) to announce, so the relay's /v1/models can
- * expose it and agents can size context / decide when to compress. Sourced from
- * the provider's `/models` `context_length` (same cached fetch as pricing).
- * Models the provider doesn't report a window for are simply omitted.
- */
+export function buildImagePricingAnnounce(cfg: HaloConfig): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const provider of configProviders(cfg)) {
+    for (const m of provider.imageModels ?? []) {
+      const price = imagePriceForModel(cfg, m);
+      if (price !== null) out[m] = price;
+    }
+  }
+  return out;
+}
+
+/** Resolve announced context windows from cached provider catalogs, omitting unknown models. */
 async function buildContextLengthAnnounce(cfg: HaloConfig): Promise<Record<string, number>> {
   const out: Record<string, number> = {};
   for (const provider of configProviders(cfg)) {
@@ -2508,26 +2786,14 @@ interface EventPayload {
   durationMs: number;
   timestamp: number;
   txHash: string | null;
-  /** Payment rail this event was served over. Drives indexer league awarding:
-   *  vault rows are credited on-redeem by the vault settlement watcher, budget/
-   *  exact rows by the settlement verifier. Informational — not signed. */
-  mode: "vault" | "budget" | "exact";
-  /** Vault only: operator's on-chain cumulative (USDC base) AFTER this serve, so
-   *  the indexer attaches the paying redeem by interval containment rather than by
-   *  summing serve amounts (issue #379). Informational — not signed. Absent on the
-   *  budget/exact paths. */
+  /** Payment rail this event was served over. Informational — not signed. */
+  mode: "vault" | "budget";
+  /** Unsigned vault checkpoint used for interval-based redeem attribution. */
   cumulativeCheckpoint?: string;
 }
 
-/**
- * Canonical message signed by the operator so the indexer can verify each
- * event was emitted by the operator it attributes points to. Shape is locked:
- *   halo-event:{id}:{operator}:{consumer}:{amountUsdc}:{tokens}:{timestamp}
- *
- * txHash is carried in the event body for indexer settlement verification
- * but is not included in the signature (CDP can fail to return a tx hash;
- * adding it to the signature would reject legitimate events).
- */
+/** Indexer signature contract: `halo-event:{id}:{operator}:{consumer}:{amountUsdc}:{tokens}:{timestamp}`.
+ * `txHash` remains body-only because it may be unavailable. */
 export function canonicalEventMessage(ev: Omit<EventPayload, "txHash" | "mode" | "cumulativeCheckpoint">): string {
   return `halo-event:${ev.id}:${ev.operator.toLowerCase()}:${ev.consumer.toLowerCase()}:${ev.amountUsdc}:${ev.tokens}:${ev.timestamp}`;
 }
@@ -2537,7 +2803,6 @@ function abbrevAddr(addr: string | null | undefined): string {
   return `${addr.slice(0, 6)}…${addr.slice(-4)}`;
 }
 
-// ── File logging + PID file ─────────────────────────────────────────────────
 
 /** Cap a single log file at 5 MB before rotation. ~2× total disk = 10 MB. */
 const LOG_ROTATE_BYTES = 5 * 1024 * 1024;
@@ -2551,17 +2816,7 @@ function pidFilePath(): string {
   return path.join(configDir(), "serve.pid");
 }
 
-/**
- * Write a debug line straight to the live terminal, bypassing the serve.log
- * file tee installed by setupFileLogging. Used for raw upstream error bodies:
- * a misbehaving upstream can echo the consumer's prompt back inside a 4xx/5xx
- * body, and that plaintext must never persist to disk — it would defeat the
- * "prompts vanish once processed" property. An operator actively debugging
- * still sees the full body live (ephemeral terminal scrollback); nothing is
- * written to ~/.halo/serve.log. We go through process.stderr.write
- * directly because setupFileLogging patches console.error to also append to
- * the file, so console.* is no longer a disk-free channel.
- */
+/** Write sensitive upstream diagnostics to the terminal only, bypassing the persistent console tee. */
 function debugToTerminal(msg: string): void {
   try {
     process.stderr.write(`${msg}\n`);
@@ -2570,21 +2825,10 @@ function debugToTerminal(msg: string): void {
   }
 }
 
-/**
- * Tee console.log / console.error to a persistent log file. The file
- * survives terminal close, sleep/wake, and process crashes — which makes
- * diagnosing "the WS silently dropped" possible after the fact instead of
- * needing live scrollback. Append-only with size-based rotation; opaque
- * binary log files were not an option because operators (and the agents
- * driving them) need to grep these.
- */
+/** Tee console output to a size-rotated persistent log for post-exit diagnosis. */
 function setupFileLogging(): void {
   mkdirSync(configDir(), { recursive: true });
-  // Rotate if the existing log is too big. We rotate ONCE at startup so the
-  // running serve writes to a known-fresh file; subsequent rotation during
-  // the lifetime of the process is rare enough not to warrant the extra
-  // complexity (an operator generating > 5 MB of logs in a single session
-  // already has something else to look at).
+  // Rotate once at startup so the active process writes a fresh bounded log.
   try {
     const existing = serveLogPath();
     if (existsSync(existing) && statSync(existing).size > LOG_ROTATE_BYTES) {
@@ -2635,11 +2879,7 @@ function setupFileLogging(): void {
   );
 }
 
-/**
- * Write a PID file so `halo doctor` can answer "is serve running?"
- * deterministically. Cleared on graceful exit (SIGINT/SIGTERM); a stale PID
- * file after a crash is detected by doctor via process.kill(pid, 0).
- */
+/** Maintain the serve PID file; doctor validates stale entries with `process.kill(pid, 0)`. */
 function writePidFile(): void {
   mkdirSync(configDir(), { recursive: true });
   writeFileSync(pidFilePath(), `${process.pid}\n`, { mode: 0o600 });

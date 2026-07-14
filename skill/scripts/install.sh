@@ -30,9 +30,7 @@ if command -v halo &>/dev/null; then
       fi
       ;;
   esac
-  # The pre-auto-update installer linked from $TMPDIR/halo-install. Recognize
-  # that exact legacy shape (including a now-dangling npm link) and migrate it;
-  # arbitrary npm-linked development checkouts remain strictly off-limits.
+  # Migrate only the known temporary-installer layout; leave other linked checkouts untouched.
   GLOBAL_LINK="$(npm root -g 2>/dev/null)/halo-cli"
   GLOBAL_TARGET=$(readlink "$GLOBAL_LINK" 2>/dev/null || true)
   RESOLVED="${HALO_REAL:-$GLOBAL_TARGET}"
@@ -41,9 +39,7 @@ if command -v halo &>/dev/null; then
       echo "  migrating legacy temporary halo install to $SRC..."
       ;;
     "")
-      # Neither realpath nor the npm global-link probe could resolve a target
-      # (dangling symlink, restricted/sandboxed filesystem). Say so plainly
-      # rather than printing an "unmanaged checkout" line with a blank target.
+      # Neither realpath nor the global-link probe resolved a target.
       echo "halo is already on your PATH at $HALO_BIN, but its install location could not be resolved" >&2
       echo "  (dangling symlink, restricted filesystem, or sandboxed runner)." >&2
       echo "leaving it untouched; remove that halo from your PATH before installing a managed copy." >&2
@@ -61,14 +57,8 @@ fi
 if [[ -f "$SENTINEL" ]]; then
   EXISTING_ORIGIN=$(git -C "$SRC" config --get remote.origin.url 2>/dev/null || true)
   if [[ "$EXISTING_ORIGIN" == "$REMOTE" ]]; then
-    # Managed checkout present (sentinel + matching origin). If the build
-    # artifact or its dependencies are missing (interrupted build, manual
-    # `rm -rf .../dist` or `.../node_modules`, disk cleanup) rebuild in place
-    # rather than dead-ending below — the install one-liner is documented as
-    # safe to re-run.
-    # Check each package's actual resolved entry file, not just its dist/ dir:
-    # vault-core builds esm then cjs in sequence and resolves via dist/cjs, so an
-    # interrupted cjs stage leaves dist/ present but the entry missing.
+    # Recover incomplete managed builds. Check resolved entry files because a
+    # partially built vault-core can have dist/ without its CJS entry point.
     if [[ ! -f "$SRC/cli/dist/index.js" || ! -d "$SRC/cli/node_modules" \
        || ! -f "$SRC/sdk/dist/index.js" || ! -f "$SRC/vault-core/dist/cjs/index.js" ]]; then
       echo "  managed halo checkout at $SRC is missing its build; rebuilding in place..."

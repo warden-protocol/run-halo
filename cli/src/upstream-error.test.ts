@@ -103,7 +103,6 @@ test("does not treat an ordinary 400 bad request as credit exhaustion", () => {
     }),
     null
   );
-  // A prompt that merely mentions the word "credit" must not trip the narrow 400 rule.
   assert.equal(
     classifyUpstreamProviderError(400, {
       error: { message: "The model does not support the 'credit' parameter" },

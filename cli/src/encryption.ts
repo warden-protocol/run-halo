@@ -1,46 +1,14 @@
-/**
- * Operator-side end-to-end prompt encryption.
- *
- * Scheme: X25519 ECDH → HKDF-SHA256 → AES-256-GCM.
- *
- * Key lifecycle:
- *   - Operator generates a fresh X25519 keypair on every `halo serve`
- *     startup. The private key lives in process memory only — never persisted
- *     to disk. The public key rides in the WS `announce` payload.
- *   - When the operator process restarts, the key is gone forever. Ciphertext
- *     captured from past sessions becomes provably uncrackable, even by the
- *     operator themselves. That's the forward-secrecy property fresh-per-
- *     session buys us.
- *
- * Why X25519 instead of reusing the operator's secp256k1 wallet key:
- *   - Forward secrecy at the session boundary (above).
- *   - Separation of concerns: payment-signing and content-decryption never
- *     share a key, eliminating an entire class of confused-deputy bugs.
- *   - TEE-attestation forward compatibility: a future enclave generates its
- *     keypair at attestation time, which can't be done with the wallet key.
- *
- * Wire format (the JSON value of `_enc` in the request body or top-level
- * response body):
- *
- *   {
- *     v: 1,
- *     alg: "x25519-aes256gcm",
- *     epk:   "<32 byte hex>",   // consumer's ephemeral X25519 pubkey
- *     nonce: "<12 byte hex>",   // AES-GCM IV, fresh per direction
- *     ct:    "<hex>"            // ciphertext || 16-byte GCM auth tag
- *   }
- *
- * The plaintext under `ct` is JSON.stringify(body) of the request (sans
- * `model`, which the relay needs in cleartext for routing) or the response.
- */
 import { createCipheriv, createDecipheriv, randomBytes } from "crypto";
 import { x25519 } from "@noble/curves/ed25519";
 import { hkdf } from "@noble/hashes/hkdf";
 import { sha256 } from "@noble/hashes/sha256";
+import { verifyMessage } from "ethers";
 
 export const ENCRYPTION_ALG = "x25519-aes256gcm";
 export const ENCRYPTION_VERSION = 1;
+export const ENCRYPTION_BYTES_VERSION = 2;
 const HKDF_INFO = new TextEncoder().encode("halo/v1/x25519-aes256gcm");
+const V2_AAD = new TextEncoder().encode(`${ENCRYPTION_BYTES_VERSION}:${ENCRYPTION_ALG}`);
 
 export interface OperatorKeyPair {
   /** 32-byte X25519 public key, hex-encoded (no 0x prefix). */
@@ -49,7 +17,7 @@ export interface OperatorKeyPair {
   privateKey: Uint8Array;
 }
 
-export interface EncryptedEnvelope {
+export interface TextEncryptedEnvelope {
   v: 1;
   alg: typeof ENCRYPTION_ALG;
   epk: string;
@@ -57,12 +25,22 @@ export interface EncryptedEnvelope {
   ct: string;
 }
 
-/** True if `value` looks like a v1 EncryptedEnvelope. */
+export interface BytesEncryptedEnvelope {
+  v: 2;
+  alg: typeof ENCRYPTION_ALG;
+  epk: string;
+  nonce: string;
+  ct: string;
+}
+
+export type EncryptedEnvelope = TextEncryptedEnvelope | BytesEncryptedEnvelope;
+
+/** True if `value` looks like a known encrypted envelope. */
 export function isEncryptedEnvelope(value: unknown): value is EncryptedEnvelope {
   if (!value || typeof value !== "object") return false;
   const v = value as Record<string, unknown>;
   return (
-    v.v === ENCRYPTION_VERSION &&
+    (v.v === ENCRYPTION_VERSION || v.v === ENCRYPTION_BYTES_VERSION) &&
     v.alg === ENCRYPTION_ALG &&
     typeof v.epk === "string" &&
     typeof v.nonce === "string" &&
@@ -80,14 +58,27 @@ export function generateOperatorKeypair(): OperatorKeyPair {
   };
 }
 
-/**
- * Derive the AES-256-GCM session key from an X25519 ECDH between our private
- * key and the peer's public key. Same derivation on both ends produces the
- * same key; one direction encrypts with it, the other decrypts.
- *
- * The HKDF info string is fixed and versioned so a future scheme bump can
- * coexist without ambiguity.
- */
+/** Return the normalized key only when the operator wallet signed its binding. */
+export function authenticatedOperatorPubkey(
+  operator: string,
+  pubkeyHex: string | null | undefined,
+  attestation: string | null | undefined
+): string | null {
+  if (!pubkeyHex || !attestation) return null;
+  const normalized = pubkeyHex.replace(/^0x/i, "").toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(normalized)) return null;
+  try {
+    const recovered = verifyMessage(
+      `halo-pubkey:${operator.toLowerCase()}:${normalized}`,
+      attestation
+    );
+    return recovered.toLowerCase() === operator.toLowerCase() ? normalized : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Derive the shared AES-256-GCM key. The fixed, versioned HKDF context separates protocol versions. */
 function deriveSessionKey(
   ourPrivateKey: Uint8Array,
   peerPublicKey: Uint8Array
@@ -98,15 +89,7 @@ function deriveSessionKey(
   return hkdf(sha256, shared, undefined, HKDF_INFO, 32);
 }
 
-/**
- * Decrypt an `_enc` envelope received from the consumer. Returns the parsed
- * JSON plaintext (typically the OpenAI-compat body sans `model`).
- *
- * Throws on:
- *   - Unsupported envelope version/alg
- *   - Malformed hex
- *   - AES-GCM auth tag mismatch (wrong key, tampered ciphertext, wrong peer pubkey)
- */
+/** Decrypt and parse an `_enc` envelope; malformed, unsupported, or unauthenticated input throws. */
 export function decryptRequest(
   envelope: EncryptedEnvelope,
   operatorPrivateKey: Uint8Array
@@ -146,12 +129,51 @@ export function decryptRequest(
   };
 }
 
-/**
- * Encrypt a response body with the same session key as the request (re-derived
- * from the consumer's ephemeral pubkey). Fresh nonce per direction so the
- * request and response ciphertexts never share an (key, nonce) pair — the
- * cardinal sin of nonce-misuse with GCM.
- */
+/** Decrypt a v2 raw-bytes envelope; returns exact plaintext bytes with no JSON parsing. */
+export function decryptBytes(
+  envelope: EncryptedEnvelope,
+  receiverPrivateKey: Uint8Array,
+  expectedSenderPublicKey?: Uint8Array
+): { plaintext: Buffer; senderPublicKey: Uint8Array } {
+  if (envelope.v !== ENCRYPTION_BYTES_VERSION || envelope.alg !== ENCRYPTION_ALG) {
+    throw new Error(`unsupported bytes envelope: v=${envelope.v} alg=${envelope.alg}`);
+  }
+  const senderPublicKey = hexToBuf(envelope.epk);
+  if (senderPublicKey.length !== 32) {
+    throw new Error(`epk must be 32 bytes, got ${senderPublicKey.length}`);
+  }
+  if (
+    expectedSenderPublicKey &&
+    Buffer.compare(Buffer.from(senderPublicKey), Buffer.from(expectedSenderPublicKey)) !== 0
+  ) {
+    throw new Error("unexpected bytes envelope sender public key");
+  }
+  const nonce = hexToBuf(envelope.nonce);
+  if (nonce.length !== 12) {
+    throw new Error(`nonce must be 12 bytes, got ${nonce.length}`);
+  }
+  const sealed = base64ToBuf(envelope.ct);
+  if (sealed.length < 16) {
+    throw new Error(`ct too short to contain GCM tag`);
+  }
+  const sessionKey = deriveSessionKey(receiverPrivateKey, senderPublicKey);
+
+  const tag = sealed.subarray(sealed.length - 16);
+  const ct = sealed.subarray(0, sealed.length - 16);
+
+  const decipher = createDecipheriv("aes-256-gcm", sessionKey, nonce);
+  decipher.setAAD(V2_AAD);
+  decipher.setAuthTag(tag);
+  let plaintextBytes: Buffer;
+  try {
+    plaintextBytes = Buffer.concat([decipher.update(ct), decipher.final()]);
+  } catch {
+    throw new Error("bytes decryption failed (wrong key or tampered ciphertext)");
+  }
+  return { plaintext: plaintextBytes, senderPublicKey };
+}
+
+/** Encrypt a response with the request's shared key and a fresh directional GCM nonce. */
 export function encryptResponse(
   body: unknown,
   consumerPublicKey: Uint8Array,
@@ -166,18 +188,13 @@ export function encryptResponse(
   return {
     v: ENCRYPTION_VERSION,
     alg: ENCRYPTION_ALG,
-    // Response carries the operator's own ephemeral counterpart only for
-    // protocol symmetry / debuggability — the consumer already knows it from
-    // the announce, but echoing it here means a future scheme that does
-    // per-request ratcheting has a place to put it. For v1 it's the same as
-    // the static operator pubkey derived from operatorPrivateKey.
+    // Echo the announced operator key for wire symmetry and future per-request ratcheting.
     epk: bufToHex(x25519.getPublicKey(operatorPrivateKey)),
     nonce: bufToHex(nonce),
     ct: bufToHex(Buffer.concat([ct, tag])),
   };
 }
 
-// ── Consumer side (encrypt request to operator, decrypt operator's reply) ─────
 
 export interface EphemeralKeyPair {
   /** 32-byte X25519 public key, hex (no 0x). Sent as the envelope `epk`. */
@@ -199,12 +216,7 @@ export function hexToPubkey(hex: string): Uint8Array {
   return buf;
 }
 
-/**
- * Encrypt a request body to the operator's announced X25519 pubkey so the RELAY
- * only ever sees ciphertext. Mirrors the frontend; the operator's `decryptRequest`
- * reads it byte-for-byte. The caller keeps `model` (and `stream`) in cleartext
- * outside the envelope for routing.
- */
+/** Encrypt to the announced X25519 key while leaving routing fields outside the envelope. */
 export function encryptRequest(
   body: unknown,
   operatorPublicKey: Uint8Array,
@@ -225,11 +237,29 @@ export function encryptRequest(
   };
 }
 
-/**
- * Decrypt the operator's `_enc` response with the same session key (re-derived
- * from our ephemeral private key + the operator's pubkey). Returns the parsed
- * JSON body. Throws on a tag mismatch (wrong key / tampered).
- */
+/** Encrypt raw bytes with the same X25519/HKDF/AES-GCM construction as v1, in a v2 base64 wire format. */
+export function encryptBytes(
+  bytes: Uint8Array | Buffer,
+  peerPublicKey: Uint8Array,
+  sender: EphemeralKeyPair | OperatorKeyPair
+): BytesEncryptedEnvelope {
+  const sessionKey = deriveSessionKey(sender.privateKey, peerPublicKey);
+  const nonce = randomBytes(12);
+  const plaintext = Buffer.from(bytes);
+  const cipher = createCipheriv("aes-256-gcm", sessionKey, nonce);
+  cipher.setAAD(V2_AAD);
+  const ct = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return {
+    v: ENCRYPTION_BYTES_VERSION,
+    alg: ENCRYPTION_ALG,
+    epk: sender.publicKeyHex,
+    nonce: bufToHex(nonce),
+    ct: bufToBase64(Buffer.concat([ct, tag])),
+  };
+}
+
+/** Decrypt and parse an operator response; authentication failure throws. */
 export function decryptResponse(
   envelope: EncryptedEnvelope,
   operatorPublicKey: Uint8Array,
@@ -262,4 +292,18 @@ function bufToHex(buf: Uint8Array | Buffer): string {
 function hexToBuf(hex: string): Uint8Array {
   const clean = hex.startsWith("0x") ? hex.slice(2) : hex;
   return Buffer.from(clean, "hex");
+}
+
+function bufToBase64(buf: Uint8Array | Buffer): string {
+  return Buffer.from(buf).toString("base64");
+}
+
+function base64ToBuf(b64: string): Buffer {
+  if (b64.includes("\n") || b64.includes("\r")) {
+    throw new Error("base64 ciphertext must be unwrapped");
+  }
+  if (b64.length % 4 === 1 || !/^[A-Za-z0-9+/]*={0,2}$/.test(b64)) {
+    throw new Error("malformed base64 ciphertext");
+  }
+  return Buffer.from(b64, "base64");
 }

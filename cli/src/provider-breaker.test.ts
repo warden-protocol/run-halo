@@ -38,8 +38,6 @@ test("transient/unknown codes never trip the breaker", () => {
 
 test("re-tripping an open breaker is a no-op that keeps the first reason", () => {
   assert.equal(tripBreaker("openrouter", "credit_exhausted", 1000), true);
-  // A later auth error for the same provider must not overwrite the original
-  // cause or fire the change hook again.
   assert.equal(tripBreaker("openrouter", "operator_auth_failure", 2000), false);
   assert.equal(breakerCode("openrouter"), "credit_exhausted");
 });
@@ -65,10 +63,10 @@ test("the change hook fires on the open transition and on close, not on repeats"
   setBreakerChangeHandler(() => {
     changes += 1;
   });
-  tripBreaker("openrouter", "credit_exhausted"); // open  → fire
-  tripBreaker("openrouter", "credit_exhausted"); // repeat → no fire
-  tripBreaker("openrouter", "provider_error"); // non-sticky → no fire
-  clearBreaker("openrouter"); // close → fire
-  clearBreaker("openrouter"); // already closed → no fire
+  tripBreaker("openrouter", "credit_exhausted");
+  tripBreaker("openrouter", "credit_exhausted");
+  tripBreaker("openrouter", "provider_error");
+  clearBreaker("openrouter");
+  clearBreaker("openrouter");
   assert.equal(changes, 2);
 });

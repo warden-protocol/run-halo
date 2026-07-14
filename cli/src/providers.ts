@@ -1,17 +1,3 @@
-/**
- * Known inference provider presets. "Custom" lets operators point at any
- * OpenAI-compatible endpoint that isn't in the list.
- *
- * Wire shape:
- *   "openai-compat" — POST {baseUrl}/chat/completions, Bearer auth (default)
- *   "anthropic"     — POST {baseUrl}/messages with x-api-key + anthropic-version;
- *                     translated to/from OpenAI chat-completions in serve.ts
- *
- * Agent runtimes (OpenClaw, Claude Code, Hermes) expose an upstream the
- * operator can point at without operating a model themselves. Self-hosted
- * options (Ollama, LM Studio) and OpenRouter let any operator serve without
- * an agent at all.
- */
 export type ProviderWireFormat = "openai-compat" | "anthropic";
 
 export interface ProviderPreset {
@@ -26,7 +12,8 @@ export interface ProviderPreset {
   isTee?: boolean;
   /** Wire format the operator's upstream speaks. Defaults to openai-compat. */
   wire?: ProviderWireFormat;
-  /** Suggested margin % if pricing mode is "margin". */
+  /** OpenAI-compatible image generation path, when this provider supports it. */
+  imageEndpointPath?: string;
   defaultMarginPercent: number;
 }
 
@@ -74,6 +61,7 @@ export const PROVIDER_PRESETS: Record<string, ProviderPreset> = {
     label: "OpenAI",
     baseUrl: "https://api.openai.com/v1",
     requiresApiKey: true,
+    imageEndpointPath: "/images/generations",
     defaultMarginPercent: 30,
   },
   anthropic: {
@@ -89,6 +77,7 @@ export const PROVIDER_PRESETS: Record<string, ProviderPreset> = {
     label: "OpenRouter (100+ models)",
     baseUrl: "https://openrouter.ai/api/v1",
     requiresApiKey: true,
+    imageEndpointPath: "/images/generations",
     defaultMarginPercent: 30,
   },
   venice: {
@@ -97,14 +86,12 @@ export const PROVIDER_PRESETS: Record<string, ProviderPreset> = {
     baseUrl: "https://api.venice.ai/api/v1",
     requiresApiKey: true,
     isPrivacy: true,
+    imageEndpointPath: "/images/generations",
     defaultMarginPercent: 30,
   },
   near: {
     slug: "near",
-    // NEAR AI Cloud: OpenAI-compatible inference inside Intel TDX + NVIDIA H200
-    // TEEs, with per-response attestation. The gateway base serves every model
-    // and `/v1/models`; the confidential (attested, E2EE) path uses each model's
-    // direct-completions subdomain — see the attestation integration.
+    // NEAR exposes an OpenAI-compatible catalog; its confidential path uses model-specific endpoints.
     label: "NEAR AI Cloud (confidential TEE)",
     baseUrl: "https://cloud-api.near.ai/v1",
     requiresApiKey: true,
@@ -154,20 +141,18 @@ export function wireFormatFor(slug: string): ProviderWireFormat {
   return PROVIDER_PRESETS[slug]?.wire ?? "openai-compat";
 }
 
+/** Returns the image-generation path for providers with an inline image API. */
+export function imageEndpointPathFor(slug: string): string | null {
+  return PROVIDER_PRESETS[slug]?.imageEndpointPath ?? null;
+}
+
 /** True when a provider slug serves inside a hardware TEE (confidential mode).
  *  Kept in sync with the relay's TEE_PROVIDERS set. */
 export function isTeeProviderSlug(slug: string): boolean {
   return PROVIDER_PRESETS[slug]?.isTee === true;
 }
 
-/**
- * Fetch the provider's models list. Returns only the `id` fields.
- *
- * Three shapes:
- *   - Ollama:    GET {host}/api/tags → { models: [{ name }] }
- *   - Anthropic: GET {base}/models with x-api-key + anthropic-version → { data: [{ id }] }
- *   - Everything else (OpenAI-compatible): GET {base}/models with Bearer → { data: [{ id }] }
- */
+/** Fetch model IDs across Ollama, Anthropic, and OpenAI-compatible catalog shapes. */
 export async function detectModels(
   baseUrl: string,
   apiKey: string | undefined,

@@ -1,26 +1,3 @@
-/**
- * halo service — install consume/serve as an always-on OS service.
- *
- * The problem this solves: agents (Hermes, OpenClaw, …) often launch
- * `halo consume` or `halo serve` as a CHILD of their own gateway process. When
- * the gateway restarts, it SIGTERMs its process group and the Halo daemon dies
- * with it — so the endpoint the agent depends on vanishes on every restart.
- *
- * The fix is process ownership: register the daemon with the OS supervisor
- * (launchd on macOS, systemd --user on Linux) so it is owned by init, NOT the
- * gateway. It then survives gateway restarts, auto-restarts on crash, and starts
- * on login. The agent simply talks to a port that is always there.
- *
- *   halo service install [consume|serve] [-- daemon args…]
- *   halo service uninstall [consume|serve]
- *   halo service status [consume|serve]
- *   halo service logs [consume|serve]
- *
- * Passphrase: the supervisor can't type one. Either use a no-passphrase keystore
- * (`halo setup --no-wallet-passphrase`) or export HALO_PASSPHRASE before
- * `install` — it is baked into the unit's environment so the daemon can unlock
- * the wallet unattended.
- */
 import { execFileSync } from "node:child_process";
 import { writeFileSync, mkdirSync, existsSync, unlinkSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -33,7 +10,6 @@ const LABEL = (t: Target) => `com.halo-${t}`;
 const UNIT = (t: Target) => `halo-${t}.service`;
 
 export async function cmdService(rawArgs: string[]): Promise<void> {
-  // Pull out service-level flags (everything else is sub/target/passthrough).
   const dryRun = rawArgs.includes("--dry-run") || rawArgs.includes("--print");
   const args = rawArgs.filter((a) => a !== "--dry-run" && a !== "--print");
 
@@ -82,9 +58,8 @@ function invocation(): string[] {
   return [process.execPath, process.argv[1]];
 }
 
-/** Warn (don't block) if the keystore needs a passphrase the supervisor can't supply. */
 function passphrasePreflight(): void {
-  if (process.env.HALO_PASSPHRASE != null) return; // will be baked into the unit
+  if (process.env.HALO_PASSPHRASE != null) return;
   try {
     const cfg = loadConfig();
     if (!cfg.operator.noPassphrase) {
@@ -144,7 +119,6 @@ function install(target: Target, passthrough: string[], dryRun: boolean): void {
   process.exit(1);
 }
 
-// ── macOS / launchd ───────────────────────────────────────────────────────
 function installLaunchd(
   target: Target,
   argv: string[],
@@ -190,7 +164,6 @@ ${envEls}
   mkdirSync(path.dirname(plistPath), { recursive: true });
   mkdirSync(configDir(), { recursive: true });
   writeFileSync(plistPath, plist);
-  // Reload cleanly: unload an existing instance, then load + enable.
   try {
     execFileSync("launchctl", ["unload", plistPath], { stdio: "ignore" });
   } catch {
@@ -204,7 +177,6 @@ ${envEls}
   console.log(`    Manage: halo service status ${target} | halo service uninstall ${target}`);
 }
 
-// ── Linux / systemd --user ──────────────────────────────────────────────────
 function installSystemd(
   target: Target,
   argv: string[],

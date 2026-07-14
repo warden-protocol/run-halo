@@ -4,39 +4,29 @@ import path from "path";
 import type { EncryptedSecret } from "./secret";
 import { matchesModel } from "@halo/vault-core";
 
-/**
- * One upstream inference provider an operator fronts. A single operator may
- * carry several (multi-provider) — each request routes to the provider whose
- * `models` includes the requested model.
- */
+export type PricingMode = "margin" | "flat";
+
+export interface PricingConfig {
+  mode: PricingMode;
+  marginPercent?: number;
+  flatUsdcPer1KTokens?: number;
+  usdcPerImage?: number;
+}
+
+/** One upstream provider; multi-provider routing uses model membership. */
 export interface ProviderConfig {
   /** Provider slug: "openrouter" | "ollama" | "venice" | "near" | ... */
   slug: string;
   /** Base URL including /v1 */
   baseUrl: string;
-  /**
-   * Upstream provider API key. Two on-disk shapes are supported:
-   *   - `string`           — legacy plaintext (still works; not recommended)
-   *   - `EncryptedSecret`  — AES-256-GCM ciphertext keyed off the operator's
-   *                          keystore passphrase. Decrypted at `serve` start
-   *                          using the passphrase already entered to unlock
-   *                          the wallet, so encryption adds zero new prompts.
-   * At runtime `serve` mutates this back to a plaintext string before
-   * `callUpstream` runs, so downstream code only ever sees `string | undefined`.
-   */
+  /** Stored provider key: legacy plaintext or a keystore-passphrase-encrypted envelope. */
   apiKey?: string | EncryptedSecret;
   /** Models this operator will advertise for this provider (subset of catalog). */
   models: string[];
-  /**
-   * Optional per-provider pricing override. Margins differ by gateway (a TEE
-   * provider may warrant a different margin than a commodity one), so each
-   * provider can carry its own; falls back to the top-level `cfg.pricing`.
-   */
-  pricing?: {
-    mode: "margin" | "flat";
-    marginPercent?: number;
-    flatUsdcPer1KTokens?: number;
-  };
+  /** Subset of `models` priced per returned image; a non-image model here settles at $0 (invariant #2: never bill an unmeterable response). */
+  imageModels?: string[];
+  /** Provider-specific pricing, falling back to top-level pricing. */
+  pricing?: PricingConfig;
 }
 
 export interface HaloConfig {
@@ -46,45 +36,19 @@ export interface HaloConfig {
   operator: {
     address: string;
     keystorePath: string;
-    /** Human-readable name shown in the League */
     label?: string;
-    /**
-     * Operator-declared prompt-log retention policy. Soft commitment —
-     * surfaced in /v1/operators so privacy-aware consumers can filter.
-     * Defaults to "unknown" when omitted (most cautious value for the consumer).
-     */
+    /** Declared prompt-log retention policy; omission is exposed as `unknown`. */
     dataRetention?: "none" | "24h" | "7d" | "unknown";
-    /**
-     * Unattended mode: the keystore was created with an empty passphrase so
-     * `halo serve` can start without a human at the keyboard. The
-     * private key is recoverable from the keystore file in seconds by anyone
-     * who can read it — file mode `0600` plus host-level access controls
-     * become the only protection. API-key encryption is also forced off when
-     * this is true (no passphrase to derive the encryption key from).
-     */
+    /** Empty-passphrase unattended mode relies entirely on file and host access controls. */
     noPassphrase?: boolean;
   };
-  /**
-   * Primary upstream provider. Retained as the canonical single-provider field
-   * for back-compat (existing configs, the relay's primary-slug classification,
-   * and any code that reads one provider). When `providers` is also set, this is
-   * mirrored as `providers[0]`.
-   */
+  /** Primary provider retained for compatibility and mirrored as `providers[0]`. */
   provider: ProviderConfig;
-  /**
-   * Multi-provider operators: one `halo serve` can front several gateways at
-   * once (e.g. OpenRouter for general models + NEAR for confidential ones).
-   * Each request routes to the provider whose `models` list serves the
-   * requested model (see `providerForModel`). When present this is the source
-   * of truth and includes the primary as its first entry; when absent the
-   * operator is single-provider (`[provider]`). Read via `configProviders`.
-   */
+  /** Ordered multi-provider configuration; the first entry is primary. */
   providers?: ProviderConfig[];
-  pricing: {
+  pricing: PricingConfig & {
     /** "margin" = upstreamCostUsdc × (1 + marginPercent/100); "flat" = flatUsdcPer1KTokens */
-    mode: "margin" | "flat";
-    marginPercent?: number;
-    flatUsdcPer1KTokens?: number;
+    mode: PricingMode;
     /** Fallback fixed price per request in USDC base units (6 dp). Used when model token cost is unknown. */
     fallbackPerRequestUsdc: number;
   };
@@ -92,29 +56,14 @@ export interface HaloConfig {
     url: string;
     /** Optional API key for facilitators that require auth (CDP). */
     apiKey?: string;
-    /**
-     * Failover URLs tried in order when the primary is down (I-03).
-     * Empty array = no failover.
-     */
+    /** Ordered RPC failovers; an empty list disables failover. */
     failoverUrls?: string[];
   };
-  /**
-   * Optional override for the HaloVault contract address this operator gates
-   * against. Absent → the consensus-pinned VAULT_ADDRESS (production). Set this
-   * ONLY to point at a non-prod deployment (e.g. a dev vault) whose facilitator
-   * and consumers use the same address — it MUST match, or every vault request
-   * is rejected. Deliberately config-only (never an env flag): see vault-address.ts.
-   */
+  /** Config-only vault override; every facilitator and consumer must use the same address. */
   vaultAddress?: string;
-  /**
-   * Optional consumer profile: persisted defaults for `halo consume` (the local
-   * OpenAI-compatible endpoint that pays per request from this wallet). Set by
-   * `halo setup` when the user opts to consume; absent when they only operate.
-   * `halo consume` flags still override these at run time.
-   */
+  /** Persisted `halo consume` defaults; command flags override them. */
   consume?: {
-    /** Per-request spend ceiling in USD — the consumer's cost guard ("fallback"):
-     *  a request is refused (402) if the operator asks for more. */
+    /** Per-request spend ceiling in USD: estimated vault cost above it is refused (402). */
     maxUsdc: number;
     /** Model used when a consume request omits `model`. */
     defaultModel?: string;
@@ -126,7 +75,6 @@ export interface HaloConfig {
   };
 }
 
-/** Current config dir name. */
 const DIR_NAME = ".halo";
 
 export function configDir(): string {
@@ -147,30 +95,70 @@ export function loadConfig(): HaloConfig {
     throw new Error(`No config at ${p}. Run: halo setup`);
   }
   const raw = readFileSync(p, "utf-8");
-  return JSON.parse(raw) as HaloConfig;
+  return validateConfig(JSON.parse(raw) as HaloConfig);
 }
 
 export function saveConfig(cfg: HaloConfig): void {
+  validateConfig(cfg);
   mkdirSync(configDir(), { recursive: true });
   writeFileSync(configPath(), JSON.stringify(cfg, null, 2), { mode: 0o600 });
 }
 
-/**
- * Normalized provider list. The multi-provider `providers[]` when set, else the
- * single legacy `provider` wrapped in a one-element list. Always ≥1 entry, so
- * callers never special-case the single-provider operator.
- */
+export function providerServesConfiguredImageModel(
+  provider: ProviderConfig,
+  model: string
+): boolean {
+  return (provider.imageModels ?? []).includes(model);
+}
+
+/** Per-image rate for `model`, or null if it isn't a configured image model; the provider's `usdcPerImage` overrides the operator-wide default. */
+export function imagePriceForModel(cfg: HaloConfig, model: string): number | null {
+  const provider = providerForModel(configProviders(cfg), model);
+  if (!providerServesConfiguredImageModel(provider, model)) return null;
+  const price = provider.pricing?.usdcPerImage ?? cfg.pricing.usdcPerImage;
+  return typeof price === "number" && Number.isFinite(price) && price >= 0 ? price : null;
+}
+
+const VALID_PRICING_MODES: PricingMode[] = ["margin", "flat"];
+
+export function validateConfig(cfg: HaloConfig): HaloConfig {
+  const providers = cfg.providers && cfg.providers.length > 0 ? cfg.providers : [cfg.provider];
+  if (!VALID_PRICING_MODES.includes(cfg.pricing.mode)) {
+    throw new Error(`unrecognized pricing.mode "${cfg.pricing.mode}"`);
+  }
+  for (const provider of providers) {
+    if (provider.pricing && !VALID_PRICING_MODES.includes(provider.pricing.mode)) {
+      throw new Error(
+        `unrecognized pricing.mode "${provider.pricing.mode}" for provider "${provider.slug}"`
+      );
+    }
+    const imageModels = provider.imageModels ?? [];
+    if (imageModels.length === 0) continue;
+
+    const price = provider.pricing?.usdcPerImage ?? cfg.pricing.usdcPerImage;
+    if (!Number.isFinite(price) || (price ?? -1) < 0) {
+      throw new Error(
+        `imageModels for provider "${provider.slug}" requires a finite non-negative usdcPerImage`
+      );
+    }
+    for (const imageModel of imageModels) {
+      if (!provider.models.includes(imageModel)) {
+        throw new Error(
+          `imageModels entry "${imageModel}" must also be listed in provider "${provider.slug}" models`
+        );
+      }
+    }
+  }
+  return cfg;
+}
+
+/** Return `providers[]` or the primary provider as a non-empty list. */
 export function configProviders(cfg: HaloConfig): ProviderConfig[] {
   if (cfg.providers && cfg.providers.length > 0) return cfg.providers;
   return [cfg.provider];
 }
 
-/**
- * Which provider serves `model`. Exact membership first, then a loose
- * substring match (mirrors the relay's tolerant model matching), else the
- * primary provider as a last resort. The provider's `models` list is the
- * routing key — a model announced by exactly one provider always resolves to it.
- */
+/** Resolve a model by exact then loose membership, falling back to the primary provider. */
 export function providerForModel(providers: ProviderConfig[], model: string): ProviderConfig {
   return (
     providers.find((p) => p.models.includes(model)) ||
@@ -196,17 +184,9 @@ export function allConfiguredModels(cfg: HaloConfig): string[] {
 
 export const DEFAULT_RELAY_URL = "https://relay.runhalo.xyz";
 export const DEFAULT_INDEXER_URL = "https://indexer.runhalo.xyz";
-// Default to the Halo protocol-run x402 facilitator. Operators don't
-// need credentials or a personal wallet — the protocol covers gas. CDP and
-// other facilitators remain valid via `--facilitator-url` if an operator
-// wants their own settlement path.
+// The protocol facilitator is credentialless for operators and covers gas.
 export const DEFAULT_FACILITATOR_URL = "https://facilitator.runhalo.xyz";
 
-/**
- * Base mainnet. Halo is mainnet-only — no network switching, no testnet. The
- * chain id and x402 network name are hardcoded here (never read from config or
- * env) so signing domains, USDC selection, and settlement can never drift onto
- * another chain.
- */
+/** Fixed Base-mainnet identifiers shared by signing, USDC selection, and settlement. */
 export const BASE_CHAIN_ID = 8453;
 export const BASE_NETWORK = "base";

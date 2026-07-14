@@ -1,28 +1,20 @@
-/**
- * halo vault — manage the consumer's HaloVault balance for `halo consume --vault`.
- *
- *   halo vault status              show balance / locked / withdrawable
- *   halo vault deposit <usd>       move USDC from the wallet into the vault
- *   halo vault withdraw [usd]      start/complete a timelocked withdrawal
- *
- * The vault rail bills the ACTUAL tokens each request used (settle-actual), vs
- * exact mode's prompt-blind flat per-request quote. Deposits are on-chain (the
- * wallet pays a little gas); per-request reserve/redeem are gasless (facilitator).
- */
 import prompts from "prompts";
 import { classifySessionKey } from "@halo/vault-core";
 import { loadConfig, BASE_CHAIN_ID } from "../config";
 import { loadWallet } from "../wallet";
 import {
   VaultConsumeClient,
-  VAULT_ADDRESS,
   fmtUsd,
   guardVaultFresh,
   resolveSessionSigner,
   type SessionKeyMode,
 } from "../vault-consume";
+import {
+  facilitatorVaultError,
+  inspectFacilitatorVault,
+  resolveVaultAddress,
+} from "../vault-address";
 
-/** Read `--flag value` or `--flag=value` from a raw arg list. */
 function flagValue(args: string[], name: string): string | undefined {
   const eq = args.find((a) => a.startsWith(`${name}=`));
   if (eq) return eq.slice(name.length + 1);
@@ -46,8 +38,7 @@ export async function cmdVault(rawArgs: string[]): Promise<void> {
     passphrase = r.passphrase;
   }
   const force = rawArgs.includes("--force");
-  // Session-key scheme (#426), must match how `halo consume --vault` was run so
-  // status classifies — and deposit registers — the SAME key.
+  // Use the same signer mode for status, deposit, and consume.
   const sessionKeyRaw = flagValue(rawArgs, "--session-key");
   if (sessionKeyRaw && sessionKeyRaw !== "wallet" && sessionKeyRaw !== "browser") {
     console.error(`  ✗ --session-key must be "wallet" or "browser" (got "${sessionKeyRaw}").`);
@@ -56,6 +47,7 @@ export async function cmdVault(rawArgs: string[]): Promise<void> {
   const sessionKeyMode: SessionKeyMode = sessionKeyRaw === "browser" ? "browser" : "wallet";
   const wallet = await loadWallet(cfg.operator.keystorePath, passphrase);
   const facilitatorUrl = cfg.facilitator?.url ?? "https://facilitator.runhalo.xyz";
+  const vaultAddress = resolveVaultAddress(cfg.vaultAddress);
   const sessionSigner = await resolveSessionSigner(wallet, sessionKeyMode);
   const client = new VaultConsumeClient(
     wallet,
@@ -63,17 +55,16 @@ export async function cmdVault(rawArgs: string[]): Promise<void> {
       facilitatorUrl,
       rpcUrl: (process.env.BASE_RPC_URL || "https://mainnet.base.org").trim(),
       chainId: BASE_CHAIN_ID,
+      vaultAddress,
     },
     sessionSigner
   );
 
   switch (sub) {
     case "status": {
+      const identity = await inspectFacilitatorVault(facilitatorUrl, vaultAddress);
       const s = await client.readVaultState();
-      // Classify the on-chain session key against the key this CLI SIGNS with in
-      // the selected mode (#426): the wallet itself (default), or the derived
-      // browser sub-wallet (--session-key browser). Anything else means
-      // `halo consume --vault` would serve work it can never redeem.
+      // Classify against the selected receipt signer, not always the main wallet.
       const expected = await client.sessionAddress();
       const skStatus = classifySessionKey(s.sessionKey, expected);
       const browser = sessionKeyMode === "browser";
@@ -88,7 +79,12 @@ export async function cmdVault(rawArgs: string[]): Promise<void> {
               : " (none yet — your first deposit registers this wallet)"
             : " ⚠ NOT the key this CLI signs with — receipts can't redeem against it";
       console.log(`halo vault`);
-      console.log(`  vault       : ${VAULT_ADDRESS}  (Base mainnet)`);
+      console.log(`  vault       : ${vaultAddress}  (Base mainnet)`);
+      console.log(
+        identity.status === "match"
+          ? `  facilitator : verified (${identity.live})`
+          : `  facilitator : ${facilitatorVaultError(vaultAddress, identity)}`
+      );
       console.log(`  consumer    : ${wallet.address}`);
       console.log(`  balance     : $${fmtUsd(s.balance)}`);
       console.log(`  locked      : $${fmtUsd(s.lockedTotal)} (reserved to operators)`);
@@ -98,7 +94,7 @@ export async function cmdVault(rawArgs: string[]): Promise<void> {
       if (skStatus === "mismatch") {
         console.log(
           `\n  ⚠ The registered session key is NOT the key this CLI signs with, so\n` +
-            `    \`halo consume --vault${browser ? " --session-key browser" : ""}\` would serve work it can never collect\n` +
+            `    \`halo consume${browser ? " --session-key browser" : ""}\` would serve work it can never collect\n` +
             `    (redeem reverts BadSignature). Common causes: mixing the Halo browser app and the\n` +
             `    CLI on one wallet, or the wrong --session-key mode. Try the other mode\n` +
             `    (--session-key ${browser ? "wallet" : "browser"}), use a DEDICATED wallet, or rotate the key via\n` +
@@ -115,8 +111,7 @@ export async function cmdVault(rawArgs: string[]): Promise<void> {
         console.error("usage: halo vault deposit <usd>   (e.g. halo vault deposit 5)");
         process.exit(1);
       }
-      // Staleness gate (#392): refuse to move USDC into a stale pinned vault.
-      if (!(await guardVaultFresh(facilitatorUrl, { force }))) process.exit(1);
+      if (!(await guardVaultFresh(facilitatorUrl, vaultAddress, { force }))) process.exit(1);
       console.log(`  depositing $${amount.toFixed(2)} into the vault (approve + deposit; needs a little ETH for gas)…`);
       try {
         const tx = await client.deposit(amount);

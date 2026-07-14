@@ -1,22 +1,8 @@
-/**
- * Upstream pricing resolver — turns (provider, model, promptTokens,
- * completionTokens) into a USDC base-unit cost so margin mode can charge
- * fairly across cheap and expensive models.
- *
- * Without this, every margin-mode operator fell through to the
- * fallbackPerRequestUsdc — flat $0.01 regardless of model — losing money
- * on Claude Opus prompts and over-charging on tiny Qwen calls. See
- * docs/PRICING.md.
- *
- * Today: OpenRouter and NEAR AI Cloud (both via a public OpenAI-compatible
- * /models endpoint that reports per-token `prompt`/`completion` pricing
- * strings), Ollama (free, returns zero), and a fallback path that returns null
- * so the caller can use fallbackPerRequestUsdc.
- *
- * Adding a provider: if its /models endpoint reports OpenRouter-style pricing
- * strings, register `makeModelsPricingResolver(slug)`; otherwise implement a
- * bespoke `Resolver` and register it in RESOLVERS.
- */
+import {
+  HaloConfig,
+  configProviders,
+  providerForModel,
+} from "./config";
 
 export interface UpstreamRate {
   /** USD per prompt token (e.g. 0.000003 for $3/M). */
@@ -25,11 +11,7 @@ export interface UpstreamRate {
   completionRateUsd: number;
   /** USD per request — some providers charge a flat surcharge on top. */
   requestRateUsd?: number;
-  /** USD per CACHE-READ prompt token (NEAR/OpenRouter `input_cache_read`).
-   *  Typically ~5–10× cheaper than promptRateUsd. When the upstream reports
-   *  cached prompt tokens, those are billed at this rate so the operator passes
-   *  the provider's prompt-cache saving on to the consumer. Undefined ⇒ the
-   *  provider doesn't discount cache reads (cached tokens bill at promptRateUsd). */
+  /** Optional USD cache-read rate; absent values use the ordinary prompt rate. */
   cacheReadRateUsd?: number;
   /** Model context window in tokens (provider `/models` `context_length`), when
    *  the provider reports it. Announced to the relay so agents can size context
@@ -40,10 +22,7 @@ export interface UpstreamRate {
 type Resolver = (model: string, baseUrl: string) => Promise<UpstreamRate | null>;
 
 const CACHE_TTL_MS = 5 * 60 * 1000;
-// Hard ceiling on the /models fetch. Without it a hung OpenRouter endpoint never
-// resolves the in-flight promise, stalling every caller awaiting it — including
-// the operator announce (which prices each model) and per-request pricing on the
-// serve hot path. On timeout we throw → fall back to stale cache / proxy rate.
+// Bound catalog fetches so callers can fall back instead of sharing a permanently hung promise.
 const FETCH_TIMEOUT_MS = 5_000;
 
 /** Per-(provider+baseUrl) cache. Pricing tables don't change often. */
@@ -58,7 +37,6 @@ function cacheKey(slug: string, baseUrl: string): string {
   return `${slug}::${baseUrl.replace(/\/+$/, "")}`;
 }
 
-// ── OpenAI-compatible /models pricing (OpenRouter, NEAR) ─────────────────────
 
 interface ModelsPricingEntry {
   id: string;
@@ -75,13 +53,7 @@ interface ModelsPricingEntry {
   };
 }
 
-/**
- * Build a resolver for any provider whose public `/models` endpoint reports
- * OpenRouter-style per-token `prompt`/`completion` pricing strings. One fetch
- * populates the whole catalog into the cache; subsequent lookups are O(1) for
- * 5 minutes. Returns null when the model isn't in the catalog (caller falls
- * back). `slug` keys the cache so providers sharing a base URL never collide.
- */
+/** Build a slug-isolated cached resolver for OpenRouter-style `/models` pricing. */
 function makeModelsPricingResolver(slug: string): Resolver {
   return async (model, baseUrl) => {
     const key = cacheKey(slug, baseUrl);
@@ -162,17 +134,12 @@ const openrouterResolver: Resolver = makeModelsPricingResolver("openrouter");
 // NEAR AI Cloud: same public /models pricing shape (prompt/completion strings).
 const nearResolver: Resolver = makeModelsPricingResolver("near");
 
-// ── Ollama (local, free) ────────────────────────────────────────────────────
 
 const ollamaResolver: Resolver = async () => {
-  // Local inference has no per-token upstream cost. Margin mode on
-  // Ollama settles at 0 + margin = 0, which means the operator earns
-  // nothing — they should use flat mode instead. We return zero rather
-  // than null so this is explicit and shows up in logs.
+  // Return explicit zero for free local inference; `null` would incorrectly select a fallback.
   return { promptRateUsd: 0, completionRateUsd: 0 };
 };
 
-// ── Registry ────────────────────────────────────────────────────────────────
 
 const RESOLVERS: Record<string, Resolver> = {
   openrouter: openrouterResolver,
@@ -180,23 +147,12 @@ const RESOLVERS: Record<string, Resolver> = {
   ollama: ollamaResolver,
 };
 
-/**
- * True when margin mode against this provider can produce a real upstream
- * cost. Used by setup.ts to warn operators selecting margin against a
- * provider we don't yet know how to price.
- */
+/** Whether this provider has a margin-pricing resolver. */
 export function providerSupportsMargin(slug: string): boolean {
   return slug in RESOLVERS && slug !== "ollama";
 }
 
-/**
- * Compute the upstream USDC base-unit cost for a given inference. Returns
- * null when the rate is unknown — caller must fall back (typically to
- * `fallbackPerRequestUsdc`).
- *
- * Token splits matter: most providers price prompt and completion at
- * different rates, sometimes by a factor of 5x or more.
- */
+/** Compute upstream cost in USDC base units, or `null` when no rate is available. */
 export async function upstreamUsdcCost(params: {
   providerSlug: string;
   providerBaseUrl: string;
@@ -236,40 +192,65 @@ export async function upstreamUsdcCost(params: {
   return BigInt(Math.ceil(usd * 1_000_000));
 }
 
-/**
- * Blend weight applied to the (more expensive) completion rate when
- * collapsing an upstream prompt/completion rate pair into the SINGLE
- * USD-per-1K-token number the operator announces to the relay. Upstream
- * completion tokens often cost 4–5× prompt tokens, so we lean toward
- * completion (rather than a flat 50/50 or a usage-weighted prompt-heavy
- * blend) to keep the advertised figure CONSERVATIVE — the relay/frontend
- * uses it to size per-prompt caps and gate model choice, and an
- * under-estimate there would let a prompt blow past its cap mid-run.
- */
+export interface RequestPricingInputs {
+  cfg: HaloConfig;
+  model: string;
+  promptTokens: number;
+  completionTokens: number;
+  cachedPromptTokens?: number;
+}
+
+/** Price a request in six-decimal USDC base units using flat or upstream-margin pricing. */
+export async function priceRequest(inputs: RequestPricingInputs): Promise<bigint> {
+  const provider = providerForModel(configProviders(inputs.cfg), inputs.model);
+  const pricing = provider.pricing ?? inputs.cfg.pricing;
+  const fallbackPerRequestUsdc = inputs.cfg.pricing.fallbackPerRequestUsdc;
+  const totalTokens = Math.max(1, inputs.promptTokens + inputs.completionTokens);
+
+  if (
+    pricing.mode === "flat" &&
+    typeof pricing.flatUsdcPer1KTokens === "number"
+  ) {
+    const scaled = BigInt(Math.round(pricing.flatUsdcPer1KTokens * 1_000_000));
+    return (scaled * BigInt(totalTokens)) / 1000n;
+  }
+
+  if (pricing.mode === "margin") {
+    const upstream = await upstreamUsdcCost({
+      providerSlug: provider.slug,
+      providerBaseUrl: provider.baseUrl,
+      model: inputs.model,
+      promptTokens: inputs.promptTokens,
+      completionTokens: inputs.completionTokens,
+      cachedPromptTokens: inputs.cachedPromptTokens,
+    });
+    if (upstream === null) {
+      console.warn(
+        `[pricing] margin mode: no upstream rate for ${provider.slug}/${inputs.model} — using fallbackPerRequestUsdc ($${(fallbackPerRequestUsdc / 1_000_000).toFixed(4)})`
+      );
+      return BigInt(fallbackPerRequestUsdc);
+    }
+    if (upstream === 0n) {
+      console.warn(
+        `[pricing] margin mode on free provider ${provider.slug}: upstream cost is $0; using fallbackPerRequestUsdc — consider switching to mode=flat`
+      );
+      return BigInt(fallbackPerRequestUsdc);
+    }
+    const marginPct =
+      typeof pricing.marginPercent === "number" ? pricing.marginPercent : 25;
+    const multipliedNumerator =
+      upstream * BigInt(100 + Math.round(marginPct));
+    return (multipliedNumerator + 99n) / 100n;
+  }
+
+  return BigInt(fallbackPerRequestUsdc);
+}
+
+/** Completion-heavy weight for the single blended rate announced to the relay. */
 const ANNOUNCE_COMPLETION_WEIGHT = 0.35; // 65% prompt-priced / 35% completion-priced
 
-/**
- * Representative upstream rate in USD per 1,000 tokens for a model, for the
- * operator's pricing announce. Lets margin-mode operators advertise a REAL
- * per-model price (Opus high, small models low) instead of a flat proxy, so
- * the relay/frontend can show price and size budget caps per model.
- *
- * Returns:
- *   - a positive USD/1K number when the upstream rate is known,
- *   - 0 for free providers (e.g. Ollama),
- *   - null when the rate is unknown (caller falls back to its own proxy).
- *
- * The announce carries one number, so the prompt/completion split is blended
- * via ANNOUNCE_COMPLETION_WEIGHT. Actual per-prompt cost still varies with the
- * real split; this is a representative, intentionally conservative figure.
- */
-/**
- * Model context window (tokens) for a model, from the provider's `/models`
- * `context_length`. Reuses the same cached fetch as pricing. Returns null when
- * the provider doesn't report it (or isn't a /models-pricing provider). The
- * operator announces this so the relay's /v1/models can expose it — agents use
- * it to size context and decide when to compress.
- */
+/** Blended announcement rate: positive, zero for free providers, or `null` for caller fallback. */
+/** Return cached catalog `context_length`, or `null` when the provider omits it. */
 export async function upstreamContextLength(params: {
   providerSlug: string;
   providerBaseUrl: string;
@@ -310,15 +291,7 @@ export async function upstreamRatePer1KUsd(params: {
   return perToken * 1000;
 }
 
-/**
- * Cheap token estimator for the 402 pre-inference price quote. Real
- * settlement uses the operator's actual usage.prompt_tokens /
- * usage.completion_tokens, which is what the upstream returns.
- *
- * Heuristic: ~4 chars per token. Conservative for English, slightly
- * over-estimates for code/CJK; both bias toward over-quoting the user,
- * which is honest behavior for a ceiling-style 402.
- */
+/** Estimate quote tokens at roughly four characters each; settlement uses reported usage. */
 export function estimatePromptTokens(messages: unknown): number {
   if (!Array.isArray(messages)) return 0;
   let chars = 0;

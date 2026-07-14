@@ -24,83 +24,35 @@ export interface SetupFlags {
   provider?: string;
   baseUrl?: string;
   apiKey?: string;
-  models?: string; // "m1,m2,m3"
+  models?: string;
+  imageModels?: string; // subset of models priced per image
   margin?: number;
   flat?: number;
+  imagePrice?: number;
   fallbackCents?: number;
-  /**
-   * Append this provider to an existing operator instead of replacing it. Lets
-   * one operator front several gateways at once (e.g. add NEAR confidential
-   * models alongside an existing OpenRouter setup) — each request routes to the
-   * provider that serves the requested model. Requires an existing config; the
-   * wallet and other providers are preserved untouched. The provider's
-   * own pricing (margin/flat) is stored per-provider.
-   */
+  /** Add a provider to an existing multi-provider config while preserving its wallet and providers. */
   addProvider?: boolean;
   label?: string;
   withPairing?: boolean;
-  /**
-   * Force wallet rotation. Without this flag, re-running setup with an existing
-   * config preserves the operator wallet and only updates provider/pricing —
-   * we never silently destroy an identity that already has accumulated league
-   * points and dashboard pairings.
-   */
+  /** Rotate the wallet explicitly; setup otherwise preserves an existing identity. */
   rotateWallet?: boolean;
-  /**
-   * Explicit choice for upstream API key encryption-at-rest.
-   *   undefined → ask interactively (default behavior for human-driven setup)
-   *   true      → encrypt with the keystore passphrase (recommended)
-   *   false     → store plaintext (faster restart in trusted environments,
-   *               but a stolen ~/.halo/ directory exposes the key)
-   */
+  /** API-key storage choice: `undefined` prompts, true encrypts, false stores plaintext. */
   encryptApiKey?: boolean;
-  /**
-   * Operator-declared prompt-log retention policy. Defaults to "unknown" if
-   * omitted (most cautious value from the consumer's standpoint).
-   */
+  /** Declared prompt-log retention policy; omission becomes `unknown`. */
   dataRetention?: "none" | "24h" | "7d" | "unknown";
-  /**
-   * Unattended mode: generate the wallet keystore with an empty passphrase,
-   * skip every passphrase prompt, and force the upstream API key to be stored
-   * plaintext. Intended for headless operator deploys (auto-restart, CI) where
-   * no human is around to type. Comes with a clear security trade-off — see
-   * the on-screen warning at setup time.
-   */
+  /** Headless mode uses an empty keystore passphrase and plaintext API key. */
   noWalletPassphrase?: boolean;
-  /**
-   * Non-interactive wallet choice for driven/headless setup. When set, the
-   * "Generate / Import" select is skipped. Unattended mode (noWalletPassphrase)
-   * defaults this to "generate" so the canonical agent command completes without
-   * a human. NOTE: "import" still needs the key entered interactively (no pk
-   * flag), so it can't fully run headless.
-   */
+  /** Non-interactive choice; import still requires interactive key entry. */
   walletMode?: "generate" | "import";
-  /**
-   * Consumer profile (persisted for `halo consume`). `--consume` opts in
-   * non-interactively (skips the yes/no prompt); the rest set its fields.
-   * In unattended mode the consume step is only configured when `--consume` is
-   * passed (it never prompts). Interactive setup asks if `--consume` is unset.
-   */
+  /** Persisted consumer defaults; unattended setup configures them only with explicit `--consume`. */
   consume?: boolean;
   consumeModel?: string; // default model when a request omits one
   consumeAllow?: string; // CSV allowlist of payable models ("" / "any" ⇒ no limit)
-  consumeMaxUsdc?: number; // per-request spend ceiling (the "fallback" cost guard)
+  consumeMaxUsdc?: number; // per-request vault spend ceiling
   consumePort?: number;
-  /**
-   * Non-interactive private-key backup choice for the generate path. When set,
-   * the backup prompt is skipped. Unattended mode defaults this to "skip" (the
-   * encrypted keystore is the backup; don't write a plaintext copy unprompted).
-   */
+  /** Generated-key backup choice; unattended mode defaults to no plaintext backup. */
   keyBackup?: "file" | "skip";
-  /**
-   * DEV/TEST ESCAPE HATCH: override the x402 facilitator URL. Operators
-   * should NEVER need this — the protocol-run facilitator is the single
-   * authoritative settlement service in the current architecture, and
-   * setup writes the protocol default URL automatically. This flag exists
-   * only for development against a staging facilitator or for protocol
-   * upgrades that need to point at a new instance during a migration
-   * window. Intentionally omitted from `halo setup --help`.
-   */
+  /** Development-only facilitator override, intentionally omitted from setup help. */
   facilitatorUrl?: string;
 }
 
@@ -112,18 +64,9 @@ function passphraseStrength(p: string): { ok: boolean; label: string } {
 }
 
 const CONSUME_DEFAULT_MAX_USDC = 0.1;
-// 8799, not the indexer's 8789 — avoids a common local port clash.
 const CONSUME_DEFAULT_PORT = 8799;
 
-/**
- * Resolve the optional consumer profile (`halo consume` defaults). Returns
- * undefined when the user doesn't consume. Precedence:
- *   --consume true/false       → honor without prompting
- *   unattended (no passphrase) → never prompt; configure only if --consume, else
- *                                preserve the existing profile
- *   interactive                → ask yes/no, then prompt the fields
- * `halo consume` flags still override these per run.
- */
+/** Resolve consumer defaults: explicit flag wins, unattended mode preserves state, interactive mode prompts. */
 async function resolveConsumeConfig(
   flags: SetupFlags,
   models: string[],
@@ -217,25 +160,19 @@ async function resolveConsumeConfig(
 
 export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
   console.log("\nhalo setup\n");
-  if (flags.provider || flags.models || flags.margin !== undefined || flags.flat !== undefined) {
+  if (
+    flags.provider ||
+    flags.models ||
+    flags.margin !== undefined ||
+    flags.flat !== undefined ||
+    flags.imagePrice !== undefined
+  ) {
     console.log("  using flags from caller — interactive prompts skipped where provided\n");
   }
 
   const cancel = { onCancel: () => process.exit(130) };
 
-  // ── Wallet ─────────────────────────────────────────────────────────────
-  // Identity preservation: if a config already exists at ~/.halo/, we
-  // do NOT touch the keystore. Re-running setup is for adjusting provider,
-  // pricing, or label — not for rotating identity. An accumulated league
-  // history and dashboard pairings live on the address; silently overwriting
-  // would orphan them. Pass --rotate-wallet to opt in to a new wallet.
-  //
-  // Orphaned-keystore recovery: if config.json is missing but a keystore.json
-  // exists at the default path, that's the fingerprint of a setup that
-  // crashed mid-way (most commonly: the scrypt-maxmem boundary on Node 18
-  // during API-key encryption). Treat the keystore as a preserved wallet so
-  // a retry of setup doesn't blow away the user's identity. The address is
-  // recoverable from the keystore JSON without decryption.
+  // Preserve configured or orphaned keystores unless rotation is explicit.
   const existingConfig = existsSync(configPath()) ? safeLoadConfig() : null;
   const orphanedAddr = !existingConfig ? readOrphanedKeystoreAddress() : null;
   const preserveExisting =
@@ -280,10 +217,7 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
     console.log(`  Keystore: ${keystorePath} (0600)\n`);
   }
 
-  // Unattended-mode propagation: if the operator opted out of a wallet
-  // passphrase, we cannot encrypt the API key (no key material to derive
-  // the AES key from), and we'll mark the config so `serve` knows to skip
-  // its passphrase prompt at startup.
+  // Empty-passphrase mode cannot encrypt provider keys and suppresses the serve unlock prompt.
   const noPassphrase = !!flags.noWalletPassphrase;
   if (noPassphrase && flags.encryptApiKey === true) {
     console.log(
@@ -295,7 +229,6 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
     flags = { ...flags, encryptApiKey: false };
   }
 
-  // ── Provider ───────────────────────────────────────────────────────────
   let slug: string;
   if (flags.provider) {
     if (!PROVIDER_PRESETS[flags.provider]) {
@@ -337,17 +270,8 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
     baseUrl = r.u;
   }
 
-  // API key resolution. Precedence:
-  //   1. Explicit --api-key flag → use it (operator wants to rotate)
-  //   2. Existing config with same provider slug → preserve the value AS-IS
-  //      (handles the footgun where re-running setup to change one thing —
-  //      margin, label, facilitator URL — silently blanked the upstream API
-  //      key when no --api-key flag was passed)
-  //   3. Interactive prompt → ask (only fires when nothing else applies)
-  //
-  // When preserving, the existing key is kept in its on-disk form (plaintext
-  // string or EncryptedSecret) and bypasses resolveApiKeyStorage so we don't
-  // try to decrypt+re-encrypt when we don't have to.
+  // API-key precedence: explicit flag, existing stored value, then interactive prompt.
+  // Preserved values keep their current plaintext/encrypted representation.
   let apiKey: string | undefined = flags.apiKey;
   let preservedApiKey: string | import("../secret").EncryptedSecret | undefined;
 
@@ -375,10 +299,7 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
     apiKey = k;
   }
 
-  // Normalize the key before storage: a key that "works when I curl it" but is
-  // refused by Halo is almost always a paste artifact — a leading "Bearer ",
-  // surrounding quotes, or stray whitespace/newline. Halo sends the stored bytes
-  // verbatim as `Authorization: Bearer <key>`, so strip those here once.
+  // Strip common paste wrappers before persisting bytes used verbatim in Bearer auth.
   if (typeof apiKey === "string") {
     const cleaned = apiKey
       .trim()
@@ -389,14 +310,7 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
       console.log("  ℹ normalized API key (stripped Bearer prefix / quotes / whitespace)");
       apiKey = cleaned;
     }
-    // Reject an obviously MASKED/TRUNCATED key. The #1 way an AI agent driving
-    // setup corrupts a key is by reading the terminal's masked display
-    // (`sk-or-…1955`, `sk-…abcd`) instead of the real bytes — the stored value
-    // then contains an ellipsis or is implausibly short, and every upstream call
-    // 401s. Catch it here with a loud, specific error rather than letting a dead
-    // key reach `serve`. Pass the FULL key from its original source (the user's
-    // paste, an env var, the provider dashboard) — never a value copied from
-    // masked terminal output.
+    // Reject masked or truncated values before they reach runtime configuration.
     if (apiKey) {
       if (/[…⋯]|\.{3,}|\*{2,}|•{2,}/.test(apiKey)) {
         throw new Error(
@@ -413,7 +327,6 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
     }
   }
 
-  // ── Models ─────────────────────────────────────────────────────────────
   let models: string[] = [];
   if (flags.models) {
     models = flags.models
@@ -461,12 +374,24 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
     }
   }
 
-  // ── Pricing ────────────────────────────────────────────────────────────
+  // Driven mode uses defaults instead of prompts; computed here because the pricing section below needs it.
+  const drivenMode = !!(
+    flags.provider ||
+    flags.models ||
+    flags.imageModels ||
+    flags.margin !== undefined ||
+    flags.flat !== undefined ||
+    flags.imagePrice !== undefined
+  );
+
   let pricingMode: "margin" | "flat";
   let marginPercent: number | undefined;
   let flatUsdcPer1KTokens: number | undefined;
 
-  if (flags.margin !== undefined && flags.flat !== undefined) {
+  const explicitPricingFlags = [flags.margin, flags.flat].filter(
+    (v) => v !== undefined
+  ).length;
+  if (explicitPricingFlags > 1) {
     throw new Error("--margin and --flat are mutually exclusive");
   }
   if (flags.margin !== undefined) {
@@ -477,12 +402,25 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
     pricingMode = "flat";
     flatUsdcPer1KTokens = flags.flat;
     console.log(`  pricing: flat $${flatUsdcPer1KTokens}/1K tokens (from --flat)`);
+  } else if (drivenMode) {
+    // Driven/headless with no --margin/--flat defaults silently instead of
+    // blocking on a prompt; inert when all models are image-priced.
+    if (slug === "ollama") {
+      pricingMode = "flat";
+      flatUsdcPer1KTokens = 0.0005;
+    } else {
+      pricingMode = "margin";
+      marginPercent = preset.defaultMarginPercent;
+    }
+    console.log(
+      `  pricing: ${pricingMode === "flat" ? `flat $${flatUsdcPer1KTokens}/1K tokens` : `margin ${marginPercent}%`} (default; pass --margin/--flat to override)`
+    );
   } else {
     const r = await prompts(
       {
         type: "select",
         name: "pricingMode",
-        message: "Pricing model",
+        message: "Pricing model (for chat/completion models)",
         choices: [
           { title: "Margin on upstream cost (paid gateways)", value: "margin" },
           { title: "Flat per 1K tokens (local / free models)", value: "flat" },
@@ -504,10 +442,7 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
         cancel
       );
       marginPercent = pct;
-      // Warn loudly if margin mode is paired with a provider we don't
-      // have an upstream pricing resolver for. Without one, every
-      // settle falls through to fallbackPerRequestUsdc and the
-      // marginPercent value is effectively ignored.
+      // Margin without a resolver uses the fixed fallback, so warn that the percentage cannot apply.
       if (!providerSupportsMargin(slug)) {
         console.log(
           `\n  ⚠ margin mode against provider "${slug}" has no upstream pricing resolver yet.`
@@ -538,34 +473,74 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
     }
   }
 
-  // "Driven mode" detection: the caller passed enough flags that interactive
-  // prompts should be suppressed and reasonable defaults assumed. Computed
-  // here (rather than near its only other use further down) because the
-  // fallback-cents resolution below needs it to decide whether to prompt or
-  // use the default.
-  const drivenMode = !!(
-    flags.provider ||
-    flags.models ||
-    flags.margin !== undefined ||
-    flags.flat !== undefined
-  );
+  // Optional per-image overlay: a subset of --models priced per returned image
+  // instead of by token count. --image-price and --image-models must be given
+  // together (no default) so no chat model is silently reclassified as image-priced.
+  let usdcPerImage: number | undefined;
+  let pricedImageModels: string[] = [];
+  if (flags.imagePrice !== undefined || flags.imageModels !== undefined) {
+    if (flags.imagePrice === undefined) {
+      throw new Error("--image-models requires --image-price");
+    }
+    pricedImageModels = (flags.imageModels ?? "")
+      .split(",")
+      .map((s: string) => s.trim())
+      .filter(Boolean);
+    if (pricedImageModels.length === 0) {
+      throw new Error(
+        "--image-price requires --image-models (comma-separated subset of --models priced per image)"
+      );
+    }
+    usdcPerImage = flags.imagePrice;
+    console.log(
+      `  image pricing: $${usdcPerImage}/image for ${pricedImageModels.join(", ")} (from --image-price/--image-models)`
+    );
+  } else if (!drivenMode) {
+    const { wantsImagePricing } = await prompts(
+      {
+        type: "confirm",
+        name: "wantsImagePricing",
+        message: "Price any models per returned image (e.g. image generation/editing)?",
+        initial: false,
+      },
+      cancel
+    );
+    if (wantsImagePricing) {
+      const { imgModels } = await prompts(
+        {
+          type: "text",
+          name: "imgModels",
+          message: "Image model id(s) to price per image (comma-separated, subset of the models above)",
+          validate: (v: string) => (v.trim().length > 0 ? true : "required"),
+        },
+        cancel
+      );
+      pricedImageModels = String(imgModels)
+        .split(",")
+        .map((s: string) => s.trim())
+        .filter(Boolean);
+      const { usd } = await prompts(
+        {
+          type: "number",
+          name: "usd",
+          message: "Flat price per returned image (USD, e.g. 0.02)",
+          initial: 0.02,
+          float: true,
+          increment: 0.005,
+          validate: (v: number) => (v >= 0 ? true : "must be >= 0"),
+        },
+        cancel
+      );
+      usdcPerImage = usd;
+    }
+  }
+  for (const imageModel of pricedImageModels) {
+    if (!models.includes(imageModel)) {
+      throw new Error(`--image-models entry "${imageModel}" must also be listed in --models`);
+    }
+  }
 
-  // Fallback price per request, in CENTS USD. Charged when token-count
-  // pricing isn't available (margin mode, or flat mode when total_tokens is
-  // missing). Default of 1 cent ($0.01) is sane for almost every operator.
-  //
-  // This prompt was historically a footgun: in driven-mode the agent shell
-  // can't reliably answer an interactive number prompt, and the unit string
-  // "cents USD" was easy to misread. A `10000` typo here produces a $100
-  // fallback per inference and an operator advertising $100 per 1K tokens.
-  // The mitigations below are layered defense:
-  //
-  //   1. In driven mode, skip the prompt and default to 1 cent silently.
-  //      Operators with non-default needs pass --fallback-cents.
-  //   2. Hard cap at 1000 cents ($10) without an explicit acknowledgement.
-  //      Anything above that is almost certainly a unit-confusion typo.
-  //   3. Print a confirmation summary showing the USD equivalent so the
-  //      operator can catch a mistake visually before serve goes live.
+  // Fallback pricing is cents-based; driven mode defaults to one cent and guards large values.
   const FALLBACK_HARD_CAP_CENTS = 1000;
   let fallbackCents: number;
   if (flags.fallbackCents !== undefined) {
@@ -605,11 +580,7 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
   }
   const fallbackPerRequestUsdc = Math.round(fallbackCents * 10_000); // cents → base units
 
-  // ── Network + infra URLs ───────────────────────────────────────────────
-  // When the agent drove the provider/models/pricing decisions via flags, the
-  // remaining infra URLs are almost always defaults — skip those prompts to
-  // avoid an unattended setup hanging on them. Reuses the drivenMode flag
-  // computed above for the fallback-cents resolution.
+  // Flag-driven setup accepts default infrastructure URLs instead of blocking on prompts.
   const driven = drivenMode;
 
   // When re-running setup with an existing config, default infra settings to
@@ -626,14 +597,8 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
 
   let relayUrl = relayDefault;
   let indexerUrl = indexerDefault;
-  // Facilitator is protocol infrastructure, not an operator concern. Setup
-  // always writes the protocol default URL and never a per-operator API key,
-  // regardless of what the existing config has. Auto-migrates any operator
-  // whose config predates the protocol facilitator (e.g., the CDP default
-  // URL from earlier alpha builds) — silent except for a single-line notice.
-  //
-  // --facilitator-url is honored only as a dev/test escape hatch (staging
-  // facilitator, protocol-upgrade migration windows). Not in --help.
+  // Setup writes the protocol facilitator without an operator API key.
+  // The hidden URL override is reserved for development and migrations.
   let facilitatorUrl = flags.facilitatorUrl ?? DEFAULT_FACILITATOR_URL;
   const facilitatorKey = "";
   if (
@@ -678,45 +643,56 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
     label = r.label;
   }
 
-  // ── Upstream API key encryption-at-rest ────────────────────────────────
-  // The wallet keystore on this host is already passphrase-protected. Offer
-  // the operator the choice of binding the upstream API key (OpenRouter,
-  // Anthropic, Hermes, …) to the same passphrase. Defaults to ON because
-  // the passphrase is already entered on every `serve` start — turning it on
-  // adds zero new prompts but defends against a stolen ~/.halo/.
-  //
-  // If we preserved an existing key (operator re-ran setup without changing
-  // the upstream credential), keep it in its on-disk form and bypass the
-  // encryption decision — we'd have to decrypt to re-encrypt, requiring the
-  // passphrase. Idempotent for unattended-mode re-runs.
+  // New API keys may reuse the wallet passphrase; preserved keys retain their stored representation.
   const finalApiKey =
     preservedApiKey !== undefined
       ? preservedApiKey
       : await resolveApiKeyStorage(apiKey, flags, passphrase, driven);
 
-  // ── Multi-provider: append this provider to an existing operator ──────────
-  // Preserves the wallet and every other provider; only adds (or
-  // updates, if the same slug) one entry. The new provider keeps its own
-  // pricing block so a confidential gateway can carry a different margin than
-  // a commodity one. Each inference then routes to whichever provider serves
-  // the requested model.
+  // Upsert one provider and its pricing while preserving wallet and other provider entries.
   if (flags.addProvider) {
     if (!existingConfig) {
       throw new Error(
         "--add-provider needs an existing operator config. Run `halo setup` once to create the operator, then `halo setup --add-provider --provider <slug> --api-key <key>` to add another gateway."
       );
     }
+    // Start from the existing provider list (normalizing a single-provider
+    // config to a list), then replace-or-append this slug.
+    const existingList = configProviders(existingConfig).map((p) => ({ ...p }));
+    const at = existingList.findIndex((p) => p.slug === slug);
+    const existingProvider = at >= 0 ? existingList[at] : undefined;
+    // Re-running --add-provider without --image-* must not drop the
+    // existing per-image overlay.
+    const imageOverlayGivenThisRun =
+      flags.imagePrice !== undefined || flags.imageModels !== undefined;
+    const preserved = imageOverlayGivenThisRun ? undefined : existingProvider;
+    const effectiveImageModels = imageOverlayGivenThisRun
+      ? pricedImageModels
+      : preserved?.imageModels ?? [];
+    const effectiveUsdcPerImage = imageOverlayGivenThisRun
+      ? usdcPerImage
+      : preserved?.pricing?.usdcPerImage ?? usdcPerImage;
+    // Preserve existing token pricing only for an existing-slug re-run
+    // without --margin/--flat; a brand-new slug uses the driven-mode default,
+    // never the primary's cfg.pricing (which would misprice the gateway).
+    const tokenPricingGivenThisRun = flags.margin !== undefined || flags.flat !== undefined;
+    const effectiveTokenPricing =
+      !tokenPricingGivenThisRun && existingProvider
+        ? existingProvider.pricing ?? existingConfig.pricing
+        : { mode: pricingMode, marginPercent, flatUsdcPer1KTokens };
     const newProvider: ProviderConfig = {
       slug,
       baseUrl,
       apiKey: finalApiKey,
       models,
-      pricing: { mode: pricingMode, marginPercent, flatUsdcPer1KTokens },
+      ...(effectiveImageModels.length > 0 ? { imageModels: effectiveImageModels } : {}),
+      pricing: {
+        mode: effectiveTokenPricing.mode,
+        marginPercent: effectiveTokenPricing.marginPercent,
+        flatUsdcPer1KTokens: effectiveTokenPricing.flatUsdcPer1KTokens,
+        usdcPerImage: effectiveUsdcPerImage,
+      },
     };
-    // Start from the existing provider list (normalizing a single-provider
-    // config to a list), then replace-or-append this slug.
-    const existingList = configProviders(existingConfig).map((p) => ({ ...p }));
-    const at = existingList.findIndex((p) => p.slug === slug);
     if (at >= 0) existingList[at] = newProvider;
     else existingList.push(newProvider);
 
@@ -759,11 +735,13 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
       baseUrl,
       apiKey: finalApiKey,
       models,
+      ...(pricedImageModels.length > 0 ? { imageModels: pricedImageModels } : {}),
     },
     pricing: {
       mode: pricingMode,
       marginPercent,
       flatUsdcPer1KTokens,
+      usdcPerImage,
       fallbackPerRequestUsdc,
     },
     facilitator: {
@@ -785,16 +763,18 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
       `  API key:     ${isEncryptedSecret(finalApiKey) ? "encrypted (AES-256-GCM, keystore passphrase)" : "plaintext (file 0600)"}`
     );
   }
-  // Show the pricing in human-readable USD. This is the visual sanity check
-  // for the cents-vs-dollars unit confusion the prompt has historically been
-  // vulnerable to. An operator scanning the summary line will notice a $100
-  // fallback or a $5/1K-tokens flat rate immediately, before serve goes live.
+  // Show dollar equivalents so unit mistakes remain visible before serving.
   const pricingDetail =
     pricingMode === "flat"
       ? `flat $${(flatUsdcPer1KTokens ?? 0).toFixed(4)}/1K tokens`
       : `margin ${marginPercent ?? 0}% over upstream`;
   const fallbackDetail = `fallback $${(fallbackCents / 100).toFixed(2)}/request`;
   console.log(`  Pricing:     ${pricingDetail}; ${fallbackDetail}`);
+  if (pricedImageModels.length > 0) {
+    console.log(
+      `  Image:       $${(usdcPerImage ?? 0).toFixed(4)}/image for ${pricedImageModels.join(", ")}`
+    );
+  }
   console.log(`  Relay:       ${relayUrl}`);
   console.log(`  Indexer:     ${indexerUrl}`);
   console.log(`  Facilitator: ${facilitatorUrl}`);
@@ -807,8 +787,6 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
   }
   console.log(`  Config:      ${configPath()}\n`);
 
-  // Wallet funding hint: ETH is only needed if the operator wants to move
-  // their earned USDC. x402 settlement gas is paid by the facilitator (CDP).
   console.log(`  Next:`);
   console.log(`    halo serve        — connect to relay and start earning`);
   if (consume) {
@@ -816,9 +794,7 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
   }
   console.log(`    halo link         — pair with a dashboard wallet\n`);
 
-  // ── Optional: chain into pairing-code generation. We already know the
-  // passphrase here, so we don't need to re-prompt the operator (which would
-  // be a poor experience inside an agent-driven flow).
+  // Reuse the available passphrase for optional pairing.
   if (flags.withPairing) {
     await emitPairingCode(cfg, passphrase);
   }
@@ -832,18 +808,7 @@ function safeLoadConfig(): HaloConfig | null {
   }
 }
 
-/**
- * Read the wallet address from a keystore-only state (no config.json).
- *
- * Called when we detect ~/.halo/keystore.json exists but config.json
- * doesn't — almost always the fingerprint of a setup that crashed after the
- * wallet was generated but before saveConfig ran. v3 ethers keystores store
- * the address in cleartext under the top-level `address` field; we only need
- * that to identify which wallet the keystore belongs to, never to unlock it.
- *
- * Returns the 0x-prefixed checksum-case-insensitive address, or null if the
- * keystore is missing, malformed, or lacks a usable address field.
- */
+/** Read the public address from a keystore-only recovery state, or return `null`. */
 function readOrphanedKeystoreAddress(): string | null {
   const ksPath = defaultKeystorePath();
   if (!existsSync(ksPath)) return null;
@@ -862,10 +827,7 @@ async function runWalletWizard(
   noPassphrase: boolean = false,
   driven: { walletMode?: "generate" | "import"; keyBackup?: "file" | "skip" } = {}
 ): Promise<{ address: string; encryptedJson: string; passphrase: string }> {
-  // Resolve the wallet mode without a prompt when driven/headless: an explicit
-  // --wallet-mode wins; otherwise unattended mode (no passphrase, no human)
-  // defaults to "generate" so the canonical agent command completes. Only fall
-  // back to the interactive select when none of that applies.
+  // Explicit wallet mode wins; unattended mode generates; only interactive setup prompts.
   let walletMode = driven.walletMode;
   if (!walletMode && noPassphrase) walletMode = "generate";
   if (!walletMode) {
@@ -889,12 +851,7 @@ async function runWalletWizard(
 
   let passphrase: string;
   if (noPassphrase) {
-    // Unattended mode — generate the keystore with an empty passphrase so
-    // `halo serve` can start without a human at the keyboard. The key
-    // in the file is then recoverable in seconds by anyone who can read it,
-    // so the security model collapses to "trust the host's user account and
-    // file mode 0600". Print the warning loudly so the operator is never in
-    // any doubt about what they just signed up for.
+    // Empty-passphrase unattended keystores rely entirely on host access controls and mode 0600.
     console.log("\n  ━━━ Unattended mode (--no-wallet-passphrase) ━━━");
     console.log("  The wallet keystore will be created with an EMPTY passphrase.");
     console.log("  Anyone with read access to the keystore file can extract the");
@@ -934,10 +891,7 @@ async function runWalletWizard(
     const generated = await generateAndEncrypt(passphrase);
     console.log(`\n✓ Generated wallet: ${generated.address}`);
 
-    // M-01: do NOT print private key to stdout. Write it to a 0600 file the
-    // user can move/shred, or skip entirely — the encrypted keystore already
-    // holds the key. Driven/headless: honor --key-backup, else default to "skip"
-    // in unattended mode (don't write a plaintext copy with no human present).
+    // Never print private keys; optional plaintext backups use mode 0600 and default off unattended.
     let backupMode = driven.keyBackup;
     if (!backupMode && noPassphrase) backupMode = "skip";
     if (!backupMode) {
@@ -1017,11 +971,7 @@ async function emitPairingCode(
   cfg: HaloConfig,
   passphrase: string | undefined
 ): Promise<void> {
-  // When setup preserved an existing wallet, we don't have the passphrase in
-  // hand — prompt for it now. Skipped in the generate/import path because the
-  // user just typed it 30 seconds ago. Note `passphrase === ""` is a *known*
-  // empty passphrase (unattended mode) and must fall straight through to
-  // loadWallet — only `undefined` means "we don't have it".
+  // Empty is a known unattended passphrase; only undefined requires prompting.
   if (passphrase === undefined) {
     const r = await prompts({
       type: "password",
@@ -1038,7 +988,7 @@ async function emitPairingCode(
   const wallet = await loadWallet(cfg.operator.keystorePath, passphrase!);
   const code = generatePairingCode();
   const nonce = "0x" + randomBytes(32).toString("hex");
-  const expiresAt = Math.floor(Date.now() / 1000) + 300; // 5 min
+  const expiresAt = Math.floor(Date.now() / 1000) + 300;
   const message = `halo-link-init:${wallet.address.toLowerCase()}:${code}:${nonce}:${expiresAt}`;
   const operatorSig = await wallet.signMessage(message);
 
@@ -1084,22 +1034,7 @@ function generatePairingCode(): string {
   return groups.join("-");
 }
 
-/**
- * Decide how the upstream API key lands in config.json.
- *
- * Inputs the caller already resolved:
- *   - `apiKey`: the plaintext key the user just typed or passed via --api-key
- *               (undefined for ollama/lmstudio/openclaw).
- *   - `flags.encryptApiKey`: explicit yes/no from --encrypt-api-key / --no-...
- *   - `walletPassphrase`: the keystore passphrase if we have it in hand
- *                         (true for generate/import path; undefined when we
- *                          preserved an existing wallet — we prompt late).
- *   - `driven`: true when the agent passed enough flags that we shouldn't
- *               drop into an interactive question.
- *
- * Output: either a plaintext string (legacy / opted-out) or an EncryptedSecret
- * envelope. Returning undefined means "no key" (free providers).
- */
+/** Store a provider key as plaintext, encrypted envelope, or `undefined` according to resolved setup inputs. */
 async function resolveApiKeyStorage(
   apiKey: string | undefined,
   flags: SetupFlags,

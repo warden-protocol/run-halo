@@ -36,10 +36,6 @@ export async function loadWallet(
   const abs = resolve(keystorePath);
   if (!existsSync(abs)) throw new Error(`Keystore not found at ${abs}`);
   const json = readFileSync(abs, "utf-8");
-  // `Wallet.createRandom()` (generateAndEncrypt) returns an HDNodeWallet — it has
-  // a mnemonic, which `encrypt()` bakes into the keystore — so fromEncryptedJson
-  // faithfully reconstructs an HDNodeWallet, NOT a Wallet. Both extend BaseWallet
-  // and sign identically; the old `instanceof Wallet` guard rejected every wallet
-  // this tool generates itself, dead-ending serve/status/pay on a fresh install.
+  // Generated mnemonic keystores decrypt to HDNodeWallet; both wallet classes are valid BaseWallet signers.
   return Wallet.fromEncryptedJson(json, passphrase);
 }

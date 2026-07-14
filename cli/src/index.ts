@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import { cmdSetup } from "./commands/setup";
 import { cmdServe } from "./commands/serve";
-import { cmdPay } from "./commands/pay";
 import { cmdConsume } from "./commands/consume";
 import { cmdLink } from "./commands/link";
 import { cmdStatus } from "./commands/status";
@@ -12,16 +11,12 @@ import { HALO_VERSION } from "./version";
 import { checkAndApplyUpdate, restartIntoManagedInstall } from "./update";
 import { shouldPreRunUpdate } from "./commandGating";
 
-// Fail-fast Node version check. The CLI uses Node 20+ APIs (notably
-// scrypt with maxmem parameters; on Node 18 the maxmem boundary crashes
-// the API-key encryption step mid-setup, leaving an orphaned keystore).
-// Bail with a clear actionable error before any command runs — including
-// --help so the user sees this immediately on a fresh install.
+// Fail before dispatch because unsupported Node versions can corrupt setup state mid-command.
 const NODE_MAJOR = parseInt(process.versions.node.split(".")[0], 10);
 if (NODE_MAJOR < 20) {
   process.stderr.write(
     `halo requires Node 20+ (you have ${process.versions.node}).\n` +
-      `Earlier versions crash mid-setup on scrypt memory limits (see PR #8).\n` +
+      `Earlier versions crash mid-setup on scrypt memory limits.\n` +
       `Install Node 20 or later: https://nodejs.org\n` +
       `If you use nvm: nvm install 20 && nvm use 20\n`
   );
@@ -36,8 +31,10 @@ halo — Halo operator + payer CLI
     --base-url <url>           override (or set, for "custom") provider base URL
     --api-key <key>            provider API key (paid providers only)
     --models <a,b,c>           comma-separated model ids to advertise
-    --margin <n>               margin pricing: n% over upstream (e.g. 20)
-    --flat <n>                 flat pricing: USD per 1K tokens (e.g. 0.0005)
+    --image-models <a,b,c>     subset of --models priced per returned image (requires --image-price)
+    --margin <n>               margin pricing: n% over upstream (e.g. 20) — chat/completion models
+    --flat <n>                 flat pricing: USD per 1K tokens (e.g. 0.0005) — chat/completion models
+    --image-price <n>          per-image overlay: USD per returned image (e.g. 0.02); requires --image-models; composes with --margin/--flat
     --add-provider             ADD this provider to an existing operator (front several gateways at once, e.g. openrouter + near) instead of replacing it
     --fallback-cents <n>       fallback price per request in cents (default 1)
     --label <name>             label shown in the League
@@ -56,26 +53,24 @@ halo — Halo operator + payer CLI
     --consume-port <n>         local consume endpoint port (default 8799)
 
   halo run                                         connect to relay, start earning
-  halo pay [--model M] [--prompt P]                test x402 payment as consumer
-  halo consume [flags]                             run Halo as a local OpenAI-compatible endpoint
+  halo consume [flags]                             run a vault-backed local OpenAI-compatible endpoint
     --port <n>                 port to listen on (default 8799)
     --host <addr>              bind address (default 127.0.0.1)
     --detach                   self-daemonize: start the server in its own session (survives the launching agent/gateway restarting) and return. Idempotent — no-ops if one's already serving. Needs an unattended keystore or HALO_PASSPHRASE.
     --api-key <secret>         require this bearer token on /v1/* requests
     --max-usdc <n>             per-request spend ceiling in USD (default 0.10)
     --keystore <path>          wallet keystore to pay from (default: operator keystore)
-    --confidential             route only to TEE operators + E2E-encrypt the prompt to the enclave (operator can't read it); full hardware (Intel TDX + NVIDIA) attestation verification + response-signature verification
+    --confidential             route only to TEE operators, encrypt to the reported TEE key, and require the response signer to match the attested signer
     --tee-base-url <url>       TEE provider attestation endpoint (default https://cloud-api.near.ai/v1)
     --no-attestation-verify    DEBUG: skip the DCAP hardware attestation check (signature-only); not recommended
     --no-e2e                   disable operator end-to-end encryption (sends the prompt to the relay in plaintext)
     --budget-usdc <n>          cumulative spend cap (USD) for this run — bounds an agent's total spend across many requests (0/unset = uncapped). Raise at runtime: POST /v1/budget {"limitUsd": N}
     --budget-warn-pct <0-1>    warn (X-Halo-Budget-Warning header) at this fraction of the budget (default 0.8)
-    --vault                    use the HaloVault rail: pay the ACTUAL tokens each request used (settle-actual), not the prompt-blind flat exact-mode quote. Needs a vault deposit.
     --vault-deposit <usd>      auto-managed: top the vault up to this from the wallet's USDC on startup (needs a little ETH for the deposit tx)
     --vault-reserve-multiple <n>  reserve this many requests' worth per operator (default 5); lower it when fanning out across many operators so reservations don't lock the whole deposit (#367)
     --session-key <wallet|browser>  vault session-key scheme (default wallet): "wallet" signs receipts with this wallet; "browser" derives the SAME session key the Halo web app uses, so one wallet works on both surfaces (#426)
-    --force                    override the stale-vault guard (#392): proceed with vault fund-moving paths even when this build's pinned vault differs from the facilitator's live one
-  halo vault [--session-key <wallet|browser>] <status|deposit <usd>|withdraw>   manage the HaloVault balance for consume --vault (settle-actual billing)
+    --force                    force unrelated supported behavior; cannot bypass vault identity checks
+  halo vault [--session-key <wallet|browser>] <status|deposit <usd>|withdraw>   manage the HaloVault balance for consume (settle-actual billing)
   halo link                                        pair with a dashboard wallet
   halo status                                      show wallet + league stats
   halo doctor [--json]                             diagnose install state, local endpoints, config, reachability
@@ -148,10 +143,7 @@ async function main(): Promise<void> {
     }
   }
 
-  // Recognized short-lived commands update before doing real work; long-running
-  // commands (run/serve/consume) update on their own heartbeat, and an unknown
-  // command must fall through to "unknown command" without triggering an update
-  // cycle. See shouldPreRunUpdate.
+  // Pre-run updates apply only to recognized short-lived commands; daemons self-update.
   if (shouldPreRunUpdate(cmd)) {
     const result = await checkAndApplyUpdate();
     if (result.kind === "applied") restartIntoManagedInstall(false);
@@ -164,8 +156,13 @@ async function main(): Promise<void> {
         baseUrl: typeof flags["base-url"] === "string" ? flags["base-url"] : undefined,
         apiKey: typeof flags["api-key"] === "string" ? flags["api-key"] : undefined,
         models: typeof flags.models === "string" ? flags.models : undefined,
+        imageModels: typeof flags["image-models"] === "string" ? flags["image-models"] : undefined,
         margin: typeof flags.margin === "string" ? Number(flags.margin) : undefined,
         flat: typeof flags.flat === "string" ? Number(flags.flat) : undefined,
+        imagePrice:
+          typeof flags["image-price"] === "string"
+            ? Number(flags["image-price"])
+            : undefined,
         addProvider: flags["add-provider"] === true,
         fallbackCents:
           typeof flags["fallback-cents"] === "string"
@@ -221,13 +218,6 @@ async function main(): Promise<void> {
     case "run":
     case "serve":
       return cmdServe();
-    case "pay":
-      return cmdPay({
-        model: typeof flags.model === "string" ? flags.model : undefined,
-        prompt: typeof flags.prompt === "string" ? flags.prompt : undefined,
-        maxTokens:
-          typeof flags["max-tokens"] === "string" ? Number(flags["max-tokens"]) : undefined,
-      });
     case "consume":
       return cmdConsume({
         port: typeof flags.port === "string" ? Number(flags.port) : undefined,
@@ -242,7 +232,6 @@ async function main(): Promise<void> {
         budgetUsdc: typeof flags["budget-usdc"] === "string" ? Number(flags["budget-usdc"]) : undefined,
         budgetWarnPct:
           typeof flags["budget-warn-pct"] === "string" ? Number(flags["budget-warn-pct"]) : undefined,
-        vault: flags.vault === true,
         vaultDeposit:
           typeof flags["vault-deposit"] === "string" ? Number(flags["vault-deposit"]) : undefined,
         vaultReserveMultiple:

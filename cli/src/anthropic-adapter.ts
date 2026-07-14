@@ -1,14 +1,3 @@
-/**
- * Anthropic Messages API ↔ OpenAI chat-completions translator.
- *
- * The relay speaks one wire format to consumers — OpenAI's
- * /v1/chat/completions JSON shape. Anthropic's API (used by the `anthropic`
- * and `claude-code` provider slugs) speaks /v1/messages with a system field
- * separated out, content as a list of blocks, and `usage: {input_tokens, output_tokens}`.
- *
- * This module bridges the two so an operator backed by Anthropic looks
- * identical on the wire to one backed by OpenAI.
- */
 import { ANTHROPIC_API_VERSION } from "./providers";
 
 interface OpenAIChatMessage {
@@ -46,11 +35,7 @@ const FINISH_REASON_MAP: Record<string, string> = {
   tool_use: "tool_calls",
 };
 
-/**
- * Translate an OpenAI chat-completions request body into the Anthropic
- * Messages API shape. System messages are merged into the top-level `system`
- * field (Anthropic doesn't accept role:"system" inside `messages`).
- */
+/** Translate OpenAI chat input to Anthropic Messages, lifting system messages to `system`. */
 export function chatCompletionsToAnthropicRequest(
   body: OpenAIChatRequest
 ): Record<string, unknown> {
@@ -88,11 +73,7 @@ export function chatCompletionsToAnthropicRequest(
   return out;
 }
 
-/**
- * Translate an Anthropic Messages response into an OpenAI chat-completion.
- * Concatenates text blocks (ignores tool_use blocks — we surface the text
- * only) and synthesizes a `usage.total_tokens` from input+output.
- */
+/** Translate Anthropic text blocks and usage to an OpenAI chat completion; tool-use blocks are omitted. */
 export function anthropicResponseToChatCompletion(
   resp: AnthropicResponse,
   requestedModel: string | undefined

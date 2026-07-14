@@ -1,16 +1,3 @@
-/**
- * Make Node's global `fetch` honor HTTP(S) proxy environment variables.
- *
- * Node's built-in fetch (undici) does NOT read HTTPS_PROXY/HTTP_PROXY on its own
- * — so on a host that requires an outbound proxy, every fetch (relay calls AND
- * the Intel PCS attestation-collateral fetch behind confidential mode) silently
- * fails to connect. Operators/agents reasonably expect the standard env vars to
- * "just work", especially for a daemon installed by `halo service`.
- *
- * Call once at process start. No-op when no proxy var is set, so it adds nothing
- * for the common case; only when a proxy is configured do we load undici and set
- * it as the global dispatcher.
- */
 export function installProxyFromEnv(): void {
   const e = process.env;
   const proxy = e.HTTPS_PROXY || e.https_proxy || e.HTTP_PROXY || e.http_proxy || e.ALL_PROXY || e.all_proxy;

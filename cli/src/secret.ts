@@ -1,26 +1,9 @@
-/**
- * Symmetric encryption for sensitive config values (currently: upstream
- * provider API keys).
- *
- * Same threat model as the wallet keystore: protect a stolen
- * `~/.halo/` directory against an attacker who has the files but
- * not the operator's passphrase. We piggyback on the keystore passphrase
- * the operator already enters to unlock the wallet on `halo serve`,
- * so encryption-at-rest adds zero new prompts at runtime.
- *
- * Scheme: scrypt(passphrase, salt, 32 bytes) → AES-256-GCM(plaintext, iv).
- * scrypt parameters are gentle on purpose (N=2^15 ≈ 16 MB / ~100 ms on a
- * laptop) — strong enough to make offline brute force expensive, weak
- * enough not to wedge a serve startup.
- */
 import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from "crypto";
 
 export interface EncryptedSecret {
   /** Schema version. Bump if KDF or cipher changes. */
   v: 1;
-  /** "aes-256-gcm" — explicit so a future swap is unambiguous. */
   alg: "aes-256-gcm";
-  /** "scrypt" — explicit so a future swap is unambiguous. */
   kdf: "scrypt";
   /** Hex-encoded scrypt salt. */
   salt: string;
@@ -36,12 +19,7 @@ const SCRYPT_N = 1 << 15; // CPU/memory cost — ~100 ms on a 2020 laptop
 const SCRYPT_R = 8;
 const SCRYPT_P = 1;
 const KEY_LEN = 32;
-// Memory required by scrypt = 128 * N * r bytes.
-// With N=2^15 and r=8 → exactly 32 MB. Node's `scryptSync` default `maxmem`
-// is 32 MB and OpenSSL enforces it as strict `<`, so the call fails at the
-// boundary on Node 18 (and on some 20.x builds). We pass an explicit
-// `maxmem` with 2× headroom so the call succeeds on any conformant build
-// without compromising the memory-hardness of the KDF.
+// The selected scrypt parameters need exactly Node's default maxmem; explicit headroom avoids a strict-bound failure.
 const SCRYPT_MAXMEM = 128 * SCRYPT_N * SCRYPT_R * 2;
 
 function deriveKey(passphrase: string, salt: Buffer): Buffer {

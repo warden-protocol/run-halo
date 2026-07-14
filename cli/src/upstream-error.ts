@@ -11,12 +11,7 @@ export interface NormalizedUpstreamError {
 const CREDIT_EXHAUSTED_RE =
   /credit|quota|billing|purchase more credits|insufficient[_ -]?quota|insufficient[^.]{0,80}balance|account[^.]{0,80}balance/i;
 
-// Some providers (notably Anthropic) report an exhausted account as a 400 with
-// a credit/balance message rather than a 402. A bare 400 is normally a
-// consumer-fault bad request, so we match ONLY unambiguous account-credit
-// phrasing here (much narrower than CREDIT_EXHAUSTED_RE) to avoid tripping on an
-// ordinary 400 whose text merely mentions "credit" or "balance". Exported so
-// the operator's startup key probe classifies 400s identically.
+// Some providers report exhausted credit as 400; match only unambiguous account-level wording.
 export const CREDIT_EXHAUSTED_400_RE =
   /credit[^.]{0,80}balance[^.]{0,80}too low|balance[^.]{0,80}too low|purchase more credits|out of credits|insufficient[_ -]?quota/i;
 
@@ -106,12 +101,7 @@ export function operatorErrorResponse(): NormalizedUpstreamError {
   };
 }
 
-/**
- * Strip a consumer-facing upstream error body down to a fixed safe shape.
- * Preserves the standard OpenAI-error fields (`message`, `type`, `code`) when
- * present and short. Provider-side infrastructure failures are handled by
- * normalizeUpstreamError and never leak their provider text to consumers.
- */
+/** Retain bounded OpenAI `message`/`type`/`code` fields for consumer-safe errors. */
 function sanitizeConsumerUpstreamError(parsed: unknown, status: number): unknown {
   const src = (parsed as { error?: unknown })?.error;
   const safe: { message: string; type?: string; code?: string } = {

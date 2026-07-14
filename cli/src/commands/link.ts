@@ -1,11 +1,3 @@
-/**
- * halo link — pair this operator with a dashboard wallet via short code.
- *
- * Generates a 9-digit code (XXX-XXX-XXX), signs the attestation with the
- * operator key, POSTs /link/init to the indexer, and prints the code. The
- * human then opens the dashboard, pastes the code, signs from their wallet,
- * and the indexer finalizes the link.
- */
 import prompts from "prompts";
 import { randomBytes, randomInt } from "crypto";
 import { loadConfig } from "../config";
@@ -22,13 +14,7 @@ function generateCode(): string {
 export async function cmdLink(): Promise<void> {
   const cfg = loadConfig();
 
-  // Passphrase resolution mirrors consume/serve/vault. An empty passphrase is a
-  // valid, supported keystore (unattended mode / `--no-wallet-passphrase`), so
-  // it must unlock and print the code — not exit early. We therefore skip the
-  // prompt entirely when noPassphrase is set, and in the prompt path we only
-  // bail on a real cancel (Ctrl-C/Esc → onCancel), NOT on an empty submit
-  // (Enter with no input → passphrase ""). If a non-empty passphrase was in
-  // fact required, loadWallet throws a clear decryption error below.
+  // Empty passphrases are valid unattended keystores; distinguish empty submit from prompt cancellation.
   let passphrase = "";
   if (cfg.operator.noPassphrase) {
     passphrase = "";
@@ -50,7 +36,7 @@ export async function cmdLink(): Promise<void> {
 
   const code = generateCode();
   const nonce = "0x" + randomBytes(32).toString("hex");
-  const expiresAt = Math.floor(Date.now() / 1000) + 300; // 5 min
+  const expiresAt = Math.floor(Date.now() / 1000) + 300;
 
   const message = `halo-link-init:${wallet.address.toLowerCase()}:${code}:${nonce}:${expiresAt}`;
   const operatorSig = await wallet.signMessage(message);

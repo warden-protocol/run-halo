@@ -27,7 +27,7 @@ import {
 import { statSync } from "node:fs";
 import { configDir } from "./config";
 
-const CANONICAL_REMOTE = "https://github.com/warden-protocol/run-halo.git";
+const CANONICAL_REMOTE = "https://github.com/warden-protocol/halo.git";
 
 function markManaged(dir: string): void {
   mkdirSync(path.join(dir, ".git"), { recursive: true });
@@ -81,8 +81,6 @@ test("ensureEntryExecutable restores the exec bit tsc drops on the bin entry", (
 
     ensureEntryExecutable(entry);
 
-    // Executable for every class that could already read it, so the global
-    // `halo` bin symlink can invoke it instead of failing with EACCES.
     assert.equal(statSync(entry).mode & 0o111, 0o111);
     assert.equal(statSync(entry).mode & 0o444, 0o444, "read bits preserved");
   } finally {
@@ -135,9 +133,6 @@ test("failed staged promotion restores the live checkout", () => {
 
 test("promotion surfaces both errors and the recovery path when rollback also fails", () => {
   const home = mkdtempSync(path.join(tmpdir(), "halo-promote-double-fail-test-"));
-  // Patch the shared node:fs singleton the module calls through, so the rollback
-  // renameSync itself fails — the only deterministic way to exercise the double
-  // failure. Restored in finally.
   const fs = require("node:fs");
   const realRename = fs.renameSync;
   try {
@@ -149,16 +144,14 @@ test("promotion surfaces both errors and the recovery path when rollback also fa
     let calls = 0;
     fs.renameSync = (from: string, to: string) => {
       calls += 1;
-      if (calls === 1) return realRename(from, to); // root -> previous (real)
-      throw new Error(`boom-${calls}`); // staging->root (2) then rollback previous->root (3)
+      if (calls === 1) return realRename(from, to);
+      throw new Error(`boom-${calls}`);
     };
 
     assert.throws(
       () => promoteStagedInstall(path.join(home, "missing-staging"), root, "cli-v1.0.0"),
       (err: unknown) => {
         const m = (err as Error).message;
-        // Original error preserved (not masked by the rollback's own error),
-        // rollback error included, and the manual-recovery pointer present.
         return (
           /rollback also failed/.test(m) &&
           /install\.sh/.test(m) &&
@@ -174,8 +167,6 @@ test("promotion surfaces both errors and the recovery path when rollback also fa
 });
 
 test("readUpdateDiagnostics ignores a stale update.log on an unmanaged checkout", () => {
-  // Override HOME so configDir() points at a throwaway dir with a stale log but
-  // no managed checkout (no ~/.halo/src/.halo-managed) => unmanaged.
   const home = mkdtempSync(path.join(tmpdir(), "halo-diag-test-"));
   const realHome = process.env.HOME;
   try {
@@ -196,7 +187,6 @@ test("readUpdateDiagnostics ignores a stale update.log on an unmanaged checkout"
     const diag = readUpdateDiagnostics();
     assert.equal(diag.managed, false);
     assert.equal(diag.lastUpdateStatus, "skipped-unmanaged");
-    // The stale log must NOT leak a target/appliedAt that implies this checkout auto-updated.
     assert.equal(diag.lastUpdateTarget, null);
     assert.equal(diag.lastUpdateAppliedAt, null);
     assert.equal(diag.lastUpdateError, null);
@@ -234,7 +224,6 @@ test("atomic contender lock tolerates empty dirs, blocks peers, and reclaims dea
   const lockDir = path.join(home, "update.lock");
   const isAlive = (pid: number) => pid === process.pid;
   try {
-    // A crash after creating the directory but before publishing a contender is harmless.
     mkdirSync(lockDir);
     const first = tryAcquireUpdateLock(lockDir, { isAlive });
     assert.ok(first);

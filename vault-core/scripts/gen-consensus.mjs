@@ -52,9 +52,7 @@ if (process.argv.includes("--check")) {
   let committed = "";
   try {
     committed = readFileSync(outputPath, "utf8");
-  } catch {
-    // Report the same actionable failure as stale output.
-  }
+  } catch {}
   if (committed !== generated) {
     throw new Error(
       `Generated consensus constants are stale. Run: cd vault-core && npm run generate (${fileURLToPath(outputPath)})`
