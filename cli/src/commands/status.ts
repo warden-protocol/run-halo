@@ -1,4 +1,4 @@
-import { loadConfig, configProviders, allConfiguredModels } from "../config";
+import { loadConfig, configProviders, allConfiguredModels, imagePriceForModel } from "../config";
 
 export async function cmdStatus(): Promise<void> {
   const cfg = loadConfig();
@@ -18,6 +18,14 @@ export async function cmdStatus(): Promise<void> {
       ? ` (${cfg.pricing.marginPercent}%)`
       : ` ($${cfg.pricing.flatUsdcPer1KTokens}/1K tokens)`
   }`);
+  const imageEntries = providers.flatMap((p) =>
+    (p.imageModels ?? []).map((m) => [m, imagePriceForModel(cfg, m)] as const)
+  );
+  if (imageEntries.length > 0) {
+    console.log(
+      `  Image:     ${imageEntries.map(([m, price]) => `${m} ($${price}/image)`).join(", ")}`
+    );
+  }
 
   try {
     const res = await fetch(`${cfg.indexerUrl.replace(/\/+$/, "")}/points/${cfg.operator.address}`);

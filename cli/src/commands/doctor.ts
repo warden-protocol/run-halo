@@ -1,15 +1,3 @@
-/**
- * halo doctor — diagnostic report.
- *
- * Single command an agent or operator runs to learn what state this
- * install is in. Replaces the ad-hoc `ls ~/.halo/`, `curl ...`,
- * `node --version`, etc. calls the skill currently has to invent.
- *
- * Two output modes:
- *   default     — human-readable, with ✓/⚠/✖ markers for each check
- *   --json      — structured output for agent parsing. Schema is stable:
- *                 every field is always present, even when null.
- */
 import { existsSync, readFileSync, statSync } from "fs";
 import path from "path";
 import { configDir, configPath, defaultKeystorePath, loadConfig } from "../config";
@@ -22,15 +10,11 @@ export interface DoctorOptions {
 interface EndpointProbe {
   /** Slug used for `--provider`. */
   slug: string;
-  /** Human label shown in the text report. */
   label: string;
-  /** Where the probe hit. */
   url: string;
   /** True if we got a 2xx within the timeout. */
   reachable: boolean;
-  /** Number of models advertised, if we could parse the response. */
   modelCount: number | null;
-  /** Error string if unreachable; null otherwise. */
   error: string | null;
 }
 
@@ -39,7 +23,6 @@ interface DoctorReport {
   generatedAt: string;
   install: {
     nodeVersion: string;
-    /** Path to the running CLI entry. */
     entry: string;
   };
   update: UpdateDiagnostics;
@@ -63,15 +46,12 @@ interface DoctorReport {
     modelCount: number | null;
   };
   serve: {
-    /** PID file presence + liveness check via process.kill(pid, 0). */
     pidFilePresent: boolean;
     pidFileStale: boolean;
     pid: number | null;
     /** True when the process named in serve.pid is alive. */
     running: boolean;
-    /** Path to serve.log if present. */
     logPath: string | null;
-    /** Last few non-empty lines of serve.log for quick diagnostics. */
     recentLogLines: string[];
   };
   endpoints: EndpointProbe[];
@@ -432,7 +412,7 @@ function printText(r: DoctorReport): void {
     hints.push("Relay unreachable — operator can't serve until it's back.");
   } else if (r.serve.pidFileStale) {
     hints.push(
-      "Previous serve process crashed (stale pid file). Check `serve.log` recent lines above for the cause, then restart with `halo serve` (now reconnects forever by default — see PR #10)."
+      "Previous serve process crashed (stale pid file). Check `serve.log` recent lines above for the cause, then restart with `halo serve`."
     );
   } else if (r.provider.slug && r.wallet.address && !r.serve.running) {
     hints.push("Looks healthy. Run `halo serve` to start earning.");

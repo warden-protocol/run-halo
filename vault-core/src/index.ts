@@ -31,15 +31,7 @@ export const ERC20_ABI = [
   "function balanceOf(address) view returns (uint256)",
 ];
 
-/**
- * EIP-712 domain for HaloVault Reserve/Receipt signatures. `verifyingContract`
- * defaults to the consensus-pinned `VAULT_ADDRESS` — the single pinned deployment
- * the SDK and CLI always target. It is a parameter (not hardcoded) so a frontend
- * build pointed at a different deployment (`HALO_VAULT_ADDRESS`) signs against the
- * SAME vault its deposits/reserves/reads use; a mismatch would revert on-chain as
- * `BadSignature` (invariant #5/#7). The domain NAME/VERSION and the typed structs
- * stay consensus-pinned regardless of address.
- */
+/** Build the HaloVault EIP-712 domain for the vault being targeted. */
 export function vaultDomain(
   chainId: number | bigint,
   verifyingContract: string = VAULT_ADDRESS
@@ -52,12 +44,7 @@ export function vaultDomain(
   };
 }
 
-/**
- * Canonical display formatter for a USDC base-unit amount (6-dp). The single
- * definition every money-path surface must use instead of re-deriving
- * `(Number(base) / 1e6).toFixed(4)` — the "import, do not fork" rule applies to
- * amount display too, so logs and UI can't render the same amount two ways.
- */
+/** Format six-decimal USDC base units for display. */
 export function formatUsdcBase(
   base: bigint,
   opts: { withDollarSign?: boolean } = {}
@@ -85,28 +72,10 @@ export interface VaultState {
 
 export const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 
-/**
- * Registration status of a consumer's on-chain session key relative to the
- * address that will actually sign reserves + receipts (#426).
- *  - "unregistered": no session key set yet (zero) — the next deposit registers
- *    one, so this is not (yet) a problem.
- *  - "match": the registered key IS the signing address — receipts will redeem.
- *  - "mismatch": a DIFFERENT key is registered, so every receipt the signer
- *    produces recovers to the wrong address and redeems revert BadSignature
- *    forever. The operator can still be made to SERVE (the relay is
- *    payment-blind), so it does real work it can never collect.
- */
+/** Relationship between the registered session key and the intended signer. */
 export type SessionKeyStatus = "unregistered" | "match" | "mismatch";
 
-/**
- * Classify an on-chain `sessionKey[consumer]` against the address that signs
- * reserves + receipts for that consumer (#426). The headless CLI/SDK signs
- * DIRECTLY with the wallet key (signer == session key == consumer), so `expected`
- * is the wallet address; the browser signs with its derived in-browser sub-wallet,
- * so `expected` is that sub-wallet address. `deposit` registers a session key only
- * ONCE (HaloVault.sol), so a surface that used a different key first strands every
- * later receipt. Case-insensitive — addresses arrive checksummed or lowercased.
- */
+/** Compare a registered session key with the signer, case-insensitively. */
 export function classifySessionKey(
   registered: string,
   expected: string
@@ -117,30 +86,18 @@ export function classifySessionKey(
   return r === e ? "match" : "mismatch";
 }
 
-/**
- * The canonical message a main wallet EIP-191 personal_signs to derive its Halo
- * session sub-wallet (v2). This is a CROSS-SURFACE CONTRACT: the browser
- * (`frontend/src/lib/subKey.ts`) and the CLI (`halo consume --vault --session-key
- * browser`) both derive from THIS exact message, so one wallet reproduces the SAME
- * session key on both surfaces. Changing a single byte derives a DIFFERENT address
- * and strands any funds/registration under the current key — never edit it without
- * a detect-and-migrate plan (see the note in subKey.ts).
- */
+/** Changing these bytes changes every derived address and requires migration. */
 export const SUBKEY_DERIVATION_MESSAGE =
   "Halo — create in-browser agent sub-wallet (v2).\n" +
   "Signing derives a wallet the agent uses to pay for tools autonomously.\n" +
   "The agent can ONLY spend USDC you load into this sub-wallet.";
 
-/** The exact bytes to personal_sign to derive the session sub-wallet: the
- *  canonical message, then the lowercased owner (main wallet) address. */
+/** Exact message signed to derive an owner's session sub-wallet. */
 export function subKeyDerivationMessage(owner: string): string {
   return `${SUBKEY_DERIVATION_MESSAGE}\n${owner.toLowerCase()}`;
 }
 
-/** Derive the session sub-wallet's 32-byte private key from the owner's
- *  personal_sign signature over `subKeyDerivationMessage(owner)`. Deterministic —
- *  the same wallet always reproduces the same key. Feed the result to `new
- *  Wallet(pk)`. */
+/** Derive the deterministic session private key from the owner's signature. */
 export function deriveSubKeyPrivateKey(signature: string): string {
   return keccak256(getBytes(signature));
 }
@@ -167,10 +124,26 @@ export function priceTokens(usdPerMtok: number, tokens: number): bigint {
   return (microUsd + denom - 1n) / denom;
 }
 
-/** Add headroom for announce-cache staleness and consumer/operator token-estimate
- * differences. Reservations lock (rather than spend) this margin, and unused
- * headroom is reclaimable after expiry. Rounded up so tiny estimates still gain
- * at least one base unit of protection. */
+/** USD per image to USDC base-unit cost, rounded up. */
+export function priceImages(usdcPerImage: number, imageCount: number): bigint {
+  if (!Number.isFinite(usdcPerImage) || usdcPerImage < 0) {
+    throw new Error(`priceImages: price must be a finite non-negative number (got ${usdcPerImage})`);
+  }
+  if (!Number.isFinite(imageCount) || imageCount < 0) {
+    throw new Error(`priceImages: count must be a finite non-negative number (got ${imageCount})`);
+  }
+  const priceBase = parseUnits(usdcPerImage.toFixed(PRICE_DP), PRICE_DP);
+  if (usdcPerImage > 0 && priceBase === 0n) {
+    throw new Error(
+      `priceImages: price ${usdcPerImage} USDC/image is positive but rounds to 0 at ${PRICE_DP} decimals — refusing to serve unpriced`
+    );
+  }
+  const scaledUsd = BigInt(Math.max(0, Math.ceil(imageCount))) * priceBase;
+  const denom = 10n ** BigInt(PRICE_DP - 6);
+  return (scaledUsd + denom - 1n) / denom;
+}
+
+/** Add reservation headroom, rounding up to whole base units. */
 export function withReservationMargin(
   estimatedCost: bigint,
   marginBps: bigint = RESERVATION_PRICE_MARGIN_BPS
@@ -183,39 +156,7 @@ export function withReservationMargin(
   return (estimatedCost * (bps + marginBps) + bps - 1n) / bps;
 }
 
-/**
- * Classify an operator reservation for the consumer's ensure/top-up path (#473).
- *
- * `HaloVault.reserve()` caps a reservation's expiry at `created + maxReserveTtl`
- * (its absolute lifetime), and only ADDS to `locked` — it never opens a fresh
- * cycle while `locked > 0`. So a top-up can revive an expired reservation only
- * while the lifetime cap is far enough in the future for the reserve tx to mine
- * BEFORE the cap; once the cap is at/behind now, the extra reserve just strands
- * more funds behind an expiry that can't move. Detect that so the client reclaims
- * (or waits) instead of pouring funds into a dead reservation.
- *
- *  - "live_or_revivable": funds aren't locked, or the lifetime cap still leaves
- *    `capSafetyMarginSec` of headroom — a top-up extends expiry to
- *    `min(now+ttl, cap)`, whether the reservation is already expired (revive) or
- *    merely inside its pre-expiry refresh margin (refresh). PREFERRED over reclaim
- *    whenever the cap allows it: it's a plain reserve that doesn't depend on
- *    `releaseExpired`, which is gated by sequencer health and can revert
- *    `GracePeriodNotOver` for up to one `redeemGrace` after a sequencer recovery
- *    even when the reservation is already past its own `expiry + redeemGrace`.
- *  - "serve_as_is": the cap is too close for a top-up to advance expiry, but the
- *    reservation is STILL LIVE (`now < expiry`). A refresh here would only strand
- *    funds behind an expiry that can't move, so don't top up — keep using the
- *    current reservation until it expires (then it becomes reclaimable/wedged).
- *  - "reclaimable": expired, cap too close/past to safely revive, AND past
- *    `expiry + redeemGrace`, so `releaseExpired` opens a fresh cycle — the only
- *    safe recovery in this state.
- *  - "wedged": expired within `expiry + redeemGrace` and the cap is too close (or
- *    past), so it can neither be safely revived nor reclaimed (`NotExpired`).
- *    Surface the wait.
- *
- * `capSafetyMarginSec` is the headroom a top-up needs between now and the cap for
- * its reserve tx to mine while still live; callers pass their mine/refresh margin.
- */
+/** Classify reservation revival; `capSafetyMarginSec` reserves mining time. */
 export function classifyReservationRevival(
   ops: { locked: bigint; expiry: bigint; created: bigint },
   maxReserveTtl: bigint,
@@ -223,28 +164,14 @@ export function classifyReservationRevival(
   nowSec: bigint,
   capSafetyMarginSec: bigint = 0n
 ): "live_or_revivable" | "serve_as_is" | "reclaimable" | "wedged" {
-  // Nothing locked (or a never-set reservation) → the normal reserve path handles it.
   if (ops.locked === 0n || ops.expiry === 0n) return "live_or_revivable";
-  // If the lifetime cap still leaves safe headroom, a plain top-up advances expiry
-  // — PREFER that over reclaim (no `releaseExpired` round-trip; immune to its
-  // sequencer-health gate, which can revert `GracePeriodNotOver` even past
-  // `expiry + redeemGrace`). Checked BEFORE both the expiry and grace tests so a
-  // reservation inside its refresh margin — not yet expired — is judged by whether
-  // a top-up can actually MOVE expiry, not merely by "still live".
   if (ops.created + maxReserveTtl > nowSec + capSafetyMarginSec) return "live_or_revivable";
-  // Cap too close/past → a top-up can't move expiry to a safely-live value.
-  // Still live → keep serving on the current reservation; a refresh would be a dead
-  // top-up that strands the added funds behind an unmovable expiry (#481 review).
   if (nowSec < ops.expiry) return "serve_as_is";
-  // Expired: reclaim once past the grace window (releaseExpired opens a fresh
-  // cycle); until then it's wedged (can neither revive nor reclaim — `NotExpired`).
   if (nowSec > ops.expiry + redeemGrace) return "reclaimable";
   return "wedged";
 }
 
-/** Read the operator gate's exact reservation requirement from a 402 body.
- * Accepts either decoded JSON or raw response text, and rejects malformed,
- * non-decimal, zero, or unrelated error envelopes. */
+/** Parse a positive reservation requirement from a typed 402 error. */
 export function requiredVaultReservationBase(payload: unknown): bigint | null {
   let decoded = payload;
   if (typeof decoded === "string") {
@@ -283,66 +210,29 @@ export function estimateTokens(messages: unknown, maxTokens: number): number {
   return Math.ceil(chars / 4) + maxTokens;
 }
 
-/**
- * Heuristic detection of reasoning/thinking models. No model-catalog flag exists —
- * providers' `/models` endpoints report pricing + context length only, not whether a
- * model reasons — so this is name-matched (case-insensitive). Reasoning families emit
- * reasoning/thinking tokens that a small `max_tokens` does NOT bound, so their
- * billable completion routinely exceeds a `max_tokens`-sized ceiling (issue #421).
- *
- * Only models that reason BY DEFAULT need to match here. Opt-in reasoning params
- * (`reasoning_effort`, `reasoning`, `thinking`) are NOT in the operator's outbound
- * sanitizer allowlist (`cli/src/sanitize.ts`), so a model that reasons only when
- * asked never receives the flag through Halo → never emits reasoning tokens → no
- * over-serve to size for (that's why e.g. Claude extended-thinking is intentionally
- * absent here). Deliberately errs toward NOT flagging: a false negative just falls
- * back to the post-serve cap (`collectibleServeAmount`), and a false positive only
- * over-reserves a little headroom (reclaimable) — both safe. The o-series digit range
- * is open-ended so new numbers (o6, o7…) keep matching as OpenAI ships them.
- */
+/** Heuristically detect model families that reason by default. */
 export function isReasoningModel(model: string): boolean {
   const m = (model || "").toLowerCase();
   if (!m) return false;
   return (
-    /(^|[/:._-])o[1-9]\d*([._:\-]|$)/.test(m) || // OpenAI o-series (o1, o3-mini, o4-mini, o5, o6…, :latest, _mini)
-    m.includes("gpt-5") || // GPT-5 family reasons by default
-    m.includes("gemini-2.5") || // Gemini 2.5 Flash/Pro think by default
-    m.includes("grok-4") || // xAI Grok 4 reasons by default
-    m.includes("grok-3-mini") || // xAI Grok 3 Mini reasons by default
+    /(^|[/:._-])o[1-9]\d*([._:\-]|$)/.test(m) ||
+    m.includes("gpt-5") ||
+    m.includes("gemini-2.5") ||
+    m.includes("grok-4") ||
+    m.includes("grok-3-mini") ||
     m.includes("reasoner") ||
     m.includes("reasoning") ||
-    m.includes("deepseek-r") || // DeepSeek R1 / R1-distill
-    m.includes("magistral") || // Mistral reasoning
-    m.includes("qwq") || // Qwen QwQ
-    m.includes("thinking") // explicit "…-thinking" model-id variants
+    m.includes("deepseek-r") ||
+    m.includes("magistral") ||
+    m.includes("qwq") ||
+    m.includes("thinking")
   );
 }
 
-/**
- * Minimum completion-token ceiling assumed for a reasoning model when the caller's
- * `max_tokens` is smaller. Reasoning tokens routinely reach several thousand
- * regardless of a tiny `max_tokens`, so sizing the reservation/gate to just
- * `max_tokens` systematically undercollects (issue #421). A fixed constant (not env)
- * so the consumer's reserve sizing and the operator's serve gate always derive the
- * SAME ceiling — a divergence would let the gate exceed the reserve (invariant #5/#7).
- */
+/** Shared minimum completion ceiling for models that reason by default. */
 export const REASONING_COMPLETION_FLOOR = 8192;
 
-/**
- * Completion-token ceiling used to SIZE the vault reservation (consumer) and the
- * operator's serve gate (issue #421). For a reasoning model it floors the caller's
- * output budget to `REASONING_COMPLETION_FLOOR` so the reserve/gate cover the
- * reasoning tokens `max_tokens` never bounds; for any other model it is the caller's
- * own budget unchanged. Honors an explicit `max_completion_tokens` (the
- * reasoning-inclusive limit) when it is larger than `max_tokens`. SHARED so the
- * consumer and operator derive the identical ceiling — `reserve ≥ gate` then holds
- * without a reserve-and-replay round trip (invariant #5/#7).
- *
- * This sizes the ceiling only; it does NOT enforce it at the upstream provider call
- * (that would need per-provider `max_completion_tokens` / thinking-budget handling and
- * risks truncating output). The post-serve cap (`collectibleServeAmount`, operator
- * side) remains the backstop when a reasoning model still exceeds this headroom.
- */
+/** Size a completion ceiling without changing the upstream request limit. */
 export function completionCeilingTokens(
   model: string,
   maxTokens: number,
@@ -389,9 +279,7 @@ export interface AdvanceCumulativeReceiptParams {
   priorCeiling?: bigint;
 }
 
-/** Advance a cumulative receipt without ever decreasing it or exceeding the
- * highest reservation ceiling observed for the cycle. Shared by headless and
- * browser consumers so concurrent top-ups have identical accounting. */
+/** Advance a cumulative receipt without exceeding its observed cycle ceiling. */
 export function advanceCumulativeReceipt(
   p: AdvanceCumulativeReceiptParams
 ): { cumulative: bigint; ceiling: bigint } {
@@ -411,8 +299,7 @@ export type RedeemErrorClass = "collected" | "uncollectable" | "transient";
 export function classifyRedeemError(error: string): RedeemErrorClass {
   if (/StaleReceipt|ExceedsReservation|already\s+(redeemed|collected|settled)/i.test(error))
     return "collected";
-  // `superseded` covers a receipt dropped for a cycle the chain has moved past
-  // (see VaultConsumeClient.attemptRedeem) — it can never redeem, so don't retry.
+  // A receipt from a superseded cycle can never redeem.
   if (/BadSignature|NoSessionKey|does not recover|superseded/i.test(error))
     return "uncollectable";
   return "transient";
@@ -444,10 +331,29 @@ export function resolveModelPriceUsdPerMtok(
   return match && pricing ? pricing[match] * 1000 : null;
 }
 
+export function resolveImagePriceUsdc(
+  imageModels: string[] | undefined,
+  imagePricing: Record<string, number> | undefined,
+  requested: string
+): number | null {
+  const exact = imagePricing?.[requested];
+  if (typeof exact === "number" && Number.isFinite(exact) && exact >= 0) return exact;
+  const match = (imageModels ?? []).find(
+    (model) =>
+      matchesModel(model, requested) &&
+      typeof imagePricing?.[model] === "number" &&
+      Number.isFinite(imagePricing[model]) &&
+      imagePricing[model] >= 0
+  );
+  return match && imagePricing ? imagePricing[match] : null;
+}
+
 export interface VaultOperatorAdvertisement {
   address: string;
   models: string[];
   pricing?: Record<string, number>;
+  imageModels?: string[];
+  imagePricing?: Record<string, number>;
   tee?: boolean;
   teeModels?: string[];
   vaultPayments?: boolean;
@@ -457,6 +363,11 @@ export interface VaultOperatorAdvertisement {
 export interface VaultOperatorCandidate<T extends VaultOperatorAdvertisement> {
   operator: T;
   priceUsdPerMtok: number;
+}
+
+export interface VaultImageOperatorCandidate<T extends VaultOperatorAdvertisement> {
+  operator: T;
+  priceUsdcPerImage: number;
 }
 
 export type VaultOperatorSelectionReason =
@@ -480,13 +391,13 @@ export interface VaultOperatorSelection<T extends VaultOperatorAdvertisement> {
   reason: VaultOperatorSelectionReason;
 }
 
-/**
- * Canonical vault-operator selector shared by browser, SDK, and CLI consumers.
- * A vault request must pin a positively-priced operator that advertises the
- * on-chain reservation gate. The reason code preserves why selection failed so
- * callers can surface an actionable diagnostic instead of flattening every
- * failure into "no priced operator".
- */
+export interface VaultImageOperatorSelection<T extends VaultOperatorAdvertisement> {
+  selected: VaultImageOperatorCandidate<T> | null;
+  candidates: Array<VaultImageOperatorCandidate<T>>;
+  reason: VaultOperatorSelectionReason;
+}
+
+/** Select a positively priced, vault-capable operator and retain failure detail. */
 export function selectVaultOperatorFromList<T extends VaultOperatorAdvertisement>(
   operators: T[],
   model: string,
@@ -583,6 +494,78 @@ export function selectVaultOperatorFromList<T extends VaultOperatorAdvertisement
   return { selected, candidates: withinPrice, reason: "selected" };
 }
 
+/** Select an image-capable vault operator by EXACT imageModels match (never fuzzy matchesModel); missing positive image price is unselectable, never falls back to token pricing (invariant #7). */
+export function selectVaultImageOperatorFromList<T extends VaultOperatorAdvertisement>(
+  operators: T[],
+  model: string,
+  opts: {
+    requireAddress?: string;
+    randomizeCheapestTies?: boolean;
+  } = {}
+): VaultImageOperatorSelection<T> {
+  const want = opts.requireAddress?.toLowerCase();
+  const addressPool = want
+    ? operators.filter((operator) => operator.address.toLowerCase() === want)
+    : operators;
+  if (want && addressPool.length === 0) {
+    return { selected: null, candidates: [], reason: "pinned_not_found" };
+  }
+
+  const modelPool = addressPool.filter((operator) => operator.imageModels?.includes(model));
+  if (modelPool.length === 0) {
+    return { selected: null, candidates: [], reason: "no_operator" };
+  }
+
+  const vaultPool = modelPool.filter((operator) => operator.vaultPayments === true);
+  if (vaultPool.length === 0) {
+    return {
+      selected: null,
+      candidates: [],
+      reason: want ? "pinned_not_vault_capable" : "no_vault_operator",
+    };
+  }
+
+  const resolved = vaultPool.map((operator) => ({
+    operator,
+    priceUsdcPerImage:
+      typeof operator.imagePricing?.[model] === "number" &&
+      Number.isFinite(operator.imagePricing[model]) &&
+      operator.imagePricing[model] >= 0
+        ? operator.imagePricing[model]
+        : null,
+  }));
+  const positivelyPriced = resolved.filter(
+    (candidate): candidate is VaultImageOperatorCandidate<T> =>
+      candidate.priceUsdcPerImage !== null && candidate.priceUsdcPerImage > 0
+  );
+  if (positivelyPriced.length === 0) {
+    const free = resolved.some((candidate) => candidate.priceUsdcPerImage === 0);
+    return {
+      selected: null,
+      candidates: [],
+      reason: free
+        ? want
+          ? "pinned_free_model"
+          : "free_model"
+        : want
+          ? "pinned_unpriced"
+          : "unpriced",
+    };
+  }
+
+  const withinPrice = positivelyPriced.sort(
+    (a, b) => a.priceUsdcPerImage - b.priceUsdcPerImage
+  );
+  const best = withinPrice[0].priceUsdcPerImage;
+  const cheapest = withinPrice.filter(
+    (candidate) => candidate.priceUsdcPerImage <= best + 1e-12
+  );
+  const selected = opts.randomizeCheapestTies
+    ? cheapest[Math.floor(Math.random() * cheapest.length)]
+    : cheapest[0];
+  return { selected, candidates: withinPrice, reason: "selected" };
+}
+
 export function decodeBase64(value: string): string {
   const buffer = (
     globalThis as typeof globalThis & {
@@ -633,12 +616,7 @@ export function parseVaultSettlement(headers: Headers, body: string): ParsedVaul
     const amount = settlementAmount(header);
     if (amount !== null) return { present: true, amount };
   }
-  // Scan the body for a halo-settlement frame regardless of `content-type`. An
-  // operator streams its settlement in the body when headers were already sent,
-  // but `content-type` is operator-controlled — gating the scan on it lets an
-  // operator suppress its OWN payment by mislabeling the response (invariant #3),
-  // charging the consumer nothing for served work (invariant #4). A non-SSE body
-  // simply yields no halo-settlement frame here, so scanning it is harmless.
+  // Content-Type is operator-controlled, so settlement discovery cannot trust it.
   for (const { event, data } of parseSseDataFrames(body)) {
     if (event !== "halo-settlement" || data.length === 0) continue;
     try {
@@ -647,7 +625,7 @@ export function parseVaultSettlement(headers: Headers, body: string): ParsedVaul
       const amount = settlementAmount(envelope.paymentResponse);
       if (amount !== null) return { present: true, amount };
     } catch {
-      // Ignore malformed events and keep looking for a valid settlement.
+      // Malformed frames do not invalidate a later settlement.
     }
   }
   return { present: false, amount: 0n };
@@ -680,25 +658,20 @@ export function usageTokensFromSseBody(body: string): number | undefined {
       const reported = reportedUsageTokens(parsed.usage);
       if (reported !== undefined) tokens = reported;
     } catch {
-      // Ignore non-JSON frames such as settlement events.
+      // Non-JSON frames may coexist with usage frames.
     }
   }
   return tokens;
 }
 
-/**
- * Reported usage tokens from a served response body, independent of the
- * operator-controlled `content-type` (invariant #3): read the body as a JSON
- * `usage` object, else as an SSE stream whose trailing frame carries `usage`.
- * Returns undefined when neither is present (an unmeterable response).
- */
+/** Read reported usage from JSON or SSE without trusting Content-Type. */
 export function usageTokensFromBody(body: string): number | undefined {
   try {
     const parsed = JSON.parse(body) as { usage?: unknown };
     const reported = reportedUsageTokens(parsed.usage);
     if (reported !== undefined) return reported;
   } catch {
-    // Not a JSON body — fall through to SSE frame parsing below.
+    // The body may be SSE.
   }
   return usageTokensFromSseBody(body);
 }
@@ -708,24 +681,11 @@ export interface VaultMeterResult {
   cost: bigint;
   /** The operator provided an explicit settlement (header or halo-settlement frame). */
   settled: boolean;
-  /** cost derived from a settlement OR reported usage (false = unmeterable). */
+  /** Whether settlement or reported usage supplied the cost. */
   metered: boolean;
 }
 
-/**
- * Decide the redeemable cost for a served vault response — the ONE metering rule
- * every consumer (SDK `payInference`, CLI `vaultSend`, frontend hook) shares so
- * they can't drift into per-copy over/under-charge bugs. Preference order, none
- * of which trusts an operator-controlled header:
- *   1. explicit settlement — PAYMENT-RESPONSE header, or a halo-settlement frame
- *      anywhere in the body (`parseVaultSettlement` scans regardless of content-type);
- *   2. otherwise reported usage read from the body (`usageTokensFromBody`), priced
- *      at the operator's gate price;
- *   3. otherwise unmeterable → cost 0n, metered:false. The caller must NOT charge
- *      and should log it (invariant #2: never guess the pre-request estimate).
- * Metering is content-type independent by design (invariants #3/#4). The caller
- * still gates recordAndRedeem / `paid` on `res.ok`.
- */
+/** Prefer an explicit settlement, then reported usage; never estimate a charge. */
 export function meterVaultResponse(
   headers: Headers,
   body: string,
@@ -740,11 +700,5 @@ export function meterVaultResponse(
   return { cost: 0n, settled: false, metered: false };
 }
 
-/**
- * Total send attempts for one vault inference when the operator gate keeps
- * advancing its required reservation between reserve and replay (invariant #5):
- * the first attempt plus up to N-1 reserve-and-replay retries. Bounded so a gate
- * that advances every round can't loop forever, and shared so the SDK, CLI, and
- * frontend consumer copies retry identically.
- */
+/** Bound reserve-and-replay attempts when the operator ceiling advances. */
 export const MAX_VAULT_RESERVATION_ATTEMPTS = 3;

@@ -1,10 +1,3 @@
-/**
- * Restart-durable redeem spec (issue #369 follow-up). A pending redeem persisted
- * by one process must be resumed and settled by the next — so a consumer restart
- * never abandons the served tail.
- *
- * Run: node --require ts-node/register --test src/vaultRedeemDurable.test.ts
- */
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -45,8 +38,6 @@ const client = (facUrl: string, store: string) => {
     relayUrl: "",
     pendingStorePath: store,
   });
-  // Stale-cycle guard reads on-chain ops() before posting; no live RPC here, so
-  // return current-cycle state (no-op guard) and drive drops via the facilitator.
   c.readOps = async () => OPS;
   return c;
 };
@@ -55,7 +46,6 @@ test("a pending redeem persists to disk and a fresh client resumes + settles it"
   const store = path.join(os.tmpdir(), `halo-pending-${process.pid}-${Date.now()}.json`);
   const down = await mockFacilitator(() => ({ status: 500, body: { error: "down" } }));
   try {
-    // Process A: facilitator down → redeem fails transiently → stays pending + persisted.
     const a = client(down.url, store);
     a.recordAndRedeem(OP, OPS, 0n, 1_000n);
     await a.flushRedeems();
@@ -68,8 +58,6 @@ test("a pending redeem persists to disk and a fresh client resumes + settles it"
     down.close();
   }
 
-  // Process B: NEW client (simulating a restart) with the same store + a healthy
-  // facilitator. resumePendingRedeems() must load and settle it.
   const up = await mockFacilitator(() => ({ status: 200, body: { hash: "0xok" } }));
   try {
     const b = client(up.url, store);
@@ -86,7 +74,6 @@ test("a pending redeem persists to disk and a fresh client resumes + settles it"
     try {
       fs.unlinkSync(store);
     } catch {
-      /* ignore */
     }
   }
 });
@@ -99,13 +86,12 @@ test("no store path → in-memory only, no file written (back-compat)", async ()
       rpcUrl: "http://127.0.0.1:1",
       chainId: 8453,
       relayUrl: "",
-      // no pendingStorePath
     });
-    c.readOps = async () => OPS; // no-op stale-cycle guard (no live RPC)
+    c.readOps = async () => OPS;
     c.recordAndRedeem(OP, OPS, 0n, 1_000n);
     await c.flushRedeems();
     assert.equal(c.pendingRedeemCount, 1, "still retries in memory");
-    c.resumePendingRedeems(); // no-op without a store path — must not throw
+    c.resumePendingRedeems();
   } finally {
     up.close();
   }
@@ -113,12 +99,10 @@ test("no store path → in-memory only, no file written (back-compat)", async ()
 
 test("stale persisted entry (cycle moved on) is dropped on resume, not retried forever", async () => {
   const store = path.join(os.tmpdir(), `halo-pending-stale-${process.pid}-${Date.now()}.json`);
-  // Hand-write a persisted entry for an old cycle.
   fs.writeFileSync(
     store,
     JSON.stringify([{ key: `${OP}:1`, operator: OP, cumulative: "1000", signature: "0xsig", cycle: "1" }])
   );
-  // Facilitator rejects with a terminal BadSignature (cycle moved on).
   const fac = await mockFacilitator(() => ({ status: 400, body: { error: "vault submit failed: BadSignature()" } }));
   try {
     const c = client(fac.url, store);
@@ -131,19 +115,17 @@ test("stale persisted entry (cycle moved on) is dropped on resume, not retried f
     try {
       fs.unlinkSync(store);
     } catch {
-      /* ignore */
     }
   }
 });
 
 test("a truncated/corrupt pending file is skipped, not fatal, on resume", async () => {
   const store = path.join(os.tmpdir(), `halo-pending-corrupt-${process.pid}-${Date.now()}.json`);
-  // Simulate a torn write from a crash mid-persist: valid-prefix, truncated JSON.
   fs.writeFileSync(store, '[{"key":"0x2222:1","operator":"0x2222","cumu');
   const fac = await mockFacilitator(() => ({ status: 200, body: { hash: "0xok" } }));
   try {
     const c = client(fac.url, store);
-    c.resumePendingRedeems(); // must not throw on a corrupt file
+    c.resumePendingRedeems();
     assert.equal(c.pendingRedeemCount, 0, "corrupt file yields no resumed redeems");
     await c.flushRedeems();
     assert.equal(fac.count(), 0, "nothing submitted from a corrupt file");
@@ -152,7 +134,6 @@ test("a truncated/corrupt pending file is skipped, not fatal, on resume", async 
     try {
       fs.unlinkSync(store);
     } catch {
-      /* ignore */
     }
   }
 });
@@ -171,7 +152,6 @@ test("persist is atomic — no leftover .tmp file after a redeem is queued", asy
     try {
       fs.unlinkSync(store);
     } catch {
-      /* ignore */
     }
   }
 });

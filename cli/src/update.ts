@@ -18,11 +18,8 @@ import { promisify } from "node:util";
 import { configDir } from "./config";
 import { HALO_VERSION } from "./version";
 
-export const CANONICAL_REMOTE = "https://github.com/warden-protocol/run-halo.git";
-// How long a resolved "latest tag" check is cached in ~/.halo/update-check.json
-// (and how long a failed update to a given target is not retried). Short enough
-// that a running `halo serve`/`consume` picks up a freshly-pushed cli-v* tag
-// within a few minutes rather than up to a full check window.
+export const CANONICAL_REMOTE = "https://github.com/warden-protocol/halo.git";
+// Cache successful checks and failed-target backoff for the same short interval.
 export const UPDATE_CHECK_TTL_MS = 5 * 60 * 1000;
 // Grace window after a detached relaunch spawns, to catch a child that launches
 // but then crashes on module load (missing/corrupt entry) before we exit 0.
@@ -123,13 +120,7 @@ function appendUpdateLog(entry: UpdateLogEntry): void {
   }
 }
 
-// NOTE: this parser has a hand-maintained sibling in relay/src/version-gate.ts
-// (`parseLeadingSemver` + `compareVersions`-equivalent), which is more lenient
-// (it also accepts a bare `X.Y.Z` for the operator-supplied floor). Any change
-// to the `cli-vX.Y.Z` tag scheme — extra version component, a different
-// git-describe `-N-g<sha>[-dirty]` suffix — must be mirrored on both sides or
-// the relay's minimum-version gate silently miscompares. Consolidating the two
-// into one shared parser is tracked with the #390-style extraction.
+// Keep tag parsing compatible with relay/src/version-gate.ts.
 export function parseCliTag(version: string | null | undefined): [number, number, number] | null {
   if (!version) return null;
   const match = version.match(/^cli-v(\d+)\.(\d+)\.(\d+)(?:$|-)/);
@@ -313,13 +304,7 @@ function holderFiles(dir: string): string[] {
   }
 }
 
-/**
- * Publish a complete, uniquely-named contender and acquire only when no other
- * live contender exists. The temp file is renamed into the contender set only
- * after its metadata is complete, so a crash can never leave an empty lock.
- * Contenders never delete one another's live paths, eliminating stale-lock CAS
- * races; simultaneous contenders either elect one safely or all stand down.
- */
+/** Atomically publish a complete contender and acquire only when no other live contender exists. */
 export function tryAcquireUpdateLock(
   dir = lockPath(),
   opts: LockOptions = {}
@@ -433,14 +418,7 @@ function isOwnedManagedTree(dir: string): boolean {
   return sentinel?.remote === CANONICAL_REMOTE && existsSync(path.join(dir, ".git"));
 }
 
-/**
- * `tsc` writes `dist/index.js` as a plain 0644 file. The global `halo` bin is a
- * symlink straight to that file (npm's bin link is created once at install time
- * and never re-run by an update), so unless we restore the executable bit here
- * the very next `halo` invocation after an update dies with "permission denied".
- * npm link normally does this chmod; a rename-based promotion does not, so we do
- * it ourselves — preserving read bits, adding execute wherever read is granted.
- */
+/** Restore executable bits after rename-based promotion because `tsc` emits the linked CLI entry as 0644. */
 export function ensureEntryExecutable(entry: string): void {
   const mode = statSync(entry).mode;
   // Mirror read → execute: 0o444 (r for u/g/o) >> 2 == 0o111 (x for u/g/o).
@@ -481,10 +459,7 @@ export function promoteStagedInstall(staging: string, root: string, oldVersion: 
     try {
       renameSync(previous, root);
     } catch (rollbackErr) {
-      // The live checkout was already moved to `previous` and could not be put
-      // back — `root` is now missing, so every subsequent `halo` invocation
-      // fails to resolve cli/dist/index.js. Don't let the rollback's own error
-      // mask the original failure; surface both plus the manual recovery path.
+      // Preserve both the promotion and rollback errors when the live root could not be restored.
       throw new Error(
         `halo update failed and automatic rollback also failed; the managed ` +
           `install at ${root} is now broken (its previous copy is at ${previous}). ` +
@@ -494,10 +469,7 @@ export function promoteStagedInstall(staging: string, root: string, oldVersion: 
     }
     throw err;
   }
-  // Best-effort snapshot pruning. The new checkout is already live, so this
-  // whole block — including the readdirSync that drives it — is wrapped: a
-  // failure here must never turn a successful atomic promotion into a reported
-  // (and logged) failure.
+  // Snapshot pruning is best-effort and cannot invalidate a completed promotion.
   try {
     for (const name of readdirSync(installHome)) {
       if (name.startsWith("src-prev-") && path.join(installHome, name) !== previous) {
@@ -624,11 +596,7 @@ export function readUpdateDiagnostics(): UpdateDiagnostics {
   const cache = readCache();
   let last: UpdateLogEntry | null = null;
   let lastAppliedAt: string | null = null;
-  // Only trust the update log for a MANAGED install. An unmanaged checkout may
-  // sit on a stale/inherited ~/.halo/update.log (left by a prior managed install
-  // in the same config dir, or copied between machines); surfacing its target /
-  // appliedAt would falsely tell an operator this checkout auto-updated when it
-  // did not — the exact confusion the 2026-07-06 txHash-null postmortem hit.
+  // Ignore inherited update logs for unmanaged checkouts; they do not prove this checkout was promoted.
   if (managed) {
     try {
       for (const line of readFileSync(logPath(), "utf8").split("\n")) {
@@ -703,17 +671,8 @@ export function restartIntoManagedInstall(detached = true): void {
     settled = true;
     process.exit(code);
   };
-  // A failed relaunch must never exit 0 with no running halo and no diagnostic.
-  // There are TWO distinct failure modes, and exiting synchronously after
-  // spawn() would tear down the event loop before either can surface:
-  //   - fork/exec-level failure (EMFILE, exec bit cleared) => 'error' fires and
-  //     'spawn' never does;
-  //   - the child DOES fork/exec ('spawn' fires) but then crashes during module
-  //     load — a missing/corrupt/unreadable entry — and exits non-zero shortly
-  //     after. 'error' does NOT cover this (it's the child's failure, not the
-  //     parent's spawn), so we also watch for an early 'exit'.
-  // So: on 'spawn', give a short grace for an early crash; if the child is still
-  // alive after it, the relaunch succeeded — detach (unref) and exit 0.
+  // Observe both spawn errors and early child exits before reporting a successful relaunch.
+  // Detach only after the crash-grace interval.
   child.once("error", (err: Error) => {
     console.error(
       `Fatal: could not relaunch managed halo (${err.message}). ` +

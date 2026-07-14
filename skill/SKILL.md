@@ -1,6 +1,6 @@
 ---
 name: halo
-description: The Halo skill — paid inference on Base mainnet in EITHER role. OPERATE — serve x402-paid inference from your provider/models and earn USDC (no token, no stake, no deposit). CONSUME — run a local OpenAI-compatible endpoint that pays per request from your wallet, so any agent/app gets inference with no provider API keys in your code. Auto-generates a wallet and drives the `halo` CLI end-to-end (OpenClaw, Claude Code, Hermes, Ollama, OpenRouter, and more).
+description: The Halo skill — paid inference on Base mainnet in EITHER role. OPERATE — serve HaloVault-paid inference from your provider/models and earn USDC (no token, no stake, no operator deposit). CONSUME — run a local OpenAI-compatible endpoint that pays from a USDC vault deposit, so any agent/app gets inference with no provider API keys in your code. Auto-generates a wallet and drives the `halo` CLI end-to-end (OpenClaw, Claude Code, Hermes, Ollama, OpenRouter, and more).
 version: 0.1.0
 metadata:
   openclaw:
@@ -19,13 +19,13 @@ metadata:
 
 # Halo
 
-Halo is a marketplace for **x402-paid inference on Base mainnet**. Payment is settled
-on-chain by the **Halo protocol facilitator** (the default at
-`https://facilitator.runhalo.xyz`) — it submits the transfer and covers the gas, so
-neither side handles a network fee and operators need no facilitator credentials. (CDP
-or another x402 facilitator can be used instead via `--facilitator-url`, but you almost
-never need to.) This one skill covers **both roles** an agent can play on the network —
-and the first thing you do is decide which the user wants.
+Halo is a marketplace for **HaloVault-paid inference on Base mainnet**. Consumers
+deposit USDC into HaloVault; operators serve against operator-bound reservations and
+collect cumulative signed receipts through the **Halo protocol facilitator** (the
+default at `https://facilitator.runhalo.xyz`). Consumers pay gas for their deposit
+transaction, while the facilitator submits supported settlement transactions and
+operators need no facilitator credentials. This one skill covers **both roles** an
+agent can play on the network—and the first thing you do is decide which the user wants.
 
 **No token required.** Halo alpha runs directly on USDC on Base. Nothing is staked,
 no protocol token is held. Operators earn real USDC per request; consumers pay real
@@ -126,17 +126,18 @@ in the environment unlocks `serve`/`consume` without the prompt.
 
 ## Operate — serve & earn USDC
 
-Run the agent as a Halo **operator**: accept inference requests paid in USDC via x402, route
-them to a configured upstream provider, return results, and earn USDC at settlement. The
-operator never handles gas; the consumer never sees a network fee.
+Run the agent as a Halo **operator**: accept inference requests backed by reserved
+HaloVault USDC, route them to a configured upstream provider, return results, and earn
+USDC as receipts are redeemed. The operator does not fund the consumer's deposit or
+pay settlement gas.
 
 ### What the operate path does
 
 - Generates (or imports) an operator wallet on first run.
 - One-time setup: pick an inference provider, API key (if required), model list, pricing mode.
 - Starts a long-running process that connects to the relay via WebSocket.
-- Handles x402 end-to-end: issues `402` challenges, verifies + settles through the protocol
-  facilitator (which submits the tx and pays gas), returns the inference response.
+- Gates work on an operator-bound HaloVault reservation, meters successful inference,
+  and collects cumulative signed receipts through the protocol facilitator.
 - Emits signed inference events + heartbeats to the indexer so the operator shows up in the
   League and on the Dashboard.
 
@@ -242,7 +243,7 @@ halo serve     # alias: /halo start
 ```
 
 Loads the keystore, connects to the relay, announces the models, and handles requests until
-interrupted. While running it serves x402-paid requests, reports each settled request to the
+interrupted. While running it serves vault-backed requests, reports each settled request to the
 indexer for League points, sends a signed heartbeat every 30s, and **auto-reconnects** with
 exponential backoff (1s → 30s) up to 10 consecutive failures (a successful re-announce resets
 the counter). In unattended mode it starts with no prompt and prints a `⚠ unattended mode`
@@ -263,7 +264,7 @@ Sample log:
   connecting to relay: wss://relay.runhalo.xyz
   ✓ connected; announcing as 0xabc…123
   inference req_5f3 ← consumer 0xd4e…9a2 (model=gpt-4o-mini, 1240 tok, $0.012)
-    verify ok, settle tx 0x9f1…c4 → earned $0.012 USDC
+    reservation ok, receipt 0x9f1…c4 → earned $0.012 USDC
 ```
 
 ---
@@ -277,8 +278,8 @@ pay-per-use without subscriptions, or wants to keep provider keys out of its cod
 
 ### Quickest path: the `consume` sidecar (recommended)
 
-`halo consume` runs a **local OpenAI-compatible endpoint** that pays each request from the CLI
-wallet via x402. Point any OpenAI client's `baseURL` at it.
+`halo consume` runs a **local OpenAI-compatible endpoint** that pays each request from the
+CLI wallet's HaloVault deposit. Point any OpenAI client's `baseURL` at it.
 
 ```bash
 # 1. one-time: wallet + config, AND a persisted consumer profile so `consume`
@@ -291,11 +292,11 @@ halo setup --provider openai --models gpt-4o-mini --no-wallet-passphrase \
 
 # 2. fund the printed wallet address on Base mainnet (unlike the operator wallet, a
 #    consumer wallet MUST be funded): USDC pays for inference, AND a little ETH for gas
-#    on the vault deposit tx that step 3's --vault-deposit submits (exact mode needs USDC only).
+#    on the vault deposit tx that step 3's --vault-deposit submits.
 
-# 3. run the local endpoint on the vault rail (the recommended billing rail —
-#    deposits once, then bills the ACTUAL tokens used; see "Billing rail" below)
-halo consume --vault --vault-deposit 5
+# 3. run the local endpoint. Consume is vault-only: it deposits once, then bills
+#    the ACTUAL tokens used; see "Keeping the vault funded" below.
+halo consume --vault-deposit 5
 #   endpoint : http://127.0.0.1:8799/v1
 #   wallet   : 0x…  (Base)
 #   rail     : vault (deposit-backed, settles ACTUAL tokens)
@@ -329,14 +330,14 @@ serving it just no-ops. Needs an unattended keystore (`setup --no-wallet-passphr
 `HALO_PASSPHRASE`, since a detached process can't be prompted.
 
 ```bash
-halo consume --detach --port 8799 --vault --vault-deposit 5   # starts once, survives restarts, no-ops if already up
+halo consume --detach --port 8799 --vault-deposit 5   # starts once, survives restarts, no-ops if already up
 ```
 
 **For start-on-boot + auto-restart-on-crash → install it as an OS service** (launchd on
 macOS, systemd `--user` on Linux), owned by the OS, not the gateway:
 
 ```bash
-halo service install consume -- --port 8799 --vault --vault-deposit 5 --budget-usdc 5
+halo service install consume -- --port 8799 --vault-deposit 5 --budget-usdc 5
 halo service status consume      # MUST show a PID; an exit code = crash-looping →
 halo service logs consume        # prints the real reason (e.g. EPERM, passphrase, port)
 halo service uninstall consume
@@ -373,19 +374,17 @@ print(resp.choices[0].message.content)
 - `--max-usdc <n>` (default `0.10`) — **per-request spend ceiling in USD**. A request is
   refused (HTTP 402) if the operator asks for more. This is the consumer's primary cost guard —
   set it deliberately.
-- `--vault` — **bill on the HaloVault rail (recommended — use it for inference by default).**
-  Deposits USDC into the vault once, then settles the ACTUAL tokens used per request instead of a
-  flat per-request quote. Omitting it falls back to exact mode (see "Billing rail").
-- `--vault-deposit <usd>` — vault top-up target (e.g. `--vault-deposit 5`). Deposits on startup AND
-  auto-refills from the wallet mid-run so the vault won't 402. Always pass it together with `--vault`.
+- `--vault-deposit <usd>` — vault top-up target (e.g. `--vault-deposit 5`). Deposits on startup and
+  auto-refills from the wallet mid-run so the vault remains able to reserve requests.
 - `--budget-usdc <n>` — **cumulative spend cap** for the run (0/unset = uncapped). A human on a
   frontend self-paces; an agent loops, retries and fans out tool calls, so per-request caps don't
   bound TOTAL spend — this does. See the budget section below.
 - `--budget-warn-pct <0-1>` (default `0.8`) — warn (response header) at this fraction of the budget.
 - `--keystore <path>` — pay from a different wallet than the operator keystore.
-- `--confidential` — **confidential-only mode**: every request is end-to-end encrypted to a
-  hardware TEE the operator can't read, routed only to a TEE operator, and the reply is verified
-  against the enclave attestation. Fails closed (errors, never plaintext). See below.
+- `--confidential` — **confidential-only mode**: every request is encrypted to the reported TEE
+  key, routed only to a TEE-advertising operator, and checked against the attested reply signer.
+  It fails closed rather than falling back to plaintext; hardware authenticity remains subject to
+  the verifier limitation below.
 - `--tee-base-url <url>` — TEE provider attestation endpoint (default `https://cloud-api.near.ai/v1`).
 
 **Endpoints:** `POST /v1/chat/completions`, `GET /v1/models`, `GET /health`, `GET /v1/account`
@@ -397,28 +396,23 @@ hints (`X-Halo-Routing`, `X-Halo-Operator`, `X-Halo-Max-Price`, …) are forward
 bind keeps it to local processes; add `--api-key` (and only then a non-loopback `--host`) for a
 remote caller. Cap per-request exposure with `--max-usdc`.
 
-**Streaming on consume:** `stream: true` IS accepted (needed by agents like Hermes that always
-stream). Under the hood the x402 pay flow is buffered — consume pays for and receives the whole
-answer, then re-emits it to your client as a valid OpenAI SSE stream (`chat.completion.chunk`
-events + `[DONE]`). So the client streams, but tokens arrive as one batch at the end, not
-incrementally.
+**Streaming on consume:** `stream: true` is accepted (needed by agents like Hermes that always
+stream). Consume can receive a buffered paid answer and re-emit it to your client as valid
+OpenAI SSE (`chat.completion.chunk` events + `[DONE]`). Depending on the operator path, tokens
+may arrive as one batch at the end rather than incrementally.
 
-### Billing rail + keeping it funded (avoid falling back off Halo)
+### Keeping the vault funded (avoid falling back off Halo)
 
-Two rails, both funded from the same wallet. **Vault mode (`--vault`) is the recommended rail —
-pass `--vault --vault-deposit <usd>` for inference.** It deposits USDC into the HaloVault once and
-bills the ACTUAL tokens used per request (deposit once, settle-actual); it's the rail Halo is
-standardizing on. **Exact mode** (what you get when you omit `--vault`) signs a separate x402
-payment per request at a flat, prompt-blind quote priced on `max_tokens` — no deposit, but it
-settles straight to the operator and bypasses the vault. Use exact only as an explicit fallback on
-dev / non-vault stacks.
+`halo consume` is vault-only. It deposits USDC into HaloVault once and bills measured
+usage per request through reservations and cumulative receipts. Pass
+`--vault-deposit <usd>` to set the automatic top-up target.
 
-The #1 cause of an agent silently dropping to a non-Halo fallback is **running out of funds**:
-- Exact mode → the consumer wallet is out of **USDC**.
-- Vault mode → the **vault** is drained (a `402 Vault can't cover this request`).
+The #1 cause of an agent silently dropping to a non-Halo fallback is **running out of
+funds**: the vault can no longer reserve the request, or the wallet lacks the USDC/ETH
+needed to refill it.
 
 Keep it on the rail:
-- **Vault: always pass `--vault-deposit <usd>`** (e.g. `--vault --vault-deposit 5`). That deposits
+- **Always pass `--vault-deposit <usd>`** (e.g. `--vault-deposit 5`). That deposits
   on startup AND **auto-refills from the wallet mid-run** when the vault runs low, so it won't 402
   as long as the wallet still has USDC (a drained wallet 402s either rail).
 - Keep the **wallet** funded — USDC for inference, plus ~$0.50 ETH on Base for deposit gas (vault).
@@ -430,10 +424,11 @@ Keep it on the rail:
 ### Confidential (TEE) inference — when the agent must not be read
 
 If the agent's prompts must stay private *even from the serving operator*, use **confidential**
-mode. The prompt is end-to-end encrypted to a hardware enclave (NEAR AI Cloud — Intel TDX +
-NVIDIA H200); the operator only relays ciphertext, and the reply is signed inside the enclave and
-verified against its attestation. This is stronger than privacy mode (`X-Halo-Privacy: true`,
-which only filters by an operator's *declared* posture, not cryptographically).
+mode. This path encrypts the prompt to a reported NEAR AI Cloud enclave key (Intel TDX + NVIDIA
+H200); the operator relays ciphertext, and the client verifies the reply against the attested
+signer. This is stronger than privacy mode (`X-Halo-Privacy: true`, which only filters by an
+operator's *declared* posture), but its hardware guarantee remains conditional on the attestation
+verifier and enclave implementation.
 
 How the agent uses it through `consume`:
 
@@ -443,13 +438,14 @@ How the agent uses it through `consume`:
    --confidential`, OR require it per request by sending the header `X-Halo-Confidential: true`
    on `/v1/chat/completions`. Either way it **fails closed** — if no TEE operator can serve the
    model, the request errors; it never silently downgrades to plaintext. Before encrypting, the
-   sidecar runs the **full DCAP hardware attestation verification** (Intel TDX → Intel root +
-   NVIDIA H200, cached per model) — the same trustless check the frontend does, so a rogue
-   relay/provider can't fake the confidential guarantee with a substituted key.
+   sidecar runs the configured DCAP/NVIDIA attestation verification before encryption, cached per
+   model. The current transitive verifier has a known missing-QE-Identity limitation
+   (`CVE-2026-22696`), so this check must not be described as unconditional trustless hardware
+   proof; see `docs/code-documentation-gaps.qmd#gd-13`.
 3. **Assert** — the response carries `X-Halo-Confidential: true` and `X-Halo-TEE-Verified: true`.
    The agent should treat the reply as untrusted unless `X-Halo-TEE-Verified: true` is present
-   (it means the enclave's signature verified against the attested signer — the operator could
-   neither read nor forge it). Check the endpoint's default mode with `GET /health` →
+   (it means the reply signature matched the attested signer; it does not independently close the
+   known hardware-verifier limitation). Check the endpoint's default mode with `GET /health` →
    `{ "confidential": true|false }`.
 
 ```bash
@@ -464,12 +460,12 @@ curl -s -D - localhost:8799/v1/chat/completions \
 Confidential models are only the handful served by TEE operators, so set the consume
 `--consume-allow` allowlist accordingly (or check `confidential` per model at runtime).
 
-**Even non-confidential consume is relay-blind:** by default the sidecar end-to-end-encrypts the
-prompt to the chosen operator's announced key, so the **relay** only ever sees ciphertext (the
+**Even non-confidential consume can be relay-blind:** by default the sidecar end-to-end-encrypts the
+prompt when the chosen operator exposes an authenticated session key, so the **relay** sees ciphertext (the
 operator still decrypts to serve — use confidential mode to hide from the operator too). `--no-e2e`
-disables it. So the consume API now has full parity with the frontend: same operator E2E, same
-trustless hardware attestation, same economic safeguards (per-request cap, payTo/operator pinning,
-exact-amount settlement, unfunded rejection).
+disables it. If no authenticated key is available, the request falls back to plaintext. The consume API and frontend share the operator-E2E and attestation paths, including
+the known verifier limitation above, plus the same economic safeguards (per-request cap,
+operator pinning, reservation coverage, metered settlement, and unfunded rejection).
 
 ### Cumulative spend budget — the agent-volume guard
 
@@ -494,27 +490,6 @@ hard ceiling regardless of this soft cap.
 > itself, call that provider endpoint directly — don't route through Halo to pay yourself. It
 > earns no League points, burns the settlement spread, and the indexer's self-deal guard
 > ignores it. `consume` is for using capacity from *other* operators.
-
-### Alternative: embed the x402 flow yourself
-
-If you can't run a sidecar process, sign the `402` challenge inside your own code with the
-agent's private key. Under the hood:
-
-1. Agent wallet holds USDC on Base mainnet.
-2. Agent POSTs a chat completion to the relay (`https://relay.runhalo.xyz/v1/chat/completions`).
-3. Relay returns `402` with a `PAYMENT-REQUIRED` header (amount, operator wallet, USDC asset).
-4. Agent signs an EIP-3009 `TransferWithAuthorization` locally (off-chain, no gas).
-5. Agent retries with a `PAYMENT-SIGNATURE` header — pin `X-Halo-Operator` to the operator from
-   the probe so the retry lands on the same operator the signature is for.
-6. Relay forwards to the operator; it runs inference, settles via the protocol facilitator,
-   returns the completion.
-7. Agent parses the response exactly like an OpenAI API response.
-
-Gas for the on-chain USDC transfer is paid by the facilitator, not the agent. A drop-in
-TypeScript wrapper is in `docs/AGENT_INTEGRATION.md`; prefer the sidecar unless you specifically
-can't run one.
-
----
 
 ## Commands (CLI reference)
 
@@ -547,8 +522,6 @@ can't run one.
 - **`halo service <install|uninstall|status|logs> [consume|serve] [-- daemon args…]`** — install
   consume/serve as an always-on OS service (launchd/systemd) that survives agent/gateway restarts.
   Prefer this over foreground-launching either daemon. `--dry-run` prints the unit without installing.
-- **`halo pay [--model M] [--prompt P]`** — one-shot test of a paid request as a consumer;
-  good for verifying an install end-to-end.
 - **`halo link`** — generate a fresh 9-digit dashboard pairing code (only needed if
   `--with-pairing` failed or the operator wants a new code; one dashboard wallet can claim many
   operator addresses).
@@ -556,31 +529,27 @@ can't run one.
   served, USDC earned, uptime.
 - **`halo doctor [--json]`** — the diagnostic; run first.
 
-## How payment works (no gas, no token — both roles)
+## How payment works (HaloVault, USDC, no token)
 
-1. A consumer sends a chat request to the relay.
-2. The relay tunnels it to a selected operator over the operator's outbound WebSocket.
-3. The operator returns `402 Payment Required` (`PAYMENT-REQUIRED` header: amount, operator
-   wallet, USDC asset on Base).
-4. The consumer's wallet signs an EIP-3009 `TransferWithAuthorization` off-chain.
-5. The retry carries a `PAYMENT-SIGNATURE` header.
-6. The operator calls the protocol facilitator `/verify` then `/settle`; the facilitator submits
-   the on-chain tx and pays the gas. USDC flows consumer → operator in one transaction.
-7. The operator runs inference and returns the response with `PAYMENT-RESPONSE` (settlement tx
-   hash). Settlement happens *after* inference, so the signed authorization stays valid for the
-   whole sign → inference → settle window.
+1. A consumer deposits USDC into HaloVault and authorizes a session key.
+2. Before sending inference, the consumer reserves enough vault balance for the selected
+   operator and request ceiling.
+3. The relay tunnels the request to that vault-capable operator over its outbound WebSocket.
+4. The operator checks live operator-bound coverage before doing upstream work.
+5. Successful inference is metered, and the consumer advances a cumulative signed receipt.
+6. The operator or consumer submits the receipt through the facilitator; HaloVault pays the
+   operator and releases the corresponding reservation.
 
-Neither wallet needs ETH for gas — the facilitator covers it.
+The consumer needs a little ETH for the initial deposit transaction. The facilitator pays
+gas for supported reserve/redeem operations; operators do not need to pre-fund settlement.
 
 ## When things go wrong
 
 - **"keystore not found"** → run `halo setup`.
 - **(operate) "provider /v1/models returned 401"** → upstream API key is wrong; re-run setup.
-- **(operate) "facilitator /settle 400: insufficient_balance"** → the consumer signed for more
-  USDC than they hold; the operator returns 402 automatically.
-- **(consume) request fails with 402 / "exceeds --max-usdc"** → the picked operator's price is
-  above your ceiling. Raise `--max-usdc`, or set `X-Halo-Max-Price` / route to a cheaper
-  operator.
+- **(consume) request fails with 402 / reservation too small** → the request ceiling exceeds
+  currently reservable vault funds. Refill the vault, lower the request size, or route to a
+  cheaper operator.
 - **(consume) "insufficient funds" / payments fail** → the consumer wallet has no USDC. Fund
   the address `halo status` (or the consume startup line) prints with USDC on Base mainnet. As of
   the latest CLI the consume endpoint returns this as an actionable error whose `message` names

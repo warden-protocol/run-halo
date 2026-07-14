@@ -88,7 +88,6 @@ test("vaultSend re-reserves the typed operator requirement and retries the unser
   assert.deepEqual(redeemed, { operator, cycle: 2n, keyEpoch: 2n, cost: 73n });
 });
 
-// Minimal client that always warm-reserves once; captures the redeem, if any.
 function meteringClient(operator: string): {
   client: VaultConsumeClient;
   redeemed: () => { operator: string; cost: bigint } | undefined;
@@ -120,8 +119,6 @@ test("vaultSend meters from body usage when the operator omits PAYMENT-RESPONSE 
   t.after(() => {
     global.fetch = originalFetch;
   });
-  // Served completion with usage in the JSON body, but NO settlement header. The
-  // prior header-only CLI metering charged $0 (paid:false) for this real work.
   global.fetch = (async () =>
     new Response(JSON.stringify({ choices: [], usage: { total_tokens: 1000 } }), {
       status: 200,
@@ -130,7 +127,6 @@ test("vaultSend meters from body usage when the operator omits PAYMENT-RESPONSE 
   const operator = "0x00000000000000000000000000000000000000c1";
   const { client, redeemed } = meteringClient(operator);
   const result = await runVaultSend(client, operator);
-  // priceUsdPerMtok=1, total_tokens=1000 → priceTokens(1, 1000) = 1000 base units.
   assert.equal(result.paid, true);
   assert.equal(result.chargedBase, "1000");
   assert.deepEqual(redeemed(), { operator, cost: 1000n });

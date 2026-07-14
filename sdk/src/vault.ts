@@ -1,34 +1,9 @@
-/**
- * HaloVault (RFC v2) consumer client — SDK / pay side.
- *
- * Inference on Halo is settled through the HaloVault, which charges the protocol
- * fee on redeem. Paying an operator directly with the `exact` x402 scheme
- * bypasses the vault (and the fee), so for INFERENCE the SDK defaults to the
- * vault rail. (Tools/data x402 are unaffected — they pay external providers, not
- * Halo operators; use `fetchWithX402` for those.)
- *
- * Mechanism (mirrors cli/src/vault-consume.ts + frontend/src/lib/vaultPay.ts,
- * which run this live in prod):
- *   1. deposit USDC into the vault once (on-chain, registers a session key),
- *   2. reserve funds for the operator we route to (EIP-712 Reserve, the
- *      facilitator submits it + pays gas),
- *   3. send the inference with `x-halo-payment-mode: vault` — the operator gates
- *      on the reservation, serves, and reports the ACTUAL cost,
- *   4. advance a cumulative receipt (EIP-712 Receipt) and redeem it in the
- *      background (facilitator submits → operator paid for exactly what it served).
- *
- * Headless flow: there are no wallet popups, so by DEFAULT the SDK signer IS the
- * session key (it signs reserve + receipts directly). A distinct session signer
- * may be supplied (e.g. the browser-compatible derived sub-wallet) so one wallet
- * serves both the CLI and the web app (#426) — see the constructor's sessionSigner.
- * EIP-712 field order/types MUST match contracts/src/HaloVault.sol byte-for-byte or
- * the on-chain verify reverts.
- */
 import {
   Contract,
   JsonRpcProvider,
   MaxUint256,
   Signer,
+  getAddress,
   isAddress,
   parseUnits,
 } from "ethers";
@@ -98,27 +73,21 @@ export interface VaultConfig {
   facilitatorUrl: string;
   rpcUrl: string;
   chainId: number;
-  /** Relay base URL for best-effort operator-driven receipt delivery. The
-   *  facilitator self-redeem path remains authoritative when omitted. */
+  /** HaloVault address. Defaults to the repository consensus deployment. */
+  vaultAddress?: string;
+  /** Optional relay URL for best-effort operator receipt delivery. */
   relayUrl?: string;
   /** Reservation lifetime (s). Default 3600. */
   reserveTtlSec?: number;
   /** Reserve this many estimated-requests worth at once (batch). Default 5. */
   reserveMultiple?: bigint;
-  /** Preserve roughly this many free-liquidity slices when batching across
-   *  operators. Default 8. The current request may exceed one slice. */
+  /** Approximate free-liquidity slices to preserve. Default 8. */
   reserveLiquiditySlots?: bigint;
-  /** Auto-top-up target (USD). When the vault can't cover a request's reservation
-   *  and this is > 0, the client deposits more from the signer's USDC mid-run (up
-   *  to this balance) instead of failing — so an agent doesn't fall off the Halo
-   *  rail. 0/unset = never auto-deposit. */
+  /** Auto-top-up target in USD. Zero or unset disables auto-deposit. */
   autoTopUpUsd?: number;
-  /** File path to persist the pending-redeem queue so a RESTART resumes settling
-   *  the served tail instead of abandoning it (issue #369 follow-up). Unset ⇒
-   *  in-memory only (lost on restart). Node/CLI only (uses the filesystem). */
+  /** Node-only pending-redeem store. Unset keeps the queue in memory. */
   pendingStorePath?: string;
-  /** Optional progress/diagnostic sink. Defaults to no-op (an SDK shouldn't spam
-   *  stdout). */
+  /** Optional diagnostic sink. Defaults to no-op. */
   log?: (msg: string) => void;
 }
 
@@ -132,35 +101,25 @@ function nowSec(): number {
   return Math.floor(Date.now() / 1000);
 }
 
-/**
- * Per-process vault client. Holds the value signer (the main wallet: deposits +
- * IS the consumer) and a session signer that signs reserve+receipts. By default
- * they're the SAME wallet (headless: the wallet is its own session key). Supplying
- * a distinct session signer — e.g. the browser-compatible derived sub-wallet — lets
- * ONE wallet serve both the CLI and the web app (#426). Also holds the cumulative
- * receipt ledger per `${operator}:${cycle}` and a serialized reservation queue so
- * concurrent requests don't double-reserve on the same nonce. Reuse one instance
- * across many `chat()` calls to amortize reservations.
- */
+interface PersistedPendingRedeem {
+  key: string;
+  vaultAddress?: string;
+  operator: string;
+  cumulative: string;
+  signature: string;
+  cycle: string;
+}
+
+/** Stateful vault client; reuse it to serialize reservations and retain receipts. */
 export class HaloVaultClient {
   private readonly signer: Signer;
-  // Signs reserve+receipts; its address MUST equal on-chain sessionKey[consumer].
-  // Defaults to `signer` (the wallet is its own session key).
+  // Must match the consumer's registered on-chain session key.
   private readonly sessionSigner: Signer;
   private readonly cfg: Required<Omit<VaultConfig, "log">> & { log: (m: string) => void };
   private readonly provider: JsonRpcProvider;
-  // One read-only Contract, built once and reused by every view read (readOps runs
-  // ~50×/reservation in waitForReservation's poll loop, and once per tracked
-  // operator in releaseExpiredReservations). Rebuilding it per call re-parses all
-  // ABI fragments each time for no benefit. The deposit paths need a signer-bound
-  // Contract and build their own.
   private readonly vault: Contract;
   private readonly cumulative = new Map<string, bigint>();
-  // Highest reservation ceiling (locked+redeemed) seen per `${operator}:${cycle}`.
-  // locked+redeemed is monotonic non-decreasing within a cycle (top-ups raise
-  // locked; redeem moves locked→redeemed; a release bumps the cycle), so a fresh
-  // top-up by one request must not be clamped away by another request's older,
-  // lower ops snapshot — recordAndRedeem clamps to this high-water mark instead.
+  // Prevent stale concurrent snapshots from lowering a cycle's receipt ceiling.
   private readonly ceilingByKey = new Map<string, bigint>();
   private ensureQueue: Promise<unknown> = Promise.resolve();
   private redeemQueue: Promise<void> = Promise.resolve();
@@ -174,6 +133,9 @@ export class HaloVaultClient {
       inFlight: boolean;
     }
   >();
+  // Entries signed for another configured vault stay on disk but are never
+  // loaded into this client's retry queue.
+  private readonly preservedForeignPending: PersistedPendingRedeem[] = [];
   private redeemRetryTimer: ReturnType<typeof setInterval> | null = null;
   private readonly reservedOperators = new Set<string>();
   private readonly releaseAttemptedAt = new Map<string, number>();
@@ -185,13 +147,18 @@ export class HaloVaultClient {
 
   constructor(signer: Signer, cfg: VaultConfig, sessionSigner?: Signer) {
     this.signer = signer;
-    // The session-key signer signs reserve+receipts. Defaults to the value signer
-    // (headless: the wallet IS the session key). A distinct signer (e.g. the
-    // browser-compatible derived sub-wallet) lets one wallet serve both surfaces —
-    // its address is what deposit registers and what receipts must recover to.
     this.sessionSigner = sessionSigner ?? signer;
+    getChain(cfg.chainId);
+    const vaultAddress =
+      cfg.vaultAddress === undefined ? VAULT_ADDRESS : cfg.vaultAddress.trim();
+    if (!isAddress(vaultAddress)) {
+      throw new Error(
+        `invalid vaultAddress ${JSON.stringify(vaultAddress)} (must be a 20-byte 0x hex address)`
+      );
+    }
     this.cfg = {
       ...cfg,
+      vaultAddress: getAddress(vaultAddress),
       relayUrl: cfg.relayUrl ?? "",
       reserveTtlSec: cfg.reserveTtlSec ?? 3600,
       reserveMultiple: cfg.reserveMultiple ?? 5n,
@@ -205,20 +172,16 @@ export class HaloVaultClient {
     };
     this.autoTopUpBase = BigInt(Math.round((cfg.autoTopUpUsd ?? 0) * 1_000_000));
     this.provider = new JsonRpcProvider(cfg.rpcUrl, undefined, { staticNetwork: true });
-    this.vault = new Contract(VAULT_ADDRESS, VAULT_ABI, this.provider);
+    this.vault = new Contract(this.cfg.vaultAddress, VAULT_ABI, this.provider);
   }
 
-  /** The consumer (value signer / main wallet) address, memoized. This is the key
-   *  of the on-chain balance/session-key mappings. */
+  /** Memoized consumer address used by the vault's balance and key mappings. */
   async consumer(): Promise<string> {
     if (!this.addr) this.addr = await this.signer.getAddress();
     return this.addr;
   }
 
-  /** The session-key signer's address (memoized) — the address that signs
-   *  reserve+receipts and MUST equal on-chain `sessionKey[consumer]`. Equals the
-   *  consumer in default headless mode; differs when a distinct session signer was
-   *  supplied (e.g. the browser-compatible derived sub-wallet). */
+  /** Memoized address that signs reservations and receipts. */
   async sessionAddress(): Promise<string> {
     if (!this.sessionAddr) this.sessionAddr = await this.sessionSigner.getAddress();
     return this.sessionAddr;
@@ -228,11 +191,23 @@ export class HaloVaultClient {
     return this.cfg.facilitatorUrl.replace(/\/+$/, "");
   }
 
-  // ── reads ──────────────────────────────────────────────────────────────────
   async readVaultState(): Promise<VaultState> {
     const consumer = await this.consumer();
-    // Prefer the facilitator (batched); fall back to direct RPC.
     try {
+      const identity = await fetch(`${this.facBase()}/vault/info`, {
+        signal: AbortSignal.timeout(6000),
+      });
+      const identityBody = identity.ok
+        ? ((await identity.json()) as { vault?: unknown })
+        : null;
+      if (
+        !identityBody ||
+        typeof identityBody.vault !== "string" ||
+        !isAddress(identityBody.vault) ||
+        getAddress(identityBody.vault) !== this.cfg.vaultAddress
+      ) {
+        throw new Error("facilitator vault identity does not match the selected vault");
+      }
       const res = await fetch(`${this.facBase()}/vault/state`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -241,11 +216,7 @@ export class HaloVaultClient {
       });
       if (res.ok) {
         const s = (await res.json()) as Record<string, string>;
-        // Trust the facilitator's batched read only when it carries a REAL session
-        // key. A response that omits it would otherwise coerce to the zero address
-        // and read as "unregistered", failing the #426 guard OPEN (absent must not
-        // be mistaken for genuinely-unset). On a missing/garbled key, fall through
-        // to the authoritative on-chain read below.
+        // Missing key data must fall back on-chain rather than appear unregistered.
         if (isAddress(s.sessionKey)) {
           return {
             balance: BigInt(s.balance ?? "0"),
@@ -257,9 +228,7 @@ export class HaloVaultClient {
           };
         }
       }
-    } catch {
-      /* fall through to on-chain */
-    }
+    } catch {}
     const [balance, lockedTotal, withdrawable, sessionKey, reserveNonce, keyEpoch] =
       await withTimeout(
         Promise.all([
@@ -295,16 +264,7 @@ export class HaloVaultClient {
     };
   }
 
-  /**
-   * Session-key preflight (#426): read the on-chain `sessionKey[consumer]` and
-   * classify it against `sessionAddress()` — the address that actually signs
-   * reserves + receipts (the wallet itself by default, or a supplied session
-   * signer such as the browser-compatible derived sub-wallet), NOT necessarily the
-   * consumer. A read; it never throws, so callers (a CLI startup banner,
-   * `halo vault status`) can surface it however they like. The fail-closed
-   * enforcement lives in `ensureColdReservation`, which classifies the state it
-   * already reads before it reserves — no extra read, and re-checked every time.
-   */
+  /** Report whether the intended signer matches the registered session key. */
   async checkSessionKey(): Promise<{
     status: SessionKeyStatus;
     registered: string;
@@ -319,19 +279,6 @@ export class HaloVaultClient {
     };
   }
 
-  /**
-   * The error thrown when the on-chain session key isn't the address this client
-   * signs with (#426). Reserve + receipts are signed by the session signer (the
-   * wallet itself by default, or a supplied session signer), so a receipt only
-   * redeems when `sessionKey[consumer] == that signer`. If a DIFFERENT key is
-   * registered — classically the browser's in-browser sub-wallet on the SAME
-   * wallet, since `deposit` registers a session key only ONCE (HaloVault.sol) —
-   * the request would still be SERVED (the relay is payment-blind; the operator
-   * gates on the reservation, not a per-request signature), but its receipt
-   * reverts BadSignature forever, so the operator does real work it can never
-   * collect (#426, the #369 money-loss class). ensureColdReservation refuses to
-   * reserve with this error instead of getting unpayable work served.
-   */
   private sessionKeyMismatchError(registered: string, expected: string, consumer: string): Error {
     return new Error(
       `Vault session-key mismatch — refusing to serve unpayable work. This wallet ` +
@@ -344,7 +291,6 @@ export class HaloVaultClient {
     );
   }
 
-  // ── signing ──────────────────────────────────────────────────────────────
   private async signReserve(p: {
     operator: string;
     amount: bigint;
@@ -352,14 +298,18 @@ export class HaloVaultClient {
     nonce: bigint;
     keyEpoch: bigint;
   }): Promise<string> {
-    return this.sessionSigner.signTypedData(vaultDomain(this.cfg.chainId), RESERVE_TYPES, {
-      consumer: await this.consumer(),
-      operator: p.operator,
-      amount: p.amount,
-      expiry: p.expiry,
-      nonce: p.nonce,
-      keyEpoch: p.keyEpoch,
-    });
+    return this.sessionSigner.signTypedData(
+      vaultDomain(this.cfg.chainId, this.cfg.vaultAddress),
+      RESERVE_TYPES,
+      {
+        consumer: await this.consumer(),
+        operator: p.operator,
+        amount: p.amount,
+        expiry: p.expiry,
+        nonce: p.nonce,
+        keyEpoch: p.keyEpoch,
+      }
+    );
   }
   private async signReceipt(p: {
     operator: string;
@@ -367,16 +317,19 @@ export class HaloVaultClient {
     keyEpoch: bigint;
     cycle: bigint;
   }): Promise<string> {
-    return this.sessionSigner.signTypedData(vaultDomain(this.cfg.chainId), RECEIPT_TYPES, {
-      consumer: await this.consumer(),
-      operator: p.operator,
-      cumulative: p.cumulative,
-      keyEpoch: p.keyEpoch,
-      cycle: p.cycle,
-    });
+    return this.sessionSigner.signTypedData(
+      vaultDomain(this.cfg.chainId, this.cfg.vaultAddress),
+      RECEIPT_TYPES,
+      {
+        consumer: await this.consumer(),
+        operator: p.operator,
+        cumulative: p.cumulative,
+        keyEpoch: p.keyEpoch,
+        cycle: p.cycle,
+      }
+    );
   }
 
-  // ── facilitator submits (it pays gas) ──────────────────────────────────────
   private async postReserve(
     p: { operator: string; amount: bigint; expiry: bigint; nonce: bigint },
     signature: string
@@ -448,7 +401,6 @@ export class HaloVaultClient {
     return this.redeemGraceCache;
   }
 
-  // Immutable — read once and cache. Used by the zombie-reservation guard (#473).
   private async maxReserveTtl(): Promise<bigint> {
     if (this.maxReserveTtlCache !== null) return this.maxReserveTtlCache;
     this.maxReserveTtlCache = BigInt(
@@ -469,9 +421,7 @@ export class HaloVaultClient {
     return body.hash;
   }
 
-  /** Best-effort reclaim of tracked reservations that are past expiry plus the
-   *  contract grace period. Operators remain tracked until an on-chain read
-   *  confirms the locked balance reached zero, so dropped release txs retry. */
+  /** Reclaim tracked reservations after expiry and grace, retrying dropped releases. */
   async releaseExpiredReservations(skipOperator?: string): Promise<boolean> {
     let grace: bigint;
     try {
@@ -504,24 +454,13 @@ export class HaloVaultClient {
           );
           released = true;
         }
-      } catch {
-        // A flaky read or broadcast must not remove the reclaim hint.
-      }
+      } catch {}
     }
     return released;
   }
 
-  // ── reservation ────────────────────────────────────────────────────────────
-  /**
-   * Ensure a live reservation to `operator` covers `estCost`. Serialized through
-   * a queue so concurrent requests don't reserve on a stale nonce. Reserves a
-   * batch (reserveMultiple × estCost) to amortize the on-chain tx. Returns the
-   * fresh ops + keyEpoch for receipt signing.
-   */
+  /** Ensure serialized, live coverage for an estimated request cost. */
   ensureReservation(operator: string, estCost: bigint): Promise<{ ops: OpsState; keyEpoch: bigint }> {
-    // ensureColdReservation runs the #426 session-key gate against the state it
-    // already reads, before it reserves/serves — so a mismatch rejects here and
-    // the request is never sent (see ensureColdReservation).
     const job = this.ensureQueue.catch(() => {}).then(() => this.ensureColdReservation(operator, estCost));
     this.ensureQueue = job.then(
       () => {},
@@ -537,13 +476,7 @@ export class HaloVaultClient {
     const REFRESH_MARGIN = 120;
     const target = estCost * this.cfg.reserveMultiple;
     let [state, ops] = await Promise.all([this.readVaultState(), this.readOps(operator)]);
-    // Fail-closed session-key gate (#426), reusing the state we just read. Reserve
-    // + receipts are signed by the session signer, so a registered key that isn't
-    // that signer means the operator would serve work it can never redeem
-    // (BadSignature). Refuse before reserving/serving. Re-evaluated every
-    // reservation (no stale latch), so a mid-process key rotation is caught here
-    // too. "unregistered" (zero) is fine — the deposit path below registers the
-    // session signer on the first deposit.
+    // Fail closed before work is sent with a signer that cannot redeem receipts.
     const consumerAddr = await this.consumer();
     const sessionAddr = await this.sessionAddress();
     if (classifySessionKey(state.sessionKey, sessionAddr) === "mismatch") {
@@ -551,39 +484,15 @@ export class HaloVaultClient {
     }
     const sec = nowSec();
     const live = () => ops.expiry === 0n || BigInt(sec + REFRESH_MARGIN) < ops.expiry;
-    // Actually past its on-chain expiry (not merely inside the 120s refresh
-    // margin). The operator rejects an expired reservation even when `locked`
-    // still covers the cost, so one must be refreshed (or reclaimed) — never
-    // returned as-is (#473 / PR #481 P1).
     const isExpired = () => ops.locked > 0n && ops.expiry !== 0n && BigInt(sec) >= ops.expiry;
 
-    // Track this operator as soon as we read a NONZERO reservation for it, before
-    // the wedged/no-free-balance guards below can throw. releaseExpiredReservations
-    // only sweeps tracked operators (the vault can't enumerate them), so a reserve
-    // that errors out before the add at the end would otherwise strand these funds
-    // outside the auto-reclaim sweep. Set.add is idempotent.
+    // The vault cannot enumerate operators, so retain every observed reservation.
     if (ops.locked > 0n) this.reservedOperators.add(operator.toLowerCase());
 
     if (ops.locked < estCost || !live()) {
-      // Lifetime-cap guard (#473). `reserve` caps expiry at created +
-      // maxReserveTtl; once a top-up can't move expiry past that cap, adding to
-      // `locked` only strands funds behind a dead expiry. Run this whenever a
-      // funded reservation needs a refresh — i.e. `!live()` (near-expiry OR
-      // expired), NOT only once expired — so a reservation sitting AT its cap
-      // inside the refresh margin doesn't get a dead top-up (#481 review). A live
-      // reservation far from its cap short-circuits to "live_or_revivable" inside
-      // the classifier, so the healthy top-up path stays off the extra reads.
       if (ops.locked > 0n && !live()) {
-        // FAIL CLOSED (mirrors the frontend path): read the lifetime-cap
-        // immutables and classify BEFORE any reserve. Every failure below —
-        // the immutable reads, the release broadcast, or waiting for it to mine
-        // — propagates out of the reserve rather than being swallowed. Swallowing
-        // and falling through would let `postReserve` top up the SAME dead cycle,
-        // stranding more funds — the exact bug #473 fixes (PR #481 review).
+        // Fail closed: an uncertain lifetime cap must never receive more funds.
         const [maxTtl, grace] = await Promise.all([this.maxReserveTtl(), this.redeemGrace()]);
-        // Pass the refresh margin as the cap safety headroom: a top-up counts as
-        // able to refresh only if the cap leaves at least this long for the
-        // reserve tx to mine before it (else it can't move expiry).
         const verdict = classifyReservationRevival(
           ops,
           maxTtl,
@@ -597,10 +506,7 @@ export class HaloVaultClient {
           );
           await this.postRelease(operator);
           this.releaseAttemptedAt.set(operator.toLowerCase(), Date.now());
-          // WAIT for the reclaim to mine (locked → 0) before re-reserving: a
-          // reserve submitted while `locked` is still > 0 sees `fresh == false`
-          // and only tops up the SAME dead reservation. Re-read after so the
-          // reserve below opens a fresh cycle (created/expiry reset).
+          // Re-reserving before release confirmation would top up the dead cycle.
           await this.waitForRelease(operator);
           [state, ops] = await Promise.all([this.readVaultState(), this.readOps(operator)]);
         } else if (verdict === "wedged") {
@@ -611,18 +517,10 @@ export class HaloVaultClient {
               `revive it). Reclaim it after that time and retry.`
           );
         } else if (verdict === "serve_as_is") {
-          // Still live but at its lifetime cap: NO reserve into this cycle can
-          // move expiry, so any top-up — refresh OR coverage — is dead (it would
-          // confirm behind the imminent, unmovable expiry and strand the added
-          // funds; #481 review). If existing locked covers this request, serve
-          // as-is; otherwise fail clearly rather than fund the doomed cycle.
           if (ops.locked >= estCost) {
             this.reservedOperators.add(operator.toLowerCase());
             return { ops, keyEpoch: state.keyEpoch };
           }
-          // Reclaim isn't available until strictly after expiry + redeemGrace
-          // (releaseExpired reverts before then), so point at that time — not
-          // merely "when it expires", which lands in the wedged window.
           const reclaimAt = new Date(Number(ops.expiry + grace) * 1000).toISOString();
           throw new Error(
             `Vault reservation to ${operator.slice(0, 8)}… is at its on-chain lifetime cap and about ` +
@@ -637,19 +535,10 @@ export class HaloVaultClient {
           [state, ops] = await Promise.all([this.readVaultState(), this.readOps(operator)]);
         }
       }
-      // The free balance can't cover even this one request → try to refill the
-      // vault from the signer's USDC mid-run, then re-read. This is what keeps an
-      // agent ON the Halo rail instead of erroring out.
       if (ops.locked + state.withdrawable < estCost && this.autoTopUpBase > 0n) {
-        // Re-read after the attempt regardless of its boolean outcome: a partial
-        // deposit or a concurrent lock can move state even when the top-up didn't
-        // fully cover the need, so always refresh before sizing the reservation.
         await this.autoTopUp(target);
         [state, ops] = await Promise.all([this.readVaultState(), this.readOps(operator)]);
       }
-      // An expired reservation needs free balance to fund the refresh reserve.
-      // If the whole balance is locked (withdrawable == 0) but auto-top-up is
-      // configured, refill so an agent self-heals instead of erroring (#481 P1).
       if (isExpired() && state.withdrawable === 0n && this.autoTopUpBase > 0n) {
         await this.autoTopUp(target);
         [state, ops] = await Promise.all([this.readVaultState(), this.readOps(operator)]);
@@ -662,20 +551,10 @@ export class HaloVaultClient {
         liquiditySlots: this.cfg.reserveLiquiditySlots,
         live: live(),
       });
-      // Only hard-fail when the request genuinely can't be covered. A near-expiry
-      // reservation (`!live()`) that STILL covers estCost is served against as-is: the
-      // operator gates on the actual on-chain expiry, not the 120s refresh margin, so
-      // it serves it. computeReserveAmount adds a small refresh reserve only when free
-      // balance exists (withdrawable > 0); with the whole balance locked it returns 0,
-      // and we proceed on the existing, still-valid reservation instead of throwing a
-      // misleading "can't cover" or attempting a 1n reserve that reverts InsufficientFree.
       if (ops.locked + amount < estCost) {
         throw new Error(this.insufficientMsg(state.withdrawable, estCost));
       }
-      // Fail closed if the reservation is expired but no refresh reserve will be
-      // sent (amount == 0 because there's no free balance): returning it would
-      // just get rejected by the operator ("reservation expired") and the caller
-      // would retry into the same state (#481 P1).
+      // Locked coverage is unusable once expired unless a refresh can be funded.
       if (isExpired() && amount === 0n) {
         throw new Error(
           `Your vault reservation for this operator has expired and there's no free balance ` +
@@ -701,19 +580,15 @@ export class HaloVaultClient {
     return { ops, keyEpoch: state.keyEpoch };
   }
 
-  /** Refill the vault from the signer's USDC so `neededFreeBase` is collectible. */
+  /** Refill the vault until the requested free amount is collectible. */
   private async autoTopUp(neededFreeBase: bigint): Promise<boolean> {
     if (this.autoTopUpBase <= 0n) return false;
     try {
       const s = await this.readVaultState();
-      if (s.withdrawable >= neededFreeBase) return true; // a concurrent top-up covered it
+      if (s.withdrawable >= neededFreeBase) return true;
       const targetBalance =
         s.lockedTotal + (neededFreeBase > this.autoTopUpBase ? neededFreeBase : this.autoTopUpBase);
       const tx = await this.ensureDeposit(targetBalance);
-      // Re-read before claiming success: ensureDeposit may have been a no-op
-      // (already funded) or a concurrent reservation may have locked the fresh
-      // balance. Only return true (and log the win) when free liquidity actually
-      // covers the need, so the return value and logs aren't optimistically wrong.
       const after = await this.readVaultState();
       const covered = after.withdrawable >= neededFreeBase;
       if (tx && covered) {
@@ -733,8 +608,7 @@ export class HaloVaultClient {
       : `${base} Deposit more with HaloVaultClient.deposit(usd), or set autoTopUpUsd to refill from the signer automatically.`;
   }
 
-  /** Poll until a submitted releaseExpired is mined (`locked` returns to 0), or
-   *  time out — so the fresh reserve that follows opens a new cycle (#473). */
+  /** Wait until release confirmation makes a fresh reservation cycle possible. */
   private async waitForRelease(operator: string): Promise<void> {
     const deadline = Date.now() + 30_000;
     // eslint-disable-next-line no-constant-condition
@@ -742,7 +616,7 @@ export class HaloVaultClient {
       try {
         if ((await this.readOps(operator)).locked === 0n) return;
       } catch {
-        /* transient RPC — the release tx is submitted; keep polling to the deadline */
+        // Keep polling after transient RPC failures.
       }
       if (Date.now() > deadline) {
         throw new Error("Reclaim didn't confirm on-chain in time — retry shortly.");
@@ -759,18 +633,14 @@ export class HaloVaultClient {
         const now = await this.readOps(operator);
         if (now.cycle > before.cycle || now.locked > before.locked) return now;
       } catch {
-        /* transient RPC — keep polling to the deadline */
+        // Keep polling after transient RPC failures.
       }
       if (Date.now() > deadline) throw new Error("Reservation didn't confirm on-chain in time — retry shortly.");
       await new Promise((r) => setTimeout(r, 600));
     }
   }
 
-  /**
-   * Record the operator-reported actual cost against the cumulative receipt and
-   * redeem it in the BACKGROUND (the answer never waits on an on-chain tx).
-   * Receipts are cumulative + monotonic per cycle; the queue keeps them ordered.
-   */
+  /** Record actual cost and enqueue a monotonic cumulative receipt for redemption. */
   recordAndRedeem(
     operator: string,
     ops: OpsState,
@@ -798,8 +668,7 @@ export class HaloVaultClient {
           keyEpoch,
           cycle: ops.cycle,
         });
-        // Cumulative receipts supersede earlier receipts for the same cycle, so
-        // retaining only the highest target preserves the entire unpaid tail.
+        // The highest cumulative receipt supersedes earlier receipts in its cycle.
         this.pendingRedeems.set(key, {
           operator,
           cumulative,
@@ -807,12 +676,11 @@ export class HaloVaultClient {
           cycle: ops.cycle,
           inFlight: false,
         });
-        this.persistPending(); // durable: survive a restart (issue #369 follow-up)
+        this.persistPending();
         await this.pushReceipt(operator, cumulative, signature).catch(() => false);
         await this.attemptRedeem(key);
       } catch (e) {
-        // A signing failure cannot be retried with the same receipt. A later
-        // cumulative receipt will sign and cover this amount again.
+        // A later cumulative receipt can cover a failed signing attempt.
         this.cfg.log(`vault receipt signing failed (next receipt covers it): ${errStr(e)}`);
         if (this.pendingRedeems.size === 0 && this.redeemRetryTimer) {
           clearInterval(this.redeemRetryTimer);
@@ -834,16 +702,7 @@ export class HaloVaultClient {
       }
     };
     try {
-      // Stale-cycle guard. A receipt's signature binds its reservation `cycle`
-      // (the contract hashes the CURRENT on-chain cycle into the redeem digest),
-      // so once a reservation is released/expired and the cycle bumps, a receipt
-      // for the old cycle can NEVER redeem — it reverts BadSignature by
-      // construction. Without this, such a receipt is retried forever, the queue
-      // never drains, and (worse) the operator's un-receipted "floating" credit
-      // fills up until it stops serving this consumer. Drop it once the chain has
-      // moved past its cycle. Also drop a same-cycle receipt already covered by
-      // on-chain `redeemed` (the operator-driven path beat us to it). Best-effort:
-      // an RPC hiccup falls through to the normal attempt + error classification.
+      // Old-cycle receipts can never redeem; same-cycle receipts may already be collected.
       try {
         const onchain = await this.readOps(pending.operator);
         if (onchain.cycle > pending.cycle) {
@@ -854,12 +713,10 @@ export class HaloVaultClient {
           return;
         }
         if (onchain.cycle === pending.cycle && pending.cumulative <= onchain.redeemed) {
-          clearIfCurrent(); // already collected (e.g. via the operator-driven redeem)
+          clearIfCurrent();
           return;
         }
-      } catch {
-        /* RPC blip — proceed to attempt; the retry loop re-checks next tick */
-      }
+      } catch {}
 
       await this.postRedeem(pending.operator, pending.cumulative, pending.signature);
       clearIfCurrent();
@@ -890,8 +747,7 @@ export class HaloVaultClient {
     this.redeemRetryTimer.unref?.();
   }
 
-  /** Await queued work, make one final attempt at every retained receipt, and
-   *  stop the retry timer. Call during graceful shutdown. */
+  /** Make a final redemption attempt and stop the retry timer. */
   async flushRedeems(): Promise<void> {
     await this.redeemQueue.catch(() => {});
     await Promise.allSettled([...this.pendingRedeems.keys()].map((key) => this.attemptRedeem(key)));
@@ -905,37 +761,32 @@ export class HaloVaultClient {
     return this.pendingRedeems.size;
   }
 
-  /** Persist the pending-redeem queue to disk (atomic write-then-rename, so a
-   *  crash mid-write can't truncate it), best-effort, so a restart can resume
-   *  settling. Signatures are public redeem authorizations (submitted on-chain
-   *  anyway), not secrets. The transient `inFlight` flag is never persisted.
-   *  No-op when no `pendingStorePath` is configured. */
+  /** Persist pending receipts atomically and best-effort. */
   private persistPending(): void {
     const f = this.cfg.pendingStorePath;
     if (!f) return;
     try {
-      const arr = [...this.pendingRedeems.entries()].map(([key, v]) => ({
-        key,
-        operator: v.operator,
-        cumulative: v.cumulative.toString(),
-        signature: v.signature,
-        cycle: v.cycle.toString(),
-      }));
+      const arr = [
+        ...this.preservedForeignPending,
+        ...[...this.pendingRedeems.entries()].map(([key, v]) => ({
+          key,
+          vaultAddress: this.cfg.vaultAddress,
+          operator: v.operator,
+          cumulative: v.cumulative.toString(),
+          signature: v.signature,
+          cycle: v.cycle.toString(),
+        })),
+      ];
       mkdirSync(dirname(f), { recursive: true });
       const tmp = `${f}.tmp`;
       writeFileSync(tmp, JSON.stringify(arr), "utf-8");
-      renameSync(tmp, f); // atomic replace on the same filesystem
+      renameSync(tmp, f);
     } catch {
-      /* durability is best-effort — never break a serve on a write error */
+      // Persistence failure must not break a served response.
     }
   }
 
-  /**
-   * Reload the pending-redeem queue persisted by a prior process and resume
-   * settling it (issue #369 follow-up). Call once at startup. Stale entries (the
-   * cycle moved on since) fail their next redeem with a terminal revert and are
-   * dropped, so the file self-heals. No-op when no store path / nothing pending.
-   */
+  /** Reload persisted pending receipts and resume settlement. */
   resumePendingRedeems(): void {
     const f = this.cfg.pendingStorePath;
     if (!f) return;
@@ -943,26 +794,31 @@ export class HaloVaultClient {
     try {
       raw = readFileSync(f, "utf-8");
     } catch {
-      return; // no prior pending file — normal fresh start
+      return;
     }
-    let arr: Array<{
-      key: string;
-      operator: string;
-      cumulative: string;
-      signature: string;
-      cycle: string;
-    }>;
+    let arr: PersistedPendingRedeem[];
     try {
       arr = JSON.parse(raw);
     } catch (e) {
-      // The file exists but is corrupt — surface it rather than silently abandon
-      // receipts (funds may be owed). Atomic persist makes this rare.
+      // Surface corruption because the file may represent unpaid work.
       this.cfg.log(`pending vault-redeem file unreadable, cannot resume (${errStr(e)}): ${f}`);
       return;
     }
     if (!Array.isArray(arr) || arr.length === 0) return;
+    this.preservedForeignPending.length = 0;
+    let skippedDifferentVault = 0;
     for (const e of arr) {
       try {
+        // Legacy entries predate custom-vault support and were always signed for
+        // the consensus vault. Never replay either legacy or explicitly scoped
+        // entries against a different EIP-712 domain.
+        const persistedVault =
+          e.vaultAddress === undefined ? VAULT_ADDRESS : getAddress(e.vaultAddress);
+        if (persistedVault !== this.cfg.vaultAddress) {
+          skippedDifferentVault++;
+          this.preservedForeignPending.push(e);
+          continue;
+        }
         this.pendingRedeems.set(e.key, {
           operator: e.operator,
           cumulative: BigInt(e.cumulative),
@@ -970,17 +826,17 @@ export class HaloVaultClient {
           cycle: BigInt(e.cycle),
           inFlight: false,
         });
-      } catch {
-        /* skip a malformed entry */
-      }
+      } catch {}
+    }
+    if (skippedDifferentVault > 0) {
+      this.cfg.log(
+        `ignored ${skippedDifferentVault} pending vault redeem(s) signed for a different vault`
+      );
     }
     if (this.pendingRedeems.size === 0) return;
     this.cfg.log(`resuming ${this.pendingRedeems.size} pending vault redeem(s) from a prior session`);
     this.startRedeemRetry();
-    // Attempt promptly, but enqueue on the redeem queue (which flushRedeems awaits
-    // first) so a caller that resumes then flushes actually waits for these to
-    // settle — attemptRedeem's in-flight guard would otherwise make flush's own
-    // pass return before this fire-and-forget attempt finished.
+    // Queue resumed attempts so flushRedeems waits for them.
     this.redeemQueue = this.redeemQueue.then(async () => {
       await Promise.allSettled(
         [...this.pendingRedeems.keys()].map((key) => this.attemptRedeem(key))
@@ -988,14 +844,7 @@ export class HaloVaultClient {
     });
   }
 
-  // ── deposit (on-chain, signer pays gas) ────────────────────────────────────
-  /**
-   * Ensure the vault holds at least `targetBase` for this consumer, depositing
-   * the shortfall from the signer's USDC balance (approving first if needed).
-   * Registers the session-key signer (the wallet itself by default) as the session
-   * key on the first deposit. Requires a little ETH for gas. Returns the deposit tx
-   * hash, or null when already funded.
-   */
+  /** Deposit a shortfall and register the session signer on the first deposit. */
   async ensureDeposit(targetBase: bigint): Promise<string | null> {
     const consumer = await this.consumer();
     const state = await this.readVaultState();
@@ -1010,15 +859,12 @@ export class HaloVaultClient {
         `signer USDC ($${fmtUsd(bal)}) is less than the vault top-up needed ($${fmtUsd(shortfall)}). Fund ${consumer} with USDC on Base.`
       );
     }
-    const allowance: bigint = await usdc.allowance(consumer, VAULT_ADDRESS);
+    const allowance: bigint = await usdc.allowance(consumer, this.cfg.vaultAddress);
     if (allowance < shortfall) {
-      const aTx = await usdc.approve(VAULT_ADDRESS, MaxUint256);
+      const aTx = await usdc.approve(this.cfg.vaultAddress, MaxUint256);
       await aTx.wait();
     }
-    const vault = new Contract(VAULT_ADDRESS, VAULT_ABI, w);
-    // Register the session-key signer (the wallet itself by default, or a supplied
-    // session signer, e.g. the browser-compatible derived sub-wallet). `deposit`
-    // sets it only on the FIRST deposit; later deposits ignore this arg.
+    const vault = new Contract(this.cfg.vaultAddress, VAULT_ABI, w);
     const tx = await vault.deposit(shortfall, await this.sessionAddress());
     await tx.wait();
     return tx.hash as string;
@@ -1031,37 +877,25 @@ export class HaloVaultClient {
     const w = this.signer.connect(this.provider);
     const usdcAddr = getChain(this.cfg.chainId).usdcToken;
     const usdc = new Contract(usdcAddr, ERC20_ABI, w);
-    const allowance: bigint = await usdc.allowance(consumer, VAULT_ADDRESS);
+    const allowance: bigint = await usdc.allowance(consumer, this.cfg.vaultAddress);
     if (allowance < amount) {
-      const aTx = await usdc.approve(VAULT_ADDRESS, MaxUint256);
+      const aTx = await usdc.approve(this.cfg.vaultAddress, MaxUint256);
       await aTx.wait();
     }
-    const vault = new Contract(VAULT_ADDRESS, VAULT_ABI, w);
-    // Register the session-key signer (defaults to the wallet) on the first deposit.
+    const vault = new Contract(this.cfg.vaultAddress, VAULT_ABI, w);
     const tx = await vault.deposit(amount, await this.sessionAddress());
     await tx.wait();
     return tx.hash as string;
   }
 }
 
-// ── operator selection ───────────────────────────────────────────────────────
 export interface VaultOperatorPin {
   address: string;
   priceUsdPerMtok: number;
   encryptionPubkey: string | null;
 }
 
-/**
- * Pick the cheapest VAULT-CAPABLE operator for `model` to RESERVE against. Vault
- * needs a price (to size the reservation + meter) and pins ONE operator so the
- * reservation, the request, and the receipt all line up. Filters to TEE operators
- * when `teeOnly` (confidential). Pricing uses the relay's exact resolution rule
- * (see resolveModelPriceUsdPerMtok) so the pinned price matches what the relay
- * will compute. Only operators advertising vault payments qualify — never falls
- * back to a legacy operator (its on-chain reservation gate can't honor a vault
- * reservation), matching the relay's preferVaultCapable. Returns null when no
- * vault-capable, in-price operator qualifies, so the caller fails fast.
- */
+/** Select the cheapest in-range operator that can honor a vault reservation. */
 export async function selectVaultOperator(
   relayUrl: string,
   model: string,
@@ -1100,20 +934,18 @@ export async function selectVaultOperator(
   }
 }
 
-// ── high-level inference ───────────────────────────────────────────────────────
 export interface InferenceResult {
   status: number;
   /** Raw response body text (OpenAI-compatible JSON, or an error envelope). */
   body: string;
-  /** True when a successful response produced a non-zero reported or fallback charge. */
+  /** True when a successful response produced a non-zero charge. */
   paid: boolean;
   /** Actual metered charge in USDC base units (6 decimals), when paid. */
   chargedBase?: string;
   /** The operator that served the request. */
   operator?: string;
   headers: Headers;
-  /** Vault mode only: await queued and retained redeem attempts before exiting
-   *  a short-lived process. Normal long-lived callers need not call this. */
+  /** Await retained redeem attempts before a short-lived process exits. */
   flushRedeems?: () => Promise<void>;
 }
 
@@ -1122,37 +954,25 @@ export interface PayInferenceOptions {
   relayUrl: string;
   facilitatorUrl: string;
   rpcUrl: string;
+  /** HaloVault address. Defaults to the repository consensus deployment. */
+  vaultAddress?: string;
   /** OpenAI-compatible chat-completions body. `model` is required. */
   body: Record<string, unknown>;
   chainId?: number;
-  /** Default 8453's USDC; only "vault" is fee-compliant for inference. "exact" is
-   *  an explicit escape hatch that pays the operator directly and BYPASSES the
-   *  protocol fee — dev / non-vault stacks only. */
-  mode?: "vault" | "exact";
   teeOnly?: boolean;
   maxPriceUsdPerMtok?: number;
   reserveTtlSec?: number;
   reserveMultiple?: bigint;
   reserveLiquiditySlots?: bigint;
   autoTopUpUsd?: number;
-  /** Supply a client when you want explicit lifecycle control. When omitted,
-   *  the SDK reuses a managed client for this signer and vault configuration. */
+  /** Supply a client for explicit lifecycle control; otherwise one is cached. */
   client?: HaloVaultClient;
-  /** Distinct signer for reserve+receipts (its address is what deposit registers
-   *  and what receipts must recover to). Omit to sign with `signer` itself (the
-   *  wallet is its own session key). Supply the browser-compatible derived
-   *  sub-wallet to let one wallet serve both the CLI and the web app (#426).
-   *  NOTE: the managed-client cache keys on this signer's OBJECT IDENTITY — derive
-   *  the sub-wallet ONCE and reuse the same instance across calls, or the client
-   *  (reservation ledger, pending-redeem queue) is rebuilt per call. Pass an
-   *  explicit `client` if you need lifecycle control. */
+  /** Optional receipt signer; reuse its object because the client cache keys by identity. */
   sessionSigner?: Signer;
   signal?: AbortSignal;
   log?: (msg: string) => void;
 }
 
-// Keyed by value signer → session signer → config string, so one wallet paired
-// with different session signers gets distinct clients (object identity).
 const managedVaultClients = new WeakMap<Signer, WeakMap<Signer, Map<string, HaloVaultClient>>>();
 
 function managedVaultClient(opts: PayInferenceOptions, chainId: number): HaloVaultClient {
@@ -1172,6 +992,7 @@ function managedVaultClient(opts: PayInferenceOptions, chainId: number): HaloVau
     opts.relayUrl.replace(/\/+$/, ""),
     opts.rpcUrl,
     chainId,
+    opts.vaultAddress ?? VAULT_ADDRESS,
     opts.reserveTtlSec ?? 3600,
     String(opts.reserveMultiple ?? 5n),
     String(opts.reserveLiquiditySlots ?? 8n),
@@ -1186,6 +1007,7 @@ function managedVaultClient(opts: PayInferenceOptions, chainId: number): HaloVau
         relayUrl: opts.relayUrl,
         rpcUrl: opts.rpcUrl,
         chainId,
+        vaultAddress: opts.vaultAddress,
         reserveTtlSec: opts.reserveTtlSec,
         reserveMultiple: opts.reserveMultiple,
         reserveLiquiditySlots: opts.reserveLiquiditySlots,
@@ -1199,17 +1021,9 @@ function managedVaultClient(opts: PayInferenceOptions, chainId: number): HaloVau
   return client;
 }
 
-/**
- * Pay for one inference over Halo. Defaults to the HaloVault rail (fee-compliant);
- * `mode: "exact"` is an explicit, fee-bypassing escape hatch for dev/non-vault
- * stacks. Ensures a reservation covers the request, sends with vault headers
- * (operator gates + serves, reporting the ACTUAL cost), then advances + redeems
- * the cumulative receipt in the background. Short-lived callers should await
- * the returned `flushRedeems?.()` before process exit.
- */
+/** Pay for one inference, defaulting to the fee-compliant HaloVault rail. */
 export async function payInference(opts: PayInferenceOptions): Promise<InferenceResult> {
   const chainId = opts.chainId ?? 8453;
-  const mode = opts.mode ?? "vault";
   const relayBase = opts.relayUrl.replace(/\/+$/, "");
   const url = `${relayBase}/v1/chat/completions`;
   const model = typeof opts.body.model === "string" ? opts.body.model : "";
@@ -1218,33 +1032,6 @@ export async function payInference(opts: PayInferenceOptions): Promise<Inference
     throw new Error(
       "payInference: stream:true is not supported; request a buffered response or use a streaming API"
     );
-  }
-
-  if (mode === "exact") {
-    // Escape hatch: direct x402 EIP-3009 to the operator. Bypasses the vault (and
-    // the protocol fee) — intentionally NOT the default for inference.
-    const { fetchWithX402 } = await import("./x402-client");
-    const r = await fetchWithX402(
-      url,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(opts.body),
-        signal: opts.signal,
-      },
-      opts.signer
-    );
-    const text = await r.response.text();
-    return {
-      status: r.response.status,
-      body: text,
-      paid: r.paid,
-      // Only report a charge when the payment actually settled (r.paid = retry.ok).
-      // A 402 gate or a failed retry can carry paymentAmount without any charge landing.
-      chargedBase: r.paid ? r.paymentAmount?.toString() : undefined,
-      operator: r.response.headers.get("X-Halo-Operator") ?? undefined,
-      headers: r.response.headers,
-    };
   }
 
   const pin = await selectVaultOperator(relayBase, model, {
@@ -1285,13 +1072,7 @@ export async function payInference(opts: PayInferenceOptions): Promise<Inference
   let res = await send();
   let text = await res.text();
 
-  // A reservation rejection happens before the operator serves, so it is safe to
-  // enlarge the SAME operator-bound reservation and replay. The exact required
-  // ceiling comes from the typed error body (use that exact floor so a consumer
-  // with precisely enough free balance is not rejected by a heuristic). The gate
-  // price can advance more than once (rapid catalog updates), so retry up to
-  // MAX_VAULT_RESERVATION_ATTEMPTS total instead of a single shot; bounded so a
-  // gate that advances every round can't loop forever.
+  // A typed pre-serve 402 can safely enlarge the same reservation and replay.
   for (
     let attempt = 1;
     attempt < MAX_VAULT_RESERVATION_ATTEMPTS && res.status === 402;
@@ -1307,10 +1088,6 @@ export async function payInference(opts: PayInferenceOptions): Promise<Inference
     text = await res.text();
   }
 
-  // Meter the served response with the shared, content-type-independent rule
-  // (settlement → reported body usage → unmeterable). No operator-controlled
-  // header may decide whether the operator gets paid (invariants #2/#3/#4); an
-  // unmeterable response is left unmetered rather than charged the estimate.
   const meter = meterVaultResponse(res.headers, text, pin.priceUsdPerMtok);
   const cost = meter.cost;
   if (res.ok && !meter.metered) {
@@ -1326,10 +1103,6 @@ export async function payInference(opts: PayInferenceOptions): Promise<Inference
     status: res.status,
     body: text,
     paid: res.ok && cost > 0n,
-    // Gate on res.ok too: a non-2xx response can still carry a PAYMENT-RESPONSE
-    // header with amountUsdc > 0 (settlement.amount → cost), but nothing is redeemed
-    // for it (recordAndRedeem runs only on res.ok). chargedBase must track `paid` so a
-    // caller recording spend never shows a charge for a request that wasn't collected.
     chargedBase: res.ok && cost > 0n ? cost.toString() : undefined,
     operator: pin.address,
     headers: res.headers,

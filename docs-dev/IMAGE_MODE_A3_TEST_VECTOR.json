@@ -1,0 +1,19 @@
+{
+  "name": "image-mode-a3-media-padding-vector-1",
+  "mime": "image/png",
+  "payloadHex": "000102ff",
+  "packedPlaintextHex": "48414c4f494d47310009696d6167652f706e67000102ff",
+  "packedPlaintextLength": 23,
+  "firstBucketBytes": 524288,
+  "gcmTagBytes": 16,
+  "lengthTrailerBytes": 8,
+  "paddedPlaintextBytes": 524272,
+  "trailerEndian": "uint64be",
+  "trailerHex": "0000000000000017",
+  "relayWsMaxMessageBytes": 262144,
+  "mediaFrameJsonHeadroomBytes": 8192,
+  "mediaFrameBytes": 253952,
+  "base64CiphertextLength": 699052,
+  "normalizedFrameCount": 3,
+  "normalizedCiphertextWireBytes": 761856
+}

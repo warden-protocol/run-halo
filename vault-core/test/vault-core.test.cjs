@@ -46,10 +46,16 @@ test("reserve signature verifies against the generated domain and types", async 
 
 test("pricing guards, empty model ids, and refresh bump remain canonical", () => {
   assert.equal(core.priceTokens(2, 50), 100n);
+  assert.equal(core.priceImages(0.02, 2), 40_000n);
+  assert.equal(core.priceImages(0.02, 0), 0n);
+  assert.equal(core.priceImages(0.0000001, 1), 1n);
   assert.equal(core.withReservationMargin(100n), 120n);
   assert.equal(core.withReservationMargin(1n), 2n);
   assert.throws(() => core.priceTokens(Infinity, 1), /finite non-negative/);
   assert.throws(() => core.priceTokens(1e-13, 1_000_000), /rounds to 0/);
+  assert.throws(() => core.priceImages(-1, 1), /finite non-negative/);
+  assert.throws(() => core.priceImages(1, -1), /finite non-negative/);
+  assert.throws(() => core.priceImages(1e-13, 1), /rounds to 0/);
   assert.equal(core.matchesModel("", "gpt-4"), false);
   assert.equal(core.matchesModel("gpt-4", "gpt-4-turbo"), true);
   assert.equal(
@@ -80,6 +86,33 @@ test("price resolution accepts an exact pricing key outside models and rejects n
   );
 });
 
+test("image price resolution mirrors model matching without token-rate scaling", () => {
+  assert.equal(
+    core.resolveImagePriceUsdc(["advertised/image"], { "requested/image": 0.04 }, "requested/image"),
+    0.04
+  );
+  assert.equal(
+    core.resolveImagePriceUsdc(["dall-e-3"], { "dall-e-3": 0.02 }, "dall-e-3-hd"),
+    0.02
+  );
+  assert.equal(
+    core.resolveImagePriceUsdc(["dall-e-3"], { "dall-e-3": 0.02 }, "gpt-4o"),
+    null
+  );
+  assert.equal(
+    core.resolveImagePriceUsdc(["dall-e-3"], { "dall-e-3": Infinity }, "dall-e-3"),
+    null
+  );
+  assert.equal(
+    core.resolveImagePriceUsdc(["dall-e-3"], { "dall-e-3": -0.001 }, "dall-e-3"),
+    null
+  );
+  assert.equal(
+    core.resolveImagePriceUsdc(["dall-e-3"], { "dall-e-3": 0.02 }, "dall-e-3"),
+    0.02
+  );
+});
+
 test("shared vault selection distinguishes free and legacy pinned operators", () => {
   const legacy = {
     address: "0xlegacy",
@@ -98,6 +131,77 @@ test("shared vault selection distinguishes free and legacy pinned operators", ()
     "pinned_not_vault_capable"
   );
   assert.equal(core.selectVaultOperatorFromList([free], "model").reason, "free_model");
+});
+
+test("shared image vault selection uses exact image capability and positive per-image pricing", () => {
+  const legacy = {
+    address: "0xlegacy",
+    models: ["dall-e-3"],
+    pricing: { "dall-e-3": 0.001 },
+    imageModels: ["dall-e-3"],
+    imagePricing: { "dall-e-3": 0.02 },
+    vaultPayments: false,
+  };
+  const fuzzyCollision = {
+    address: "0xfuzzy",
+    models: ["dall-e-3"],
+    pricing: { "dall-e-3": 0.001 },
+    imageModels: ["dall-e-3"],
+    imagePricing: { "dall-e-3": 0.01 },
+    vaultPayments: true,
+  };
+  const expensive = {
+    address: "0xexpensive",
+    models: ["dall-e-3-hd"],
+    pricing: { "dall-e-3-hd": 0.001 },
+    imageModels: ["dall-e-3-hd"],
+    imagePricing: { "dall-e-3-hd": 0.08 },
+    vaultPayments: true,
+  };
+  const cheap = {
+    address: "0xcheap",
+    models: ["dall-e-3-hd"],
+    pricing: { "dall-e-3-hd": 0.001 },
+    imageModels: ["dall-e-3-hd"],
+    imagePricing: { "dall-e-3-hd": 0.03 },
+    vaultPayments: true,
+  };
+  const free = {
+    address: "0xfree",
+    models: ["image/free"],
+    imageModels: ["image/free"],
+    imagePricing: { "image/free": 0 },
+    vaultPayments: true,
+  };
+  const fuzzyPriceOnly = {
+    address: "0xfuzzyprice",
+    models: ["dall-e-3", "dall-e-3-hd"],
+    pricing: { "dall-e-3": 0.001, "dall-e-3-hd": 0.001 },
+    imageModels: ["dall-e-3", "dall-e-3-hd"],
+    imagePricing: { "dall-e-3": 0.01 },
+    vaultPayments: true,
+  };
+
+  assert.equal(
+    core.selectVaultImageOperatorFromList([legacy], "dall-e-3").reason,
+    "no_vault_operator"
+  );
+  assert.equal(
+    core.selectVaultImageOperatorFromList([fuzzyCollision], "dall-e-3-hd").reason,
+    "no_operator"
+  );
+  assert.equal(
+    core.selectVaultImageOperatorFromList([fuzzyPriceOnly], "dall-e-3-hd").reason,
+    "unpriced"
+  );
+  const selected = core.selectVaultImageOperatorFromList(
+    [expensive, cheap, fuzzyCollision],
+    "dall-e-3-hd"
+  );
+  assert.equal(selected.reason, "selected");
+  assert.equal(selected.selected.operator.address, "0xcheap");
+  assert.equal(selected.selected.priceUsdcPerImage, 0.03);
+  assert.equal(core.selectVaultImageOperatorFromList([free], "image/free").reason, "free_model");
 });
 
 test("cumulative receipt advancement keeps the high-water ceiling monotonic", () => {
@@ -120,14 +224,10 @@ test("cumulative receipt advancement keeps the high-water ceiling monotonic", ()
 
 test("classifySessionKey distinguishes unregistered, match, and mismatch (#426)", () => {
   const wallet = "0x00000000000000000000000000000000000000A0";
-  // No key set yet → the next deposit registers one; not a problem.
   assert.equal(core.classifySessionKey(core.ZERO_ADDRESS, wallet), "unregistered");
   assert.equal(core.classifySessionKey("", wallet), "unregistered");
-  // Registered key IS the signer, case-insensitively → receipts redeem.
   assert.equal(core.classifySessionKey(wallet.toLowerCase(), wallet), "match");
   assert.equal(core.classifySessionKey(wallet, wallet.toLowerCase()), "match");
-  // A DIFFERENT key is registered (e.g. the browser sub-wallet on a CLI wallet)
-  // → every receipt this signer produces reverts BadSignature.
   assert.equal(
     core.classifySessionKey("0x00000000000000000000000000000000000000ff", wallet),
     "mismatch"
@@ -135,9 +235,6 @@ test("classifySessionKey distinguishes unregistered, match, and mismatch (#426)"
 });
 
 test("session sub-wallet derivation is pinned and deterministic (#426 cross-surface)", async () => {
-  // The message is a CROSS-SURFACE CONTRACT with the browser (frontend/src/lib/
-  // subKey.ts). Pin it byte-for-byte so a change that would strand funds / desync
-  // the CLI's browser mode fails loudly here.
   assert.equal(
     core.SUBKEY_DERIVATION_MESSAGE,
     "Halo — create in-browser agent sub-wallet (v2).\n" +
@@ -150,9 +247,6 @@ test("session sub-wallet derivation is pinned and deterministic (#426 cross-surf
     core.SUBKEY_DERIVATION_MESSAGE + "\n" + owner.toLowerCase()
   );
 
-  // Deterministic: the same wallet reproduces the same sub-wallet; a different
-  // wallet derives a different one. This is what lets the CLI (`--session-key
-  // browser`) and the browser share one session key.
   const main = new Wallet("0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d");
   const sigA = await main.signMessage(core.subKeyDerivationMessage(main.address));
   const sigB = await main.signMessage(core.subKeyDerivationMessage(main.address));
@@ -196,15 +290,12 @@ const settlementFrame = (amountUsdc) =>
 
 test("parseVaultSettlement finds a body settlement frame regardless of content-type (F2/#3)", () => {
   const body = settlementFrame("12345");
-  // Operator streams the settlement frame but mislabels/omits content-type — the
-  // scan must not depend on the operator-controlled header (invariant #3).
   for (const ct of ["application/json", "text/plain", ""]) {
     const headers = new Headers(ct ? { "content-type": ct } : {});
     const parsed = core.parseVaultSettlement(headers, body);
     assert.equal(parsed.present, true, `content-type=${JSON.stringify(ct)}`);
     assert.equal(parsed.amount, 12345n);
   }
-  // Correctly-labeled SSE still honored.
   const sse = core.parseVaultSettlement(new Headers({ "content-type": "text/event-stream" }), body);
   assert.equal(sse.present, true);
   assert.equal(sse.amount, 12345n);
@@ -235,15 +326,13 @@ test("usageTokensFromBody reads JSON usage and SSE trailing usage alike (F1)", (
 });
 
 test("meterVaultResponse: settlement > body usage > unmeterable, content-type independent (F1/F2/#4)", () => {
-  const price = 1000; // USD per Mtok
-  // 1) explicit settlement wins even under a generic content-type.
+  const price = 1000;
   const s = core.meterVaultResponse(
     new Headers({ "content-type": "application/json" }),
     settlementFrame("777"),
     price
   );
   assert.deepEqual(s, { cost: 777n, settled: true, metered: true });
-  // 2) no settlement → meter from reported body usage (invariant #4: real work is paid).
   const u = core.meterVaultResponse(
     new Headers({ "content-type": "application/json" }),
     JSON.stringify({ usage: { total_tokens: 1000 } }),
@@ -253,7 +342,6 @@ test("meterVaultResponse: settlement > body usage > unmeterable, content-type in
   assert.equal(u.metered, true);
   assert.equal(u.cost, core.priceTokens(price, 1000));
   assert.ok(u.cost > 0n);
-  // 3) neither settlement nor usage → unmeterable, cost 0n (invariant #2: never guess).
   const none = core.meterVaultResponse(
     new Headers({ "content-type": "application/json" }),
     JSON.stringify({ choices: [] }),
@@ -287,8 +375,6 @@ test("MAX_VAULT_RESERVATION_ATTEMPTS is a bounded positive integer (F6)", () => 
   assert.ok(core.MAX_VAULT_RESERVATION_ATTEMPTS >= 2 && core.MAX_VAULT_RESERVATION_ATTEMPTS <= 10);
 });
 
-// ── Reasoning-aware completion ceiling (issue #421, Fix B sizing) ─────────────
-
 test("isReasoningModel flags reasoning families and not ordinary models", () => {
   for (const m of [
     "o1",
@@ -296,17 +382,17 @@ test("isReasoningModel flags reasoning families and not ordinary models", () => 
     "o3-mini",
     "openai/o4-mini",
     "o5",
-    "o6", // open-ended digit range — future o-series still match
+    "o6",
     "o10",
-    "o3:latest", // Ollama/OpenRouter tag suffix
-    "o1_mini", // underscore-delimited variant
+    "o3:latest",
+    "o1_mini",
     "gpt-5",
     "gpt-5-mini",
-    "gemini-2.5-flash", // reasons by default (no suffix)
+    "gemini-2.5-flash",
     "google/gemini-2.5-pro",
-    "grok-4", // real xAI reasoning flagship id
+    "grok-4",
     "x-ai/grok-4",
-    "grok-3-mini-beta", // real xAI reasoning id
+    "grok-3-mini-beta",
     "deepseek-r1",
     "deepseek/deepseek-r1-distill-qwen-32b",
     "magistral-small",
@@ -320,10 +406,10 @@ test("isReasoningModel flags reasoning families and not ordinary models", () => 
     "gpt-4o",
     "gpt-4o-mini",
     "gpt-4.1",
-    "o200k-tokenizer", // 'o2' then digits then non-boundary — must NOT match
-    "claude-sonnet-4-6", // Claude extended-thinking is opt-in + stripped → not sized here
+    "o200k-tokenizer",
+    "claude-sonnet-4-6",
     "gemini-1.5-pro",
-    "grok-3", // non-mini grok-3 does not reason by default
+    "grok-3",
     "llama-3.3-70b",
     "qwen2.5-72b",
     "mixtral-8x7b",
@@ -336,18 +422,15 @@ test("isReasoningModel flags reasoning families and not ordinary models", () => 
 test("completionCeilingTokens leaves ordinary models at their max_tokens budget", () => {
   assert.equal(core.completionCeilingTokens("gpt-4o", 16), 16);
   assert.equal(core.completionCeilingTokens("gpt-4o", 1024), 1024);
-  // honors an explicit (larger) max_completion_tokens
   assert.equal(core.completionCeilingTokens("gpt-4o", 16, 4096), 4096);
 });
 
 test("completionCeilingTokens floors reasoning models to the reasoning headroom", () => {
-  // the #421 repro: max_tokens:16 on a reasoning model → floored, not 16
   assert.equal(core.completionCeilingTokens("o3-mini", 16), core.REASONING_COMPLETION_FLOOR);
   assert.equal(
     core.completionCeilingTokens("deepseek-r1", 100),
     core.REASONING_COMPLETION_FLOOR
   );
-  // a caller who already asks for MORE than the floor keeps their larger budget
   const big = core.REASONING_COMPLETION_FLOOR + 5000;
   assert.equal(core.completionCeilingTokens("o3-mini", big), big);
   assert.equal(core.completionCeilingTokens("o3-mini", 16, big), big);
@@ -356,7 +439,6 @@ test("completionCeilingTokens floors reasoning models to the reasoning headroom"
 test("completionCeilingTokens is defensive on non-finite / non-positive budgets", () => {
   assert.equal(core.completionCeilingTokens("gpt-4o", NaN), 0);
   assert.equal(core.completionCeilingTokens("gpt-4o", -5), 0);
-  // reasoning model with a garbage budget still gets the floor
   assert.equal(core.completionCeilingTokens("o3-mini", NaN), core.REASONING_COMPLETION_FLOOR);
 });
 
@@ -367,15 +449,13 @@ test("REASONING_COMPLETION_FLOOR is a fixed positive integer (consumer/operator 
 });
 
 test("classifyReservationRevival gates zombie top-ups on the lifetime cap (#473)", () => {
-  const TTL = 604800n; // 7d maxReserveTtl (dev)
-  const GRACE = 21600n; // 6h redeemGrace (dev)
+  const TTL = 604800n;
+  const GRACE = 21600n;
   const now = 10_000_000n;
-  // No funds locked → nothing to strand; take the normal reserve path.
   assert.equal(
     core.classifyReservationRevival({ locked: 0n, expiry: 0n, created: 0n }, TTL, GRACE, now),
     "live_or_revivable"
   );
-  // Expired but cap still in the future → a top-up extends expiry, so revivable.
   assert.equal(
     core.classifyReservationRevival(
       { locked: 100n, expiry: now - 10n, created: now - 100n },
@@ -385,7 +465,6 @@ test("classifyReservationRevival gates zombie top-ups on the lifetime cap (#473)
     ),
     "live_or_revivable"
   );
-  // Lifetime cap in the past, still within expiry+grace → wedged (can't revive, can't reclaim).
   assert.equal(
     core.classifyReservationRevival(
       { locked: 100n, expiry: now - 100n, created: now - TTL - 100n },
@@ -395,7 +474,6 @@ test("classifyReservationRevival gates zombie top-ups on the lifetime cap (#473)
     ),
     "wedged"
   );
-  // Lifetime cap in the past AND past expiry+grace → reclaimable.
   assert.equal(
     core.classifyReservationRevival(
       { locked: 100n, expiry: now - GRACE - 100n, created: now - TTL - GRACE - 100n },
@@ -405,8 +483,6 @@ test("classifyReservationRevival gates zombie top-ups on the lifetime cap (#473)
     ),
     "reclaimable"
   );
-  // Never-topped reservation older than the cap but expiry far in the past:
-  // expiry < cap < now still strands (cap can't push expiry past now).
   assert.equal(
     core.classifyReservationRevival(
       { locked: 100n, expiry: now - TTL, created: now - TTL, },
@@ -416,34 +492,26 @@ test("classifyReservationRevival gates zombie top-ups on the lifetime cap (#473)
     ),
     "reclaimable"
   );
-  // #481 review: expired AND reclaim-eligible, but the lifetime cap is still
-  // comfortably in the FUTURE → prefer a plain top-up (revive), NOT reclaim.
-  // `releaseExpired` can transiently revert (GracePeriodNotOver, sequencer gate)
-  // even past expiry+grace, so we must not force the fragile reclaim path when a
-  // robust revive is available.
   assert.equal(
     core.classifyReservationRevival(
       { locked: 100n, expiry: now - GRACE - 50n, created: now - GRACE - 50n },
-      TTL, // cap = created + TTL is far in the future
+      TTL,
       GRACE,
       now,
       120n
     ),
     "live_or_revivable"
   );
-  // Reclaim IS preferred when past grace AND the cap is too close to safely
-  // revive (a top-up would race the cap): expiry past grace, cap inside margin.
   assert.equal(
     core.classifyReservationRevival(
-      { locked: 100n, expiry: now - GRACE - 50n, created: now - TTL + 60n }, // cap = now + 60
+      { locked: 100n, expiry: now - GRACE - 50n, created: now - TTL + 60n },
       TTL,
       GRACE,
       now,
-      120n // margin 120 > 60 headroom → revive unsafe → reclaim
+      120n
     ),
     "reclaimable"
   );
-  // Expired within grace, cap comfortably in the future → revivable by top-up.
   assert.equal(
     core.classifyReservationRevival(
       { locked: 100n, expiry: now - 10n, created: now - 10n },
@@ -454,36 +522,29 @@ test("classifyReservationRevival gates zombie top-ups on the lifetime cap (#473)
     ),
     "live_or_revivable"
   );
-  // Expired within grace, but the cap is INSIDE the safety margin → a top-up
-  // could mine after the cap and strand the funds, and reclaim isn't available
-  // yet → wedged.
   assert.equal(
     core.classifyReservationRevival(
-      { locked: 100n, expiry: now - 10n, created: now - TTL + 60n }, // cap = now + 60
+      { locked: 100n, expiry: now - 10n, created: now - TTL + 60n },
       TTL,
       GRACE,
       now,
-      120n // margin 120 > 60 headroom
+      120n
     ),
     "wedged"
   );
-  // #481 review (near-expiry): NOT yet expired but inside the refresh margin AND
-  // sitting at its lifetime cap (cap == expiry, within the margin). A refresh
-  // top-up can't move expiry → don't submit a dead top-up; keep serving as-is.
   assert.equal(
     core.classifyReservationRevival(
-      { locked: 100n, expiry: now + 60n, created: now + 60n - TTL }, // live; cap = now + 60
+      { locked: 100n, expiry: now + 60n, created: now + 60n - TTL },
       TTL,
       GRACE,
       now,
-      120n // margin 120 > 60 headroom → cap can't extend expiry
+      120n
     ),
     "serve_as_is"
   );
-  // Near-expiry but the cap is far ahead → a refresh top-up DOES extend expiry.
   assert.equal(
     core.classifyReservationRevival(
-      { locked: 100n, expiry: now + 60n, created: now }, // live; cap = now + TTL (far)
+      { locked: 100n, expiry: now + 60n, created: now },
       TTL,
       GRACE,
       now,

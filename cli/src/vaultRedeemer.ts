@@ -1,22 +1,3 @@
-/**
- * Operator-side redeem driver (operator-driven redeem, issue #369).
- *
- * In the fixed flow the operator — the party owed the money — holds the
- * consumer-signed cumulative receipts and submits the on-chain `redeem` itself,
- * instead of hoping the consumer does. It posts the receipt to the facilitator
- * (same permissionless `/vault/redeem` the consumer used; the facilitator pays
- * gas and the contract verifies the signature), with retry, because its own
- * revenue depends on it landing — unlike the old consumer-driven fire-and-forget
- * that dropped failures.
- *
- * Coalescing: receipts are cumulative, so a single redeem of the HIGHEST held
- * receipt collects everything beneath it. `kick()` therefore just (re)schedules
- * a redeem of whatever `ledger.redeemable()` currently returns; many kicks during
- * a burst collapse into one on-chain redeem. Serialized per (consumer, operator)
- * so receipts settle in monotonic order and a re-scan never double-submits.
- *
- * Off the serve path entirely — the answer never waits on this.
- */
 import { VaultCreditLedger } from "./vaultCredit";
 import { classifyRedeemError, formatUsdcBase } from "@halo/vault-core";
 
@@ -49,9 +30,7 @@ export class OperatorRedeemer {
     this.queues.set(key, next);
   }
 
-  /** Re-kick every pair that still holds an unredeemed receipt. Run on a timer so
-   *  a receipt whose redeem failed transiently (and got no follow-up receipt) is
-   *  still collected before the reservation expires (issue #369). */
+  /** Periodically retry pairs that still hold a redeemable receipt. */
   sweep(): void {
     for (const { consumer, operator } of this.ledger.pairsWithRedeemable()) {
       this.kick(consumer, operator);
@@ -90,14 +69,12 @@ export class OperatorRedeemer {
         if (res.ok && body.hash) {
           this.ledger.noteRedeemed(consumer, operator, receipt.cumulative, receipt.cycle);
           this.log(
-            `  ✓ vault redeem ${body.hash.slice(0, 10)}… collected ${fmtUsd(receipt.cumulative)} cumulative from ${abbrev(consumer)}`
+            `  ✓ vault redeem ${body.hash} collected ${fmtUsd(receipt.cumulative)} cumulative (${receipt.cumulative} base) from ${abbrev(consumer)}`
           );
           return;
         }
         if (res.ok && body.status === "already-redeemed") {
-          // Facilitator deduped it: this cumulative is already captured on-chain
-          // (issue #392 idempotency). Same terminal outcome as a StaleReceipt
-          // revert — mark collected and stop, don't retry.
+          // Treat the facilitator's terminal duplicate response as locally complete.
           this.ledger.noteRedeemed(consumer, operator, receipt.cumulative, receipt.cycle);
           return;
         }
@@ -110,12 +87,10 @@ export class OperatorRedeemer {
           return;
         }
         if (cls === "uncollectable") {
-          // Deterministic verify failure (e.g. the cycle bumped — the consumer
-          // re-reserved, releasing this cycle's tail). Retrying can't help; stop
-          // and surface the bounded loss (≤ the credit window) rather than spin.
+          // Deterministic verification failure: retrying cannot make this receipt collectible.
           this.ledger.noteRedeemed(consumer, operator, receipt.cumulative, receipt.cycle);
           this.log(
-            `  ⚠ vault receipt from ${abbrev(consumer)} is uncollectable (${errStr.slice(0, 80)}) — abandoning (bounded by the credit window)`
+            `  ⚠ vault receipt from ${abbrev(consumer)} is uncollectable (${errStr.slice(0, 80)}) — abandoning (loss can reach the reservation's collectible ceiling)`
           );
           return;
         }
@@ -138,24 +113,8 @@ export class OperatorRedeemer {
   }
 }
 
-/** Classify a facilitator redeem error so we retry only TRANSIENT failures.
- *  - `collected`: nothing left to collect (StaleReceipt = cumulative already
- *    redeemed; ExceedsReservation = reservation fully drained) — no loss, stop.
- *  - `uncollectable`: deterministic verify failure (BadSignature/NoSessionKey,
- *    incl. an old-cycle receipt whose digest no longer recovers) — retrying
- *    can't help; stop and report.
- *  - `transient`: RPC/HTTP/network blip (retry).
- *
- *  Matches the HaloVault custom-error NAMES, NOT bare words like "stale" or
- *  "already": those collide with benign transient RPC noise ("already known",
- *  "nonce ... already used", a "stale" block read), and classifying a transient
- *  blip as `collected`/`uncollectable` would mark a real, still-collectible
- *  receipt redeemed and silently abandon it (operator forfeits served revenue).
- *  When the revert name isn't present in the message (e.g. the node returns a
- *  bare "execution reverted"), we fall through to `transient` ON PURPOSE: a later
- *  kick / 30s sweep re-attempts, and the credit window stays full until it
- *  collects. Retrying a genuinely-stale receipt only wastes RPC; dropping a
- *  collectible one loses money — so we fail toward retry. */
+/** Classify named vault errors as collected, deterministic-uncollectable, or transient.
+ * Ambiguous messages remain transient so a collectible receipt is never discarded. */
 function fmtUsd(base: bigint): string {
   return formatUsdcBase(base, { withDollarSign: true });
 }

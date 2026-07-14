@@ -1,21 +1,3 @@
-/**
- * halo consume — run Halo as a local OpenAI-compatible inference endpoint.
- *
- * Starts a small HTTP server on localhost that any OpenAI-compatible client or
- * agent (Hermes, OpenClaw, the OpenAI SDK, LangChain, …) can point its
- * `baseURL` at. Each request is paid for from the CLI's own wallet via x402
- * ("exact" mode): the server probes the relay, signs an EIP-3009 authorization
- * when challenged with a 402, retries, and relays the operator's response back.
- *
- * This is the consumer-side mirror of `serve`: same keystore, same config, same
- * wallet — one direction earns, the other spends. No browser, no wallet popup.
- *
- *   halo consume [--port 8799] [--api-key SECRET] [--max-usdc 0.10]
- *
- * The wallet is the only credential — fund its address with USDC on Base. The
- * server binds to 127.0.0.1 by default and (optionally) requires a bearer token,
- * because anything that can reach it can spend the wallet.
- */
 import http from "node:http";
 import prompts from "prompts";
 import { spawn } from "node:child_process";
@@ -23,15 +5,24 @@ import { openSync } from "node:fs";
 import path from "node:path";
 import { loadConfig, configDir, BASE_NETWORK, BASE_CHAIN_ID } from "../config";
 import { loadWallet } from "../wallet";
-import { payAndFetch, X402Error } from "../x402-consume";
 import {
   generateEphemeralKeypair,
   encryptRequest,
   decryptResponse,
+  decryptBytes,
   hexToPubkey,
   isEncryptedEnvelope,
   EncryptedEnvelope,
+  BytesEncryptedEnvelope,
+  EphemeralKeyPair,
+  authenticatedOperatorPubkey,
 } from "../encryption";
+import {
+  MediaChunkFrame,
+  reassembleMediaEnvelope,
+  trimPadding,
+  unpackMediaPlaintext,
+} from "../mediaChunks";
 import {
   encryptToTee,
   decryptFromTee,
@@ -54,15 +45,20 @@ import {
 } from "../vault-consume";
 import {
   MAX_VAULT_RESERVATION_ATTEMPTS,
-  matchesModel,
+  RESERVATION_PRICE_MARGIN_BPS,
   meterVaultResponse,
+  priceImages,
   requiredVaultReservationBase,
+  selectVaultImageOperatorFromList,
   selectVaultOperatorFromList,
+  settlementAmount,
   withReservationMargin,
   type VaultOperatorSelectionReason,
 } from "@halo/vault-core";
 import { setCliVersionHeader } from "../versionHeader";
 import { restartIntoManagedInstall, startAutoUpdateMonitor } from "../update";
+import { relayCliVersion } from "../relayVersion";
+import { resolveVaultAddress } from "../vault-address";
 
 interface Args {
   port?: number;
@@ -74,8 +70,7 @@ interface Args {
   keystore?: string;
   /** Bind host. Defaults to 127.0.0.1 — do not expose publicly without auth. */
   host?: string;
-  /** Route only to TEE operators and end-to-end-encrypt the prompt to the
-   *  enclave (the operator can't read it), then verify the response signature. */
+  /** Encrypt to the reported TEE key and require the response signer to match. */
   confidential?: boolean;
   /** Base URL of the TEE provider's attestation/key endpoint (default NEAR). */
   teeBaseUrl?: string;
@@ -87,78 +82,26 @@ interface Args {
    *  the prompt in plaintext through the relay). Default false — E2E is ON when
    *  the chosen operator advertises an encryption key. */
   noE2e?: boolean;
-  /** Cumulative spend ceiling (USD) for this process — the budget an autonomous
-   *  agent can't blow past in a loop. 0 / unset = no cap. Distinct from
-   *  --max-usdc (per request); this bounds total volume. Updatable at runtime via
-   *  POST /v1/budget. */
+  /** Process-wide USD spend ceiling, runtime-updatable; zero is uncapped. */
   budgetUsdc?: number;
   /** Warn (response header) once cumulative spend reaches this fraction of the
    *  budget, so the agent can tell the user and offer to raise it. Default 0.8. */
   budgetWarnPct?: number;
-  /** Use the HaloVault rail (RFC v2): deposit once, then pay the ACTUAL tokens
-   *  each request used (settle-actual) instead of the prompt-blind flat per-request
-   *  quote of exact mode. Requires a vault deposit (auto-managed via --vault-deposit). */
-  vault?: boolean;
-  /** Auto-managed vault top-up target (USD). On startup (and when the vault runs
-   *  low) consume tops the vault up to this from the wallet's USDC. Needs a little
-   *  ETH on Base for the deposit tx. 0/unset = never auto-deposit (manage with
-   *  `halo vault deposit`). */
+  /** Vault USD top-up target; zero disables automatic deposits. */
   vaultDeposit?: number;
-  /** Batch size for vault reservations: reserve this many requests' worth at once
-   *  to amortize the reserve tx. Default 5. Lower it when fanning out across many
-   *  operators so reservations don't lock the whole deposit (#367); a single
-   *  reservation is also auto-capped at a slice of the free balance regardless. */
+  /** Reservation batch size; each reservation is also capped by free balance. */
   vaultReserveMultiple?: number;
-  /** Vault session-key scheme: "wallet" (default — the CLI wallet IS the session
-   *  key) or "browser" (derive the SAME in-browser sub-wallet the Halo web app
-   *  registers, so ONE wallet works on both surfaces). See #426. */
+  /** Session signer: the CLI wallet or browser-compatible derived key. */
   sessionKey?: string;
   /** Self-daemonize: re-spawn the server detached (own session, reparented to
    *  init) and return immediately, so an agent/gateway that launches consume
    *  can't kill it on restart. Idempotent — no-ops if one's already serving. */
   detach?: boolean;
-  /** Override the confirmed-stale-vault guard (#392): proceed with fund-moving
-   *  paths even when the pinned VAULT_ADDRESS differs from the facilitator's live
-   *  vault. Escape hatch for intentional splits; normally you should rebuild. */
+  /** Permit fund movement despite a confirmed pinned/live vault mismatch. */
   force?: boolean;
 }
 
-const MAX_BODY_BYTES = 5 * 1024 * 1024; // 5 MB — generous for large-context prompts
-
-/**
- * Pick an operator that serves `model` AND advertises an X25519 encryption key,
- * so we can E2E-encrypt the prompt to it (relay sees only ciphertext). Returns
- * the operator address + pubkey, or null when none is E2E-capable (caller falls
- * back to plaintext). Cheapest priced first, mirroring the relay's default.
- */
-async function selectE2EOperator(
-  relayBase: string,
-  model: string
-): Promise<{ address: string; encryptionPubkey: string } | null> {
-  try {
-    const res = await fetch(`${relayBase}/v1/operators`, { signal: AbortSignal.timeout(10_000) });
-    if (!res.ok) return null;
-    const { operators } = (await res.json()) as {
-      operators: Array<{
-        address: string;
-        models: string[];
-        encryptionPubkey?: string | null;
-        pricing?: Record<string, number>;
-      }>;
-    };
-    const candidates = operators
-      .filter((o) => o.encryptionPubkey && o.models.some((m) => matchesModel(m, model)))
-      .sort((a, b) => {
-        const pa = a.pricing?.[model] ?? Number.POSITIVE_INFINITY;
-        const pb = b.pricing?.[model] ?? Number.POSITIVE_INFINITY;
-        return pa - pb;
-      });
-    const op = candidates[0];
-    return op ? { address: op.address, encryptionPubkey: op.encryptionPubkey! } : null;
-  } catch {
-    return null;
-  }
-}
+const MAX_BODY_BYTES = 5 * 1024 * 1024;
 
 interface VaultOperatorPin {
   address: string;
@@ -171,14 +114,7 @@ interface VaultOperatorSelectionResult {
   reason: VaultOperatorSelectionReason;
 }
 
-/**
- * Pick the cheapest priced VAULT-CAPABLE operator for `model` to RESERVE against in
- * vault mode. Vault needs a price (to size the reservation + meter) and pins ONE
- * operator so the reservation, the request, and the receipt all line up. Only
- * operators advertising `vaultPayments` qualify — the relay filters vault routing to
- * them with no legacy fallback, so a legacy pin would 503 at the relay. Filters to TEE
- * operators when `teeOnly` (confidential). Returns null when none qualify.
- */
+/** Pick the cheapest vault-capable operator, optionally requiring TEE support; return `null` if none qualify. */
 async function selectVaultOperator(
   relayBase: string,
   model: string,
@@ -195,6 +131,7 @@ async function selectVaultOperator(
         address: string;
         models: string[];
         encryptionPubkey?: string | null;
+        pubkeyAttestation?: string | null;
         pricing?: Record<string, number>;
         tee?: boolean;
         teeModels?: string[];
@@ -213,7 +150,11 @@ async function selectVaultOperator(
       pin: {
         address: operator.address,
         priceUsdPerMtok,
-        encryptionPubkey: operator.encryptionPubkey ?? null,
+        encryptionPubkey: authenticatedOperatorPubkey(
+          operator.address,
+          operator.encryptionPubkey,
+          operator.pubkeyAttestation
+        ),
       },
       reason: selection.reason,
     };
@@ -222,13 +163,73 @@ async function selectVaultOperator(
   }
 }
 
-/**
- * Send one inference over the HaloVault rail and return a payAndFetch-shaped
- * result so the caller's response post-processing (confidential/E2E decrypt, SSE,
- * budget headers) is unchanged. Ensures a reservation covers the request, sends
- * with vault headers (operator gates + serves, reporting ACTUAL cost), then
- * advances + redeems the cumulative receipt in the background.
- */
+interface VaultImageOperatorPin {
+  address: string;
+  priceUsdcPerImage: number;
+  encryptionPubkey: string | null;
+}
+
+interface VaultImageOperatorSelectionResult {
+  pin: VaultImageOperatorPin | null;
+  reason: VaultOperatorSelectionReason | "no_encrypted_operator";
+}
+
+/** Pick the cheapest vault-capable operator advertising `model` as an EXACT
+ *  imageModels member with a positive per-image price (invariant #7 — never fuzzy
+ *  matchesModel; a missing per-image unit fails selection, no token fallback). */
+export async function selectVaultImageOperator(
+  relayBase: string,
+  model: string,
+  requireAddress?: string
+): Promise<VaultImageOperatorSelectionResult> {
+  try {
+    const res = await fetch(`${relayBase}/v1/operators`, { signal: AbortSignal.timeout(10_000) });
+    if (!res.ok) return { pin: null, reason: "no_operator" };
+    const { operators } = (await res.json()) as {
+      operators: Array<{
+        address: string;
+        models: string[];
+        imageModels?: string[];
+        imagePricing?: Record<string, number>;
+        encryptionPubkey?: string | null;
+        pubkeyAttestation?: string | null;
+        vaultPayments?: boolean;
+      }>;
+    };
+    const authenticated = operators.flatMap((operator) => {
+      const encryptionPubkey = authenticatedOperatorPubkey(
+        operator.address,
+        operator.encryptionPubkey,
+        operator.pubkeyAttestation
+      );
+      return encryptionPubkey ? [{ ...operator, authenticatedEncryptionPubkey: encryptionPubkey }] : [];
+    });
+    const selection = selectVaultImageOperatorFromList(authenticated, model, {
+      requireAddress,
+      randomizeCheapestTies: !requireAddress,
+    });
+    if (!selection.selected) {
+      const pricedSelection = selectVaultImageOperatorFromList(operators, model, { requireAddress });
+      return {
+        pin: null,
+        reason: pricedSelection.selected ? "no_encrypted_operator" : selection.reason,
+      };
+    }
+    const { operator, priceUsdcPerImage } = selection.selected;
+    return {
+      pin: {
+        address: operator.address,
+        priceUsdcPerImage,
+        encryptionPubkey: operator.authenticatedEncryptionPubkey,
+      },
+      reason: selection.reason,
+    };
+  } catch {
+    return { pin: null, reason: "no_operator" };
+  }
+}
+
+/** Send one reserved vault inference and return the shared response shape; redeem actual cost in background. */
 export async function vaultSend(
   client: VaultConsumeClient,
   url: string,
@@ -264,10 +265,7 @@ export async function vaultSend(
     fetch(url, { method: "POST", headers, body: requestBody, signal: opts.signal });
   let res = await send();
   let text = await res.text();
-  // Reserve-and-replay on a reservation-gate rejection, up to
-  // MAX_VAULT_RESERVATION_ATTEMPTS total — the operator's gate price can advance
-  // more than once, so a single retry can 402 again on funds the vault could
-  // cover. Mirrors sdk/src/vault.ts payInference.
+  // Re-reserve and replay boundedly because the operator's gate price may advance between attempts.
   for (
     let attempt = 1;
     attempt < MAX_VAULT_RESERVATION_ATTEMPTS && res.status === 402;
@@ -280,12 +278,7 @@ export async function vaultSend(
     text = await res.text();
   }
 
-  // Meter with the shared, content-type-independent rule the SDK/frontend use:
-  // settlement (PAYMENT-RESPONSE header OR a halo-settlement body frame) →
-  // reported body usage → unmeterable. A prior copy read ONLY the header, so an
-  // operator that served real work but omitted/garbled PAYMENT-RESPONSE (with
-  // usage still in the body) was paid $0 — the invariant-#4 "charge zero for real
-  // work" bug. meterVaultResponse restores parity with the SDK.
+  // Meter settlement frames first, then reported usage, regardless of content type.
   const meter = meterVaultResponse(res.headers, text, opts.priceUsdPerMtok);
   const cost = meter.cost;
   if (res.ok && cost > 0n) client.recordAndRedeem(opts.operator, ops, keyEpoch, cost);
@@ -302,6 +295,465 @@ export async function vaultSend(
   };
 }
 
+/**
+ * Build the RELAY request for an image-generation send. Always targets
+ * `/v1/chat/completions` (the relay has no `/v1/images/generations` route);
+ * modality is signalled via `acceptMedia` in the body and header, never the URL.
+ */
+export function buildImageRelayRequest(
+  relayBase: string,
+  operator: string,
+  consumer: string,
+  model: string,
+  envelope: EncryptedEnvelope
+): { url: string; headers: Record<string, string>; body: Record<string, unknown> } {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "x-halo-payment-mode": "vault",
+    "x-halo-operator": operator,
+    "x-halo-vault-consumer": consumer,
+    "x-halo-accept-media": "1",
+  };
+  setCliVersionHeader(headers);
+  return {
+    url: `${relayBase.replace(/\/+$/, "")}/v1/chat/completions`,
+    headers,
+    body: { model, acceptMedia: true, _enc: envelope },
+  };
+}
+
+export interface DecodedImage {
+  mime: string;
+  bytes: Buffer;
+}
+
+export interface ConsumedImageStream {
+  images: DecodedImage[];
+  /** Base-unit settlement amount parsed from the halo-settlement frame's
+   *  `paymentResponse`, or null when no valid settlement rode the stream. */
+  settlementBase: bigint | null;
+}
+
+/**
+ * CLI-local reader for the relay's image (`acceptMedia`) SSE stream: collects
+ * `halo-media` frames per `imageIndex`, reassembles + decrypts each image, and
+ * captures the `halo-settlement` amount. Throws on a media decode failure so
+ * the caller can skip the redeem — never pay for undeliverable images.
+ */
+export async function consumeImageSseStream(
+  res: { body?: ReadableStream<Uint8Array> | null },
+  decryptMedia: (envelope: BytesEncryptedEnvelope) => Buffer
+): Promise<ConsumedImageStream> {
+  const reader = res.body?.getReader();
+  if (!reader) return { images: [], settlementBase: null };
+  const decoder = new TextDecoder();
+  let buf = "";
+  const mediaFrames: MediaChunkFrame[] = [];
+  let settlementBase: bigint | null = null;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let sep: number;
+    while ((sep = buf.indexOf("\n\n")) !== -1) {
+      const evt = buf.slice(0, sep);
+      buf = buf.slice(sep + 2);
+      let event = "message";
+      let data = "";
+      for (const line of evt.split("\n")) {
+        if (line.startsWith("event:")) event = line.slice(6).trim();
+        else if (line.startsWith("data:")) data += line.slice(5).trim();
+      }
+      if (!data) continue;
+      if (event === "halo-settlement") {
+        try {
+          const s = JSON.parse(data) as { paymentResponse?: string | null };
+          if (s.paymentResponse) settlementBase = settlementAmount(s.paymentResponse);
+        } catch {
+          /* ignore a malformed settlement frame — stays unmetered below */
+        }
+        continue;
+      }
+      if (event === "halo-media") {
+        try {
+          const frame = JSON.parse(data) as MediaChunkFrame;
+          if (frame?.type === "media-chunk") mediaFrames.push(frame);
+        } catch {
+          /* ignore a malformed media frame */
+        }
+        continue;
+      }
+      // halo-status / done / anything else: images never stream text deltas.
+    }
+  }
+  if (mediaFrames.length === 0) return { images: [], settlementBase };
+  const byImage = new Map<number, MediaChunkFrame[]>();
+  for (const frame of mediaFrames) {
+    const imageIndex = frame.imageIndex ?? 0;
+    const bucket = byImage.get(imageIndex);
+    if (bucket) bucket.push(frame);
+    else byImage.set(imageIndex, [frame]);
+  }
+  const images: DecodedImage[] = [];
+  try {
+    for (const imageIndex of [...byImage.keys()].sort((a, b) => a - b)) {
+      const envelope = reassembleMediaEnvelope(byImage.get(imageIndex) ?? []);
+      const padded = decryptMedia(envelope);
+      const unpacked = unpackMediaPlaintext(trimPadding(padded));
+      images.push({ mime: unpacked.mime, bytes: unpacked.bytes });
+    }
+  } catch (err) {
+    throw new Error(`image media decode failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  return { images, settlementBase };
+}
+
+/**
+ * Shape the caller's response as the OpenAI images API: `{created, data:
+ * [{b64_json}]}`. Does not write files — the caller decides what to do with
+ * the base64.
+ */
+export function buildImagesResponseBody(
+  images: DecodedImage[],
+  createdSec: number = Math.floor(Date.now() / 1000)
+): { created: number; data: Array<{ b64_json: string }> } {
+  return {
+    created: createdSec,
+    data: images.map((img) => ({ b64_json: img.bytes.toString("base64") })),
+  };
+}
+
+/** Build the image endpoint's success-only delivery and settlement metadata. */
+export function buildImageResponseHeaders(
+  operator: string,
+  result: { ok: boolean; paid: boolean; chargedBase?: string; images?: unknown[] },
+  budget: Record<string, string> = {}
+): Record<string, string> {
+  const headers = { ...budget };
+  if (!result.ok) return headers;
+  if (!Array.isArray(result.images) || result.images.length === 0) {
+    throw new Error("successful image result has no delivered image");
+  }
+  if (result.paid && !/^[1-9]\d*$/.test(result.chargedBase ?? "")) {
+    throw new Error("paid image result is missing a positive exact base-unit charge");
+  }
+  headers["X-Halo-Operator"] = operator;
+  headers["X-Halo-Paid"] = result.paid ? "true" : "false";
+  headers["X-Halo-E2E-Encrypted"] = "true";
+  if (result.paid) headers["X-Halo-Charged-Base"] = result.chargedBase!;
+  return headers;
+}
+
+export function decryptRequiredOperatorE2eResponse(
+  body: string,
+  operatorPublicKey: Uint8Array,
+  ephemeralPrivateKey: Uint8Array
+): string {
+  const parsed = JSON.parse(body) as { _enc?: unknown };
+  const envelopeKeys =
+    parsed &&
+    typeof parsed === "object" &&
+    !Array.isArray(parsed) &&
+    parsed._enc &&
+    typeof parsed._enc === "object" &&
+    !Array.isArray(parsed._enc)
+      ? Object.keys(parsed._enc).sort()
+      : [];
+  if (
+    !parsed ||
+    typeof parsed !== "object" ||
+    Array.isArray(parsed) ||
+    Object.keys(parsed).length !== 1 ||
+    !Object.hasOwn(parsed, "_enc") ||
+    envelopeKeys.join(",") !== "alg,ct,epk,nonce,v" ||
+    !isEncryptedEnvelope(parsed._enc)
+  ) {
+    throw new Error("operator response was not an envelope-only encrypted payload");
+  }
+  return JSON.stringify(
+    decryptResponse(parsed._enc as EncryptedEnvelope, operatorPublicKey, ephemeralPrivateKey)
+  );
+}
+
+function parseJsonOrWrapError(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { error: { message: text || "upstream error", type: "halo_upstream_error" } };
+  }
+}
+
+/**
+ * Model allowlist gate for the image route — mirrors handleCompletion's
+ * inline check, extracted as a pure function so `handleImage` can be
+ * unit-tested. Returns the 403 `halo_model_not_allowed` response, or null
+ * when the model passes (or no allowlist is configured).
+ */
+export function modelAllowlistGate(
+  model: string,
+  allowedModels: string[] | undefined
+): { status: number; body: unknown } | null {
+  if (!allowedModels || !allowedModels.length) return null;
+  if (allowedModels.includes(model)) return null;
+  return {
+    status: 403,
+    body: {
+      error: {
+        message: `model ${model || "(none)"} is not in this consumer's allowlist (${allowedModels.join(", ")})`,
+        type: "halo_model_not_allowed",
+      },
+    },
+  };
+}
+
+/** The subset of the session budget state the image budget gate/accrual need. */
+export interface SessionBudgetState {
+  spentBase: bigint;
+  reservedBase: bigint;
+  budgetBase: bigint;
+}
+
+/**
+ * Reserve-then-accrue admission for handleImage's cumulative --budget-usdc
+ * cap — mirrors handleCompletion's inline gate. On admission, bumps
+ * `budget.reservedBase` by `ceilingBase`; on refusal, leaves state untouched
+ * and returns the same `halo_over_budget`/`over_budget` shape.
+ */
+export function reserveImageBudget(
+  budget: SessionBudgetState,
+  ceilingBase: bigint,
+  budgetUrl: string
+): { admitted: true } | { admitted: false; body: unknown } {
+  if (budget.budgetBase <= 0n) return { admitted: true };
+  const usd = (b: bigint) => (Number(b) / 1_000_000).toFixed(4);
+  if (budget.spentBase + budget.reservedBase + ceilingBase > budget.budgetBase) {
+    return {
+      admitted: false,
+      body: {
+        error: {
+          message: `Spending budget would be exceeded: $${usd(budget.spentBase)} spent${
+            budget.reservedBase > 0n ? ` (+$${usd(budget.reservedBase)} in flight)` : ""
+          } of the $${usd(budget.budgetBase)} cap, and this request reserves up to $${usd(
+            ceilingBase
+          )}. Ask the user to approve more, then raise it without restarting: POST ${budgetUrl} {"limitUsd": <new total>}.`,
+          type: "halo_over_budget",
+          code: "over_budget",
+          spentUsd: Number(usd(budget.spentBase)),
+          limitUsd: Number(usd(budget.budgetBase)),
+        },
+      },
+    };
+  }
+  budget.reservedBase += ceilingBase;
+  return { admitted: true };
+}
+
+/** Refuse an image request whose announced per-image ceiling exceeds --max-usdc. */
+export function imagePerRequestCapGate(
+  ceilingBase: bigint,
+  maxAmountBase: bigint
+): { status: 402; body: unknown } | null {
+  if (ceilingBase <= maxAmountBase) return null;
+  return {
+    status: 402,
+    body: {
+      error: {
+        message: `Image request ceiling of $${(Number(ceilingBase) / 1_000_000).toFixed(4)} exceeds the per-request cap of $${(Number(maxAmountBase) / 1_000_000).toFixed(4)}. Raise it with --max-usdc, request fewer images, or route to a cheaper operator.`,
+        type: "halo_over_cap",
+        code: "over_cap",
+        requiredUsdcBase: ceilingBase.toString(),
+        maxUsdcBase: maxAmountBase.toString(),
+      },
+    },
+  };
+}
+
+/** Release a prior `reserveImageBudget` admission. Mirrors handleCompletion's
+ * `release()` — idempotent at the call site (callers guard with their own
+ * "was this reserved" flag) and clamped so a release can never underflow
+ * `reservedBase` below zero. */
+export function releaseImageBudget(budget: SessionBudgetState, ceilingBase: bigint): void {
+  budget.reservedBase -= ceilingBase;
+  if (budget.reservedBase < 0n) budget.reservedBase = 0n;
+}
+
+/** Accrue a completed image result's actual charge into the cumulative
+ * session budget — mirrors handleCompletion's accrual exactly, including
+ * the `chargedBase` decimal-string guard. */
+export function accrueImageBudget(
+  budget: { spentBase: bigint },
+  result: { paid: boolean; chargedBase?: string }
+): void {
+  if (result.paid && result.chargedBase && /^\d+$/.test(result.chargedBase)) {
+    budget.spentBase += BigInt(result.chargedBase);
+  }
+}
+
+/**
+ * Send one image-generation inference over the HaloVault rail — the image
+ * analog of `vaultSend`. Reservation is sized from the ANNOUNCED per-image
+ * price, never token pricing (invariant #7). The redeemed amount is metered
+ * ONLY from the operator's settlement (invariant #2), CAPPED to what the
+ * DECODED image count justifies, and refused outright when a positive
+ * settlement is claimed alongside ZERO decoded images (invariant #1/#3):
+ * never charge more than images actually delivered, and never trust an
+ * operator-claimed settlement over what was actually decoded.
+ */
+export async function vaultSendImage(
+  client: VaultConsumeClient,
+  relayBase: string,
+  opts: {
+    operator: string;
+    priceUsdcPerImage: number;
+    imageCount: number;
+    model: string;
+    envelope: EncryptedEnvelope;
+    ephemeralPrivateKey: Uint8Array;
+    operatorPublicKey: Uint8Array;
+    signal: AbortSignal;
+  }
+): Promise<{
+  ok: boolean;
+  status: number;
+  images: DecodedImage[];
+  paid: boolean;
+  chargedBase?: string;
+  errorBody?: unknown;
+}> {
+  const estCost = withReservationMargin(priceImages(opts.priceUsdcPerImage, opts.imageCount));
+  let ops: OpsState;
+  let keyEpoch: bigint;
+  ({ ops, keyEpoch } = await client.ensureReservation(opts.operator, estCost));
+
+  const consumer = await client.consumer();
+  const send = (): Promise<Response> => {
+    const built = buildImageRelayRequest(relayBase, opts.operator, consumer, opts.model, opts.envelope);
+    return fetch(built.url, {
+      method: "POST",
+      headers: built.headers,
+      body: JSON.stringify(built.body),
+      signal: opts.signal,
+    });
+  };
+
+  let res = await send();
+  // Reserve-and-replay on a reservation-gate rejection (invariant #5), mirroring
+  // vaultSend/sdk payInference — the gate price can advance more than once.
+  for (
+    let attempt = 1;
+    attempt < MAX_VAULT_RESERVATION_ATTEMPTS && res.status === 402;
+    attempt++
+  ) {
+    const text = await res.text();
+    const required = requiredVaultReservationBase(text);
+    if (required === null) {
+      return { ok: false, status: res.status, images: [], paid: false, errorBody: parseJsonOrWrapError(text) };
+    }
+    ({ ops, keyEpoch } = await client.ensureReservation(opts.operator, required));
+    res = await send();
+  }
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    return { ok: false, status: res.status, images: [], paid: false, errorBody: parseJsonOrWrapError(text) };
+  }
+
+  const isSse = (res.headers.get("content-type") || "").includes("text/event-stream");
+  if (!isSse) {
+    // The relay opens the media stream whenever acceptMedia is honored for an
+    // image-capable operator; a 2xx that ISN'T SSE means no media (and no
+    // settlement) ever rode this response — nothing to decode, nothing to redeem.
+    return {
+      ok: false,
+      status: 502,
+      images: [],
+      paid: false,
+      errorBody: {
+        error: {
+          message: "operator response did not open an image media stream",
+          type: "image_media_decode_failed",
+        },
+      },
+    };
+  }
+
+  // PAYMENT-RESPONSE header path (belt-and-suspenders): in practice a streamed
+  // image serve always flushes headers before settlement is known (the relay
+  // can only emit it as a trailing halo-settlement SSE event once headers are
+  // sent), so this is expected to be absent on the happy path — checked first
+  // in case a short-circuit response ever carries it.
+  let cost: bigint | null = null;
+  const headerSettlement = res.headers.get("PAYMENT-RESPONSE");
+  if (headerSettlement) cost = settlementAmount(headerSettlement);
+
+  const decryptMedia = (envelope: BytesEncryptedEnvelope): Buffer =>
+    decryptBytes(envelope, opts.ephemeralPrivateKey, opts.operatorPublicKey).plaintext;
+
+  let stream: ConsumedImageStream;
+  try {
+    stream = await consumeImageSseStream(res, decryptMedia);
+  } catch (err) {
+    // Decode failed — never redeem for media the consumer couldn't decrypt.
+    return {
+      ok: false,
+      status: 502,
+      images: [],
+      paid: false,
+      errorBody: { error: { message: errMsg(err), type: "image_media_decode_failed" } },
+    };
+  }
+  if (cost === null) cost = stream.settlementBase;
+
+  // Invariant #1/#3: the redeemed amount must be justified by images actually
+  // DECODED, never by a bare positive settlement the operator merely claims.
+  // A non-compliant operator could send no halo-media frames, with or without a
+  // settlement. Never report that as successful encrypted delivery; a positive
+  // settlement would additionally risk paying for nothing.
+  if (stream.images.length === 0) {
+    return {
+      ok: false,
+      status: 502,
+      images: [],
+      paid: false,
+      errorBody: {
+        error: {
+          message:
+            cost !== null && cost > 0n
+              ? "operator claimed a settlement but delivered no images"
+              : "operator delivered no images",
+          type: "image_no_media_delivered",
+        },
+      },
+    };
+  }
+
+  // Invariant #2: meter from the operator settlement ONLY. No token-price
+  // fallback for images — an unmeterable response is left unmetered, never
+  // guessed from the client-requested `n` or any other estimate. Cap the
+  // redeemed amount to what the DECODED image count justifies (invariant #1):
+  // never pay more than `priceImages(perImage, decodedCount)`, even when the
+  // operator's settlement claims more — e.g. it settled for the requested `n`
+  // but fewer images' frames actually made it through decode.
+  const justified = priceImages(opts.priceUsdcPerImage, stream.images.length);
+  const paidCost =
+    stream.images.length > 0 && cost !== null && cost > 0n
+      ? cost <= justified
+        ? cost
+        : justified
+      : null;
+  if (paidCost !== null) {
+    client.recordAndRedeem(opts.operator, ops, keyEpoch, paidCost);
+  }
+
+  return {
+    ok: true,
+    status: res.status,
+    images: stream.images,
+    paid: paidCost !== null,
+    chargedBase: paidCost !== null ? paidCost.toString() : undefined,
+  };
+}
+
 /** Probe a local consume /health. Returns the health info if a halo consume is
  *  serving there, "other" if something else holds the port, or null if nothing. */
 async function probeConsumeHealth(
@@ -314,17 +766,11 @@ async function probeConsumeHealth(
     const j = (await r.json()) as { status?: string; wallet?: string };
     return j && j.status === "ok" && typeof j.wallet === "string" ? { wallet: j.wallet } : "other";
   } catch {
-    return null; // nothing listening
+    return null;
   }
 }
 
-/**
- * Self-daemonize: re-exec this CLI WITHOUT --detach in its own session
- * (`detached: true` + `unref()` reparents it to init), stdio → a log file, then
- * return. A gateway that SIGTERMs its child process group on restart can't reach
- * it. Idempotent: no-ops if a halo consume already serves the port, so an agent
- * can safely call it every session.
- */
+/** Re-exec detached with file logs; no-op when a consume server already owns the port. */
 async function runDetached(
   cfg: { operator: { noPassphrase?: boolean } },
   port: number,
@@ -387,15 +833,7 @@ async function runDetached(
   }
 }
 
-/**
- * Bounded graceful drain shared by the SIGINT/SIGTERM and auto-update paths.
- * Resolves once BOTH the server has closed and pending vault redeems have
- * flushed, or after `timeoutMs`, whichever comes first (a stuck close or wedged
- * redeem can never hang shutdown). The redeem flush MUST be awaited here — the
- * auto-update path calls process.exit() the instant this resolves, so a
- * fire-and-forget flush would truncate an in-flight redeem for already-served
- * tokens (operator served unpaid, per docs/VAULT_PAYMENT_INVARIANTS.md).
- */
+/** Close the server and flush vault redeems within one bounded shutdown deadline. */
 export function drainForShutdown(
   closeServer: () => Promise<void>,
   flushRedeems: (() => Promise<void>) | null,
@@ -418,6 +856,7 @@ export async function cmdConsume(args: Args): Promise<void> {
   // Route outbound through a proxy if the env asks for it (relay + Intel PCS
   // attestation collateral). No-op when no proxy var is set.
   installProxyFromEnv();
+  relayCliVersion();
   const cfg = loadConfig();
   // Flags override the persisted consume profile (set by `halo setup`), which
   // overrides the built-in defaults.
@@ -425,12 +864,7 @@ export async function cmdConsume(args: Args): Promise<void> {
   const port = args.port ?? cfg.consume?.port ?? 8799;
   const host = args.host ?? "127.0.0.1";
 
-  // ── Detached mode ─────────────────────────────────────────────────────────
-  // For agents that launch consume themselves (Hermes, OpenClaw, …): re-spawn
-  // the server in its OWN session (reparented to init) and return immediately,
-  // so a gateway restart — which SIGTERMs its child process group — can't kill
-  // it. Idempotent: if a halo consume is already serving on the port, this is a
-  // no-op, so the agent can safely call it on every session start.
+  // Detached mode survives gateway process-group termination and is idempotent per port.
   if (args.detach) {
     await runDetached(cfg, port, host);
     return;
@@ -441,20 +875,10 @@ export async function cmdConsume(args: Args): Promise<void> {
     Math.round((args.maxUsdc ?? cfg.consume?.maxUsdc ?? 0.1) * 1_000_000)
   );
 
-  // ── Cumulative spend budget (the agent-volume guard) ──────────────────────
-  // An agent generates far more requests than a human — loops, retries, tool
-  // fan-out — each individually under the per-request cap, so a per-request cap
-  // alone can't bound total spend. This session budget does, and warns the agent
-  // as it approaches so it can ask the user to raise the limit instead of just
-  // failing. Mutable: spentBase accrues; budgetBase can be raised at runtime via
-  // POST /v1/budget. 0 budget = uncapped (default).
+  // Track cumulative session spend separately from per-request caps; the limit is runtime-mutable.
   const budget = {
     spentBase: 0n,
-    // In-flight reservations. An autonomous agent fans requests out in parallel;
-    // a plain check-then-accrue lets N concurrent requests all pass the gate near
-    // the cap and overspend. Each request reserves its per-request ceiling up
-    // front (released + reconciled to the actual charge when it settles), so the
-    // budget can never be blown past even under heavy concurrency.
+    // Reserve each request ceiling before async work, then reconcile to actual charge.
     reservedBase: 0n,
     budgetBase: BigInt(Math.round((args.budgetUsdc ?? 0) * 1_000_000)),
     warnPct: typeof args.budgetWarnPct === "number" ? args.budgetWarnPct : 0.8,
@@ -508,64 +932,46 @@ export async function cmdConsume(args: Args): Promise<void> {
   const relayBase = cfg.relayUrl.replace(/\/+$/, "");
   const completionsUrl = `${relayBase}/v1/chat/completions`;
   const modelsUrl = `${relayBase}/v1/models`;
-  const ctx = { wallet } as const;
 
-  // ── HaloVault rail (RFC v2): settle ACTUAL tokens, not the prompt-blind flat
-  // exact-mode quote. Opt-in via --vault. Deposit once; reserve per operator;
-  // pay the metered cost via background receipts. ──────────────────────────────
-  const vaultMode = args.vault === true;
-  // Session-key scheme for the vault rail (#426 cross-surface). "wallet" (default):
-  // the CLI wallet IS the session key. "browser": derive the SAME in-browser
-  // sub-wallet the Halo web app registers, so one wallet works on both surfaces.
+  // Browser mode derives the same shared session key as the web app.
   if (args.sessionKey && args.sessionKey !== "wallet" && args.sessionKey !== "browser") {
     console.error(`  ✗ --session-key must be "wallet" or "browser" (got "${args.sessionKey}").`);
     process.exit(1);
   }
-  if (args.sessionKey === "browser" && !vaultMode) {
-    console.error(`  ⚠ --session-key browser only applies to the vault rail; add --vault (ignored otherwise).`);
-  }
   const sessionKeyMode: SessionKeyMode = args.sessionKey === "browser" ? "browser" : "wallet";
-  const vaultSessionSigner = vaultMode ? await resolveSessionSigner(wallet, sessionKeyMode) : undefined;
-  const vaultSessionKeyAddr = vaultSessionSigner ? await vaultSessionSigner.getAddress() : null;
-  const vault = vaultMode
-    ? new VaultConsumeClient(
-        wallet,
-        {
-          facilitatorUrl: cfg.facilitator?.url ?? "https://facilitator.runhalo.xyz",
-          rpcUrl: (process.env.BASE_RPC_URL || "https://mainnet.base.org").trim(),
-          chainId: BASE_CHAIN_ID,
-          // Push signed receipts to the serving operator through the relay
-          // (operator-driven redeem, issue #369); self-redeem is the fallback.
-          relayUrl: relayBase,
-          // Optional override for the reservation batch size (#367). Omitted (not
-          // undefined) when unset so the client's default (5) isn't clobbered.
-          ...(args.vaultReserveMultiple && args.vaultReserveMultiple > 0
-            ? { reserveMultiple: BigInt(Math.floor(args.vaultReserveMultiple)) }
-            : {}),
-          // Same target drives startup deposit AND mid-run auto-refill, so the
-          // vault doesn't drain to a 402 (which would bounce the agent to a fallback).
-          autoTopUpUsd: args.vaultDeposit,
-          // Persist the pending-redeem queue per wallet so a restart resumes
-          // settling the served tail instead of abandoning it (issue #369 follow-up).
-          pendingStorePath: path.join(configDir(), `vault-pending-${wallet.address.toLowerCase()}.json`),
-        },
-        vaultSessionSigner
-      )
-    : null;
-  if (vault) {
-    // Staleness guard (#392): a pinned VAULT_ADDRESS silently targets the OLD
-    // vault after a redeploy, so reserves/redeems hit the wrong contract. Gate
-    // the whole vault rail on a confirmed match — on a mismatch, refuse to start
-    // (--force overrides). Fails open for old facilitators / network blips.
-    const fac = cfg.facilitator?.url ?? "https://facilitator.runhalo.xyz";
-    if (!(await guardVaultFresh(fac, { force: args.force }))) {
-      process.exit(1);
-    }
-    // Resume any redeems a prior process left pending (restart-durable settlement).
-    // After the freshness gate, so a stale vault never replays receipts.
-    vault.resumePendingRedeems();
+  const vaultSessionSigner = await resolveSessionSigner(wallet, sessionKeyMode);
+  const vaultSessionKeyAddr = vaultSessionSigner
+    ? await vaultSessionSigner.getAddress()
+    : wallet.address;
+  const vaultAddress = resolveVaultAddress(cfg.vaultAddress);
+  const vault = new VaultConsumeClient(
+    wallet,
+    {
+      facilitatorUrl: cfg.facilitator?.url ?? "https://facilitator.runhalo.xyz",
+      rpcUrl: (process.env.BASE_RPC_URL || "https://mainnet.base.org").trim(),
+      chainId: BASE_CHAIN_ID,
+      vaultAddress,
+      // Push receipts to the operator; self-redeem remains the fallback.
+      relayUrl: relayBase,
+      // Omit the override when unset to preserve the client default.
+      ...(args.vaultReserveMultiple && args.vaultReserveMultiple > 0
+        ? { reserveMultiple: BigInt(Math.floor(args.vaultReserveMultiple)) }
+        : {}),
+      autoTopUpUsd: args.vaultDeposit,
+      // Persist pending redeems per wallet across restarts.
+      pendingStorePath: path.join(configDir(), `vault-pending-${wallet.address.toLowerCase()}.json`),
+    },
+    vaultSessionSigner
+  );
+  // Refuse every unverifiable or mismatched facilitator identity before replay or funding.
+  const facilitatorUrl = cfg.facilitator?.url ?? "https://facilitator.runhalo.xyz";
+  if (!(await guardVaultFresh(facilitatorUrl, vaultAddress, { force: args.force }))) {
+    process.exit(1);
   }
-  if (vault && args.vaultDeposit && args.vaultDeposit > 0) {
+  // Resume any redeems a prior process left pending (restart-durable settlement).
+  // After the freshness gate, so a stale vault never replays receipts.
+  vault.resumePendingRedeems();
+  if (args.vaultDeposit && args.vaultDeposit > 0) {
     // Auto-managed: top the vault up to the target from the wallet's USDC on
     // startup so the first request has reservable funds. Fails loud (and the
     // sidecar still starts in case the agent only hits read endpoints).
@@ -582,46 +988,32 @@ export async function cmdConsume(args: Args): Promise<void> {
       console.error(`    Fund ${wallet.address} with USDC + a little ETH on Base, or run: halo vault deposit <usd>`);
     }
   }
-  if (vault) {
-    // Session-key preflight (#426). The CLI signs receipts DIRECTLY with the
-    // wallet key, so the on-chain session key MUST be this wallet or every
-    // receipt reverts BadSignature and the operator serves work it can never
-    // collect. Fail CLOSED at startup with an actionable message instead of
-    // silently getting unpayable work served. Runs AFTER the startup deposit so a
-    // just-registered (zero → this wallet) key reads as a match. (The SDK client
-    // also re-checks fail-closed before each reservation; this is the early,
-    // legible failure — a read blip here can never let a mismatch slip through.)
-    try {
-      const sk = await vault.checkSessionKey();
-      if (sk.status === "mismatch") {
-        const browser = sessionKeyMode === "browser";
-        console.error(
-          `\n  ✗ VAULT SESSION-KEY MISMATCH — refusing to start the vault rail.\n` +
-            `    Wallet ${wallet.address} has session key ${sk.registered} registered on-chain,\n` +
-            `    but this CLI signs with ${sk.expected}${browser ? " (browser-derived; --session-key browser)" : " (this wallet)"}.\n` +
-            `    Receipts this CLI signs would revert (BadSignature) and the operator would\n` +
-            `    serve work it can never be paid for. Common causes: mixing the Halo browser app\n` +
-            `    and the CLI on one wallet, or the wrong --session-key mode.\n` +
-            `    Fix: try the other mode (--session-key ${browser ? "wallet" : "browser"}), use a\n` +
-            `    DEDICATED wallet for the CLI, or rotate the key with setSessionKey(${sk.expected})\n` +
-            `    (needs no active reservations).\n`
-        );
-        process.exit(1);
-      }
-    } catch (e) {
+  // Fail closed when the registered receipt signer differs from the selected key.
+  try {
+    const sk = await vault.checkSessionKey();
+    if (sk.status === "mismatch") {
+      const browser = sessionKeyMode === "browser";
       console.error(
-        `  ⚠ could not verify the vault session key at startup (${errMsg(e)}); ` +
-          `the client re-checks fail-closed before it serves.`
+        `\n  ✗ VAULT SESSION-KEY MISMATCH — refusing to start the vault rail.\n` +
+          `    Wallet ${wallet.address} has session key ${sk.registered} registered on-chain,\n` +
+          `    but this CLI signs with ${sk.expected}${browser ? " (browser-derived; --session-key browser)" : " (this wallet)"}.\n` +
+          `    Receipts this CLI signs would revert (BadSignature) and the operator would\n` +
+          `    serve work it can never be paid for. Common causes: mixing the Halo browser app\n` +
+          `    and the CLI on one wallet, or the wrong --session-key mode.\n` +
+          `    Fix: try the other mode (--session-key ${browser ? "wallet" : "browser"}), use a\n` +
+          `    DEDICATED wallet for the CLI, or rotate the key with setSessionKey(${sk.expected})\n` +
+          `    (needs no active reservations).\n`
       );
+      process.exit(1);
     }
+  } catch (e) {
+    console.error(
+      `  ⚠ could not verify the vault session key at startup (${errMsg(e)}); ` +
+        `the client re-checks fail-closed before it serves.`
+    );
   }
 
-  // Last-resort crash nets: a long-running inference sidecar an agent depends on
-  // must NEVER exit because one request threw. Without these, an uncaught
-  // exception or unhandled rejection from any code path (a malformed upstream
-  // body, a socket reset mid-write, a confidential-decrypt edge case) takes the
-  // whole daemon down and the agent sees connection-refused thereafter. Log and
-  // keep serving.
+  // Last-resort handlers log request-path failures without terminating the long-lived sidecar.
   process.on("uncaughtException", (err) => {
     // eslint-disable-next-line no-console
     console.error(`  ⚠ uncaught exception (kept alive): ${errMsg(err)}`);
@@ -647,11 +1039,7 @@ export async function cmdConsume(args: Args): Promise<void> {
       /* socket already gone */
     }
   });
-  // A bind failure (most often EADDRINUSE) must be FATAL and LOUD. Without this
-  // handler the listen 'error' propagates to the uncaughtException net above,
-  // which logs "kept alive" and leaves the process running while the socket
-  // never bound — so the agent gets connection-refused on EVERY request with no
-  // clear cause. Fail fast with the fix instead.
+  // Bind errors are fatal; otherwise the crash net could leave a live process with no listener.
   server.on("error", (err: NodeJS.ErrnoException) => {
     if (err.code === "EADDRINUSE") {
       console.error(
@@ -665,11 +1053,7 @@ export async function cmdConsume(args: Args): Promise<void> {
     }
     process.exit(1);
   });
-  // Long-lived-daemon socket hardening. requestTimeout bounds a slow/stuck body
-  // upload but must exceed our upstream inference ceiling (~300s) so a slow model
-  // isn't severed; headersTimeout guards slow-loris header dribbling;
-  // keepAliveTimeout outlives a typical agent's idle keep-alive so the server
-  // doesn't close a socket the client is about to reuse.
+  // Bound slow headers/bodies while keeping request and keepalive timeouts above legitimate inference latency.
   server.requestTimeout = 360_000;
   server.headersTimeout = 65_000;
   server.keepAliveTimeout = 75_000;
@@ -677,11 +1061,7 @@ export async function cmdConsume(args: Args): Promise<void> {
   async function handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const url = (req.url || "").split("?")[0];
 
-    // Unauthenticated health/capability check — never spends, never needs the
-    // bearer. `confidential` tells a consuming agent whether THIS endpoint
-    // enforces confidential (TEE) inference by default; per-model availability is
-    // on /v1/models (`confidential: true`), and a request can require it ad-hoc
-    // with the `X-Halo-Confidential: true` header.
+    // Health is unauthenticated and reports endpoint-default confidentiality without spending.
     if (req.method === "GET" && (url === "/health" || url === "/healthz")) {
       return sendJson(res, 200, {
         status: "ok",
@@ -710,11 +1090,7 @@ export async function cmdConsume(args: Args): Promise<void> {
       return;
     }
 
-    // Account — this consume wallet's League standing (consume points, tier,
-    // streak, requests, total USDC spent) from the indexer, plus this session's
-    // budget. Lets an agent "check its points/stats" over the API without knowing
-    // the indexer URL. Link the wallet to a dashboard with `halo link` to see it
-    // there too. No payment.
+    // Proxy this wallet's indexer standing alongside local session budget; no payment.
     if (req.method === "GET" && url === "/v1/account") {
       let stats: Record<string, unknown> = { error: "indexer unreachable" };
       try {
@@ -756,11 +1132,11 @@ export async function cmdConsume(args: Args): Promise<void> {
       return handleCompletion(req, res);
     }
 
-    // Budget read/update. GET reports current limit/spent/remaining; POST
-    // {"limitUsd": N} raises (or sets) the cumulative cap WITHOUT a restart — the
-    // path for "agent told the user the budget's nearly out, user approved more".
-    // Gated by the same bearer as everything else (above); loopback-only by
-    // default. Spent is never reset by an update — only the ceiling moves.
+    if (req.method === "POST" && url === "/v1/images/generations") {
+      return handleImage(req, res);
+    }
+
+    // GET reports budget state; authenticated POST changes only the ceiling, never accrued spend.
     if (url === "/v1/budget") {
       if (req.method === "GET") {
         return sendJson(res, 200, {
@@ -815,12 +1191,8 @@ export async function cmdConsume(args: Args): Promise<void> {
     // paying for a response nobody is waiting for.
     const ac = new AbortController();
 
-    // Cumulative budget gate with a race-safe RESERVATION. An autonomous agent
-    // fans requests out in parallel; a plain check-then-accrue lets several
-    // requests pass the gate near the cap and overspend. Each request reserves
-    // its per-request ceiling here (the most it could cost), so spent+reserved
-    // can never exceed the budget. The reservation is released — and reconciled
-    // to the actual charge — when the response closes, on every path.
+    // Reserve the request ceiling synchronously so parallel calls cannot oversubscribe cumulative budget.
+    // Release and reconcile on every response path.
     let reserved = false;
     const release = (): void => {
       if (!reserved) return;
@@ -859,13 +1231,7 @@ export async function cmdConsume(args: Args): Promise<void> {
       release();
     });
 
-    // Streaming: the x402 pay flow is buffered (we pay for, then receive, the
-    // full response), so we can't proxy a live token stream from the operator.
-    // But many agents (Hermes, etc.) ALWAYS send stream:true and treat a non-SSE
-    // reply as a hard failure. So we BUFFER under the hood, then re-emit the
-    // finished answer to the client as a tiny SSE stream (chat.completion.chunk
-    // events + [DONE]). The client gets a valid stream; payment is unchanged. We
-    // force stream:false upstream so the operator returns a buffered completion.
+    // Force buffered upstream responses, then synthesize SSE for clients that require `stream:true`.
     const wantStream = parsed.stream === true;
     if (wantStream) delete parsed.stream;
 
@@ -897,11 +1263,7 @@ export async function cmdConsume(args: Args): Promise<void> {
       confidential ||
       /^(1|true|required|yes)$/i.test(String(req.headers["x-halo-confidential"] || ""));
 
-    // Confidential (TEE) mode: fetch the model's PUBLIC attestation, encrypt each
-    // message content to the enclave key, and route only to TEE operators. The
-    // operator relays ciphertext and can't read the prompt; we decrypt + verify
-    // the response below. Fails the request (not silently downgrades) so the
-    // caller never thinks a plaintext request was confidential.
+    // Confidential mode encrypts to the reported TEE key and fails closed on setup.
     const errCtx = {
       wallet: wallet.address,
       network: BASE_NETWORK,
@@ -913,61 +1275,63 @@ export async function cmdConsume(args: Args): Promise<void> {
     // Vault rail: capture the prompt-size estimate (to size the reservation)
     // BEFORE confidential/E2E mutate `parsed`, and pin ONE operator to reserve
     // against, encrypt to, and meter (TEE-only when confidential).
-    const vaultEstTokens = vault
-      ? estimateTokens(
-          (parsed as { messages?: unknown }).messages,
-          // Size the completion budget with reasoning headroom (#421): a small
-          // max_tokens does not bound a reasoning model's reasoning tokens, so
-          // reserving on max_tokens alone systematically under-reserves and the
-          // operator undercollects. Shared with the operator's serve gate so the
-          // reservation covers what the gate prices (invariant #5/#7).
-          completionCeilingTokens(
-            typeof parsed.model === "string" ? parsed.model : "",
-            typeof parsed.max_tokens === "number" ? parsed.max_tokens : 1024,
-            typeof parsed.max_completion_tokens === "number"
-              ? parsed.max_completion_tokens
-              : undefined
-          )
+    const vaultEstTokens = estimateTokens(
+      (parsed as { messages?: unknown }).messages,
+      // Shared reasoning headroom keeps reservation and operator gate equal.
+      completionCeilingTokens(
+        typeof parsed.model === "string" ? parsed.model : "",
+        typeof parsed.max_tokens === "number" ? parsed.max_tokens : 1024,
+        typeof parsed.max_completion_tokens === "number"
+          ? parsed.max_completion_tokens
+          : undefined
+      )
+    );
+    const maxPriceUsdPerMtok =
+      Number(maxAmountBase) /
+      Math.max(1, vaultEstTokens) /
+      (1 + Number(RESERVATION_PRICE_MARGIN_BPS) / 10_000);
+    const m = typeof parsed.model === "string" ? parsed.model : "";
+    // If the caller explicitly pinned an operator (X-Halo-Operator, e.g. a
+    // settlement sweep targeting every operator), honor it; otherwise fall back
+    // to the default cheapest-tier selection.
+    const pinned = (forwardHeaders["x-halo-operator"] || "").trim() || undefined;
+    const selection = m
+      ? await selectVaultOperator(
+          relayBase,
+          m,
+          wantConfidential,
+          maxPriceUsdPerMtok,
+          pinned
         )
-      : 0;
-    let vaultPin: VaultOperatorPin | null = null;
-    if (vault) {
-      const m = typeof parsed.model === "string" ? parsed.model : "";
-      // If the caller explicitly pinned an operator (X-Halo-Operator, e.g. a
-      // settlement sweep targeting every operator), honor it; otherwise fall back
-      // to the default cheapest-tier selection.
-      const pinned = (forwardHeaders["x-halo-operator"] || "").trim() || undefined;
-      const selection = m
-        ? await selectVaultOperator(relayBase, m, wantConfidential, undefined, pinned)
-        : { pin: null, reason: "no_operator" as VaultOperatorSelectionReason };
-      vaultPin = selection.pin;
-      if (!vaultPin) {
-        const message =
-          selection.reason === "pinned_not_vault_capable"
-            ? `pinned operator ${pinned} serves "${m}" but is not vault-capable. Upgrade that operator to announce vaultPayments, or drop X-Halo-Operator to choose a vault-capable operator.`
-            : selection.reason === "pinned_free_model"
-              ? `pinned operator ${pinned} advertises "${m}" as free. A zero-price model cannot produce a redeemable vault receipt; use a metered model or a non-vault rail.`
-              : selection.reason === "free_model"
-                ? `model "${m}" is advertised as free. A zero-price model cannot produce a redeemable vault receipt; use a metered model or a non-vault rail.`
+      : { pin: null, reason: "no_operator" as VaultOperatorSelectionReason };
+    const vaultPin = selection.pin;
+    if (!vaultPin) {
+      const overPriceCeiling =
+        selection.reason === "out_of_range" ||
+        selection.reason === "pinned_out_of_range";
+      const message =
+        selection.reason === "pinned_not_vault_capable"
+          ? `pinned operator ${pinned} serves "${m}" but is not vault-capable. Upgrade that operator to announce vaultPayments, or drop X-Halo-Operator to choose a vault-capable operator.`
+          : selection.reason === "pinned_free_model"
+            ? `pinned operator ${pinned} advertises "${m}" as free. A zero-price model cannot produce a redeemable vault receipt; use a metered model.`
+            : selection.reason === "free_model"
+              ? `model "${m}" is advertised as free. A zero-price model cannot produce a redeemable vault receipt; use a metered model.`
+              : overPriceCeiling
+                ? `no eligible operator for "${m}" is within the $${(Number(maxAmountBase) / 1_000_000).toFixed(2)} per-request cap.`
                 : pinned
-                  ? `pinned operator ${pinned} is unavailable, outside the price limit, or not advertising a usable price for "${m}"${wantConfidential ? " (confidential)" : ""}. Drop X-Halo-Operator to use the cheapest eligible operator.`
-                  : `no priced${wantConfidential ? " confidential" : ""} operator is online for "${m}". Vault mode needs a positively-priced vault-capable operator for this model.`;
-        return sendJson(
-          res,
-          503,
-          actionableError(
-            503,
-            JSON.stringify({
-              error: {
-                message,
-              },
-            }),
-            errCtx
-          )
-        );
-      }
-      forwardHeaders["x-halo-operator"] = vaultPin.address;
+                  ? `pinned operator ${pinned} is unavailable or not advertising a usable price for "${m}"${wantConfidential ? " (confidential)" : ""}. Drop X-Halo-Operator to use the cheapest eligible operator.`
+                  : `no priced${wantConfidential ? " confidential" : ""} vault-capable operator is online for "${m}".`;
+      return sendJson(
+        res,
+        overPriceCeiling ? 402 : 503,
+        actionableError(
+          overPriceCeiling ? 402 : 503,
+          JSON.stringify({ error: { message } }),
+          errCtx
+        )
+      );
     }
+    forwardHeaders["x-halo-operator"] = vaultPin.address;
 
     let teeClientKey: string | null = null;
     let teeSigner: string | null = null;
@@ -975,18 +1339,12 @@ export async function cmdConsume(args: Args): Promise<void> {
       const model = typeof parsed.model === "string" ? parsed.model : "";
       try {
         const att = await fetchModelAttestation(teeBaseUrl, model);
-        // TRUSTLESS hardware verification (parity with the frontend): prove the
-        // attestation is a genuine Intel TDX + NVIDIA enclave running NEAR's
-        // image and that its signing key is bound into the quote — BEFORE we
-        // encrypt the prompt to that key. Then confirm THIS request's attested
-        // signer matches the hardware-verified one (a rogue relay/provider can't
-        // substitute a key that lacks a valid Intel-signed quote). Cached per
-        // model (~2s only on a cache miss / enclave rotation). Fails closed.
+        // Verify available hardware evidence and signer binding before encryption.
         if (!args.noAttestationVerify) {
           const verifiedSigner = await verifiedSignerForModel(teeBaseUrl, model);
           if (att.signingAddress.toLowerCase() !== verifiedSigner) {
             throw new Error(
-              `attested signer ${att.signingAddress} does not match the hardware-verified enclave signer ${verifiedSigner}`
+              `attested signer ${att.signingAddress} does not match the configured-verifier signer ${verifiedSigner}`
             );
           }
         }
@@ -1023,33 +1381,19 @@ export async function cmdConsume(args: Args): Promise<void> {
       }
     }
 
-    // Operator end-to-end encryption (non-confidential path): encrypt the prompt
-    // to the chosen operator's announced X25519 key so the RELAY only ever sees
-    // ciphertext (parity with the frontend). Confidential already encrypts to the
-    // enclave, so this only applies when NOT confidential. Pins the operator we
-    // encrypted to. Falls back to plaintext when no operator advertises a key
-    // (unless that ever becomes a hard requirement).
+    // Non-confidential E2E encrypts to and pins the selected operator; missing keys fall back to plaintext.
     let e2eEphemeralPriv: Uint8Array | null = null;
     let e2eOperatorPub: Uint8Array | null = null;
     if (!wantConfidential && !args.noE2e) {
-      const model = typeof parsed.model === "string" ? parsed.model : "";
-      // Vault mode pins ONE operator (for the reservation) — E2E-encrypt to that
-      // SAME operator rather than re-selecting, so the request lands where the
-      // funds are reserved.
-      const op = vault
-        ? vaultPin && vaultPin.encryptionPubkey
-          ? { address: vaultPin.address, encryptionPubkey: vaultPin.encryptionPubkey }
-          : null
-        : model
-          ? await selectE2EOperator(relayBase, model)
-          : null;
+      // Encrypt to the same operator that owns the reservation.
+      const op = vaultPin.encryptionPubkey
+        ? { address: vaultPin.address, encryptionPubkey: vaultPin.encryptionPubkey }
+        : null;
       if (op) {
         try {
           const operatorPub = hexToPubkey(op.encryptionPubkey);
           const eph = generateEphemeralKeypair();
-          // `model` (and `stream`, already stripped) stay cleartext for routing;
-          // everything else is sealed in `_enc`. The operator decrypts before it
-          // quotes/serves (serve.ts Phase 0), so pricing is still accurate.
+          // Keep routing fields cleartext and seal the remaining request in `_enc`.
           const { model: routeModel, ...rest } = parsed as { model?: unknown } & Record<string, unknown>;
           const envelope = encryptRequest(rest, operatorPub, eph);
           parsed = { model: routeModel, _enc: envelope } as Record<string, unknown>;
@@ -1065,16 +1409,13 @@ export async function cmdConsume(args: Args): Promise<void> {
     }
 
     try {
-      const result =
-        vault && vaultPin
-          ? await vaultSend(vault, completionsUrl, parsed, {
-              forwardHeaders,
-              signal: ac.signal,
-              operator: vaultPin.address,
-              priceUsdPerMtok: vaultPin.priceUsdPerMtok,
-              estTokens: vaultEstTokens,
-            })
-          : await payAndFetch(completionsUrl, parsed, ctx, { maxAmountBase, forwardHeaders, signal: ac.signal });
+      const result = await vaultSend(vault, completionsUrl, parsed, {
+        forwardHeaders,
+        signal: ac.signal,
+        operator: vaultPin.address,
+        priceUsdPerMtok: vaultPin.priceUsdPerMtok,
+        estTokens: vaultEstTokens,
+      });
       // Accrue what was actually charged into the session budget, then attach the
       // live budget headers (limit/spent/remaining + warning band) so the agent
       // always knows where it stands and can warn the user before it runs out.
@@ -1089,6 +1430,9 @@ export async function cmdConsume(args: Args): Promise<void> {
         headers["X-Halo-Deprecation-Warning"] = deprecationWarning;
       }
       headers["X-Halo-Paid"] = result.paid ? "true" : "false";
+      if (result.paid && result.chargedBase && /^\d+$/.test(result.chargedBase)) {
+        headers["X-Halo-Charged-Base"] = result.chargedBase;
+      }
       logReq({
         model: typeof parsed.model === "string" ? parsed.model : "(none)",
         status: result.status,
@@ -1102,8 +1446,7 @@ export async function cmdConsume(args: Args): Promise<void> {
       headers["X-Halo-Confidential"] = wantConfidential ? "true" : "false";
       let outBody = result.body;
       if (wantConfidential && teeClientKey && result.status >= 200 && result.status < 300) {
-        // Decrypt the enclave's response + verify the operator-forwarded signature
-        // recovers to the ATTESTED signer (operator can't forge; only withhold).
+        // Decrypt and require the forwarded response signature to match the attested signer.
         try {
           const j = JSON.parse(result.body) as {
             choices?: Array<{ message?: { content?: string } }>;
@@ -1127,12 +1470,11 @@ export async function cmdConsume(args: Args): Promise<void> {
       // the clear). Marks the response so the agent knows it was relay-blind.
       if (e2eEphemeralPriv && e2eOperatorPub && result.status >= 200 && result.status < 300) {
         try {
-          const j = JSON.parse(result.body) as { _enc?: unknown };
-          if (isEncryptedEnvelope(j._enc)) {
-            outBody = JSON.stringify(
-              decryptResponse(j._enc as EncryptedEnvelope, e2eOperatorPub, e2eEphemeralPriv)
-            );
-          }
+          outBody = decryptRequiredOperatorE2eResponse(
+            result.body,
+            e2eOperatorPub,
+            e2eEphemeralPriv
+          );
           headers["X-Halo-E2E-Encrypted"] = "true";
         } catch (e) {
           return sendJson(res, 502, {
@@ -1140,11 +1482,7 @@ export async function cmdConsume(args: Args): Promise<void> {
           });
         }
       }
-      // The operator/relay served a non-2xx (no operator, payment rejected, …).
-      // Replace the raw body with an actionable, OpenAI-shaped error so the
-      // agent surfaces the fix, not a cryptic "payment required". (Errors stay
-      // JSON even for stream requests — OpenAI clients read the error body off a
-      // non-200 response directly.)
+      // Normalize non-2xx responses to actionable OpenAI JSON, including for stream requests.
       if (result.status >= 400) {
         return sendJson(res, result.status, actionableError(result.status, result.body, errCtx));
       }
@@ -1156,19 +1494,213 @@ export async function cmdConsume(args: Args): Promise<void> {
     } catch (err) {
       // Client gave up and disconnected — the response socket is already gone.
       // Nothing to send; don't log it as an upstream fault.
-      if (err instanceof X402Error && err.code === "client_aborted") {
+      if (ac.signal.aborted) {
         logReq({ model: typeof parsed.model === "string" ? parsed.model : "(none)", status: 0, paid: false, confidential: wantConfidential, ms: Date.now() - t0, note: "client disconnected" });
         return;
       }
-      if (err instanceof X402Error) {
-        // over_cap is a budget refusal (402); other guard failures are upstream
-        // protocol faults (502).
-        const status = err.code === "over_cap" ? 402 : 502;
-        logReq({ model: typeof parsed.model === "string" ? parsed.model : "(none)", status, paid: false, confidential: wantConfidential, ms: Date.now() - t0, note: err.code });
-        return sendJson(res, status, actionableError(status, JSON.stringify({ error: { message: err.message } }), errCtx));
-      }
       logReq({ model: typeof parsed.model === "string" ? parsed.model : "(none)", status: 502, paid: false, confidential: wantConfidential, ms: Date.now() - t0, note: errMsg(err) });
       return sendJson(res, 502, actionableError(502, JSON.stringify({ error: { message: errMsg(err) } }), errCtx));
+    }
+  }
+
+  /**
+   * halo consume's OpenAI-compatible images endpoint. Consume always uses
+   * HaloVault. On success this returns `{created, data:[{b64_json}]}` and
+   * leaves file handling to the caller.
+   */
+  async function handleImage(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const t0 = Date.now();
+
+    let raw: string;
+    try {
+      raw = await readBody(req);
+    } catch (err) {
+      return sendJson(res, 413, { error: { message: errMsg(err), type: "halo_request_error" } });
+    }
+
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return sendJson(res, 400, { error: { message: "request body is not valid JSON", type: "halo_request_error" } });
+    }
+
+    const model = typeof parsed.model === "string" ? parsed.model.trim() : "";
+    if (!model) {
+      return sendJson(res, 400, { error: { message: "model is required", type: "halo_request_error" } });
+    }
+    // Allowlist guard: refuse to pay for a model outside the configured set,
+    // BEFORE any payment is signed — mirrors handleCompletion's gate,
+    // extracted as `modelAllowlistGate` so it's unit-testable without
+    // booting the HTTP server (handleImage is a closure nested in
+    // `cmdConsume`, not independently callable).
+    const allowlistGate = modelAllowlistGate(model, allowedModels);
+    if (allowlistGate) {
+      return sendJson(res, allowlistGate.status, allowlistGate.body);
+    }
+    // n defaults to 1, mirroring the operator's own requestedImageCount default
+    // (serve.ts) — explicitly re-sent below so the reservation size and the
+    // request the operator prices against can never drift.
+    const n =
+      typeof parsed.n === "number" && Number.isFinite(parsed.n) && parsed.n > 0
+        ? Math.ceil(parsed.n)
+        : 1;
+
+    const ac = new AbortController();
+    // Cumulative --budget-usdc gate (mirrors handleCompletion's reserve-then-
+    // accrue guard). Unlike the token path, the per-request ceiling can't be
+    // sized yet — image pricing is per operator+model
+    // (`priceImages(pin.priceUsdcPerImage, n)`), so it's only known once an
+    // operator is selected below. This closure is registered now (alongside
+    // the existing abort-on-close wiring) so the reservation is released on
+    // EVERY response-close path — success, failure, abort, or a thrown error —
+    // exactly like handleCompletion's `release()`; `imageBudgetReserved` stays
+    // false (a no-op release) for any early return before the reservation is
+    // actually taken below.
+    let imageBudgetReserved = false;
+    let imageCeilingBase = 0n;
+    const releaseImageBudgetReservation = (): void => {
+      if (!imageBudgetReserved) return;
+      imageBudgetReserved = false;
+      releaseImageBudget(budget, imageCeilingBase);
+    };
+    res.on("close", () => {
+      if (!res.writableFinished) ac.abort();
+      releaseImageBudgetReservation();
+    });
+
+    // Invariant #7: select the vault-capable operator advertising `model`
+    // as an EXACT imageModels member with a positive announced per-image
+    // price. Never falls back to token pricing. Honors an explicit
+    // X-Halo-Operator pin, mirroring the token vault path.
+    const pinned = (collectHaloHeaders(req)["x-halo-operator"] || "").trim() || undefined;
+    const selection = await selectVaultImageOperator(relayBase, model, pinned);
+    if (!selection.pin) {
+      const free = selection.reason === "free_model" || selection.reason === "pinned_free_model";
+      const noEncryption = selection.reason === "no_encrypted_operator";
+      const message = noEncryption
+        ? pinned
+          ? `pinned operator ${pinned} does not advertise an authenticated E2E key required for encrypted image delivery.`
+          : `No image operator with an authenticated E2E key is online for "${model}".`
+        : free
+          ? `Image model "${model}" is advertised as free and cannot produce a redeemable vault receipt. Use a metered image model.`
+          : pinned
+            ? `pinned operator ${pinned} is unavailable or not advertising a usable per-image price for "${model}". Drop X-Halo-Operator to use the cheapest eligible image operator.`
+            : `No priced image operator is online for "${model}". Image generation needs a vault operator advertising a positive per-image price for this exact model.`;
+      return sendJson(res, 503, {
+        error: {
+          message,
+          type: noEncryption ? "halo_e2e_error" : "halo_no_operator",
+          code: noEncryption ? "image_operator_no_encryption_key" : "no_image_operator",
+        },
+      });
+    }
+    const pin = selection.pin;
+    // E2E required for image delivery (media only ever travels encrypted).
+    if (!pin.encryptionPubkey) {
+      return sendJson(res, 503, {
+        error: {
+          message: `Image generation for "${model}" requires an operator E2E key so encrypted media can be delivered; the selected operator (${pin.address}) advertised none.`,
+          type: "halo_e2e_error",
+          code: "image_operator_no_encryption_key",
+        },
+      });
+    }
+
+    // Reserve this request's ceiling against the session budget BEFORE paying
+    // (mirrors handleCompletion's reserve-then-accrue gate exactly). Sized
+    // here rather than upfront because the per-image ceiling depends on the
+    // operator just selected above.
+    imageCeilingBase = priceImages(pin.priceUsdcPerImage, n);
+    const perRequestCap = imagePerRequestCapGate(imageCeilingBase, maxAmountBase);
+    if (perRequestCap) {
+      return sendJson(res, perRequestCap.status, perRequestCap.body, budgetHeaders());
+    }
+    const budgetAdmission = reserveImageBudget(budget, imageCeilingBase, `http://${host}:${port}/v1/budget`);
+    if (!budgetAdmission.admitted) {
+      return sendJson(res, 402, budgetAdmission.body, budgetHeaders());
+    }
+    imageBudgetReserved = true;
+    // The res.on("close") release listener was registered before the async
+    // operator-selection above, so a client disconnect DURING selection fires
+    // the one-shot "close" while imageBudgetReserved was still false (a no-op
+    // release) — which would then strand this ceiling in budget.reservedBase
+    // forever (no future close event can fire). Re-check the abort signal
+    // (set by that same close handler) now that the reservation is taken, and
+    // release it explicitly. No await sits between the reserve above and this
+    // check, so the flag/release stays exactly-once.
+    if (ac.signal.aborted) {
+      releaseImageBudgetReservation();
+      return;
+    }
+
+    let operatorPublicKey: Uint8Array;
+    let ephemeral: EphemeralKeyPair;
+    let envelope: EncryptedEnvelope;
+    try {
+      operatorPublicKey = hexToPubkey(pin.encryptionPubkey);
+      ephemeral = generateEphemeralKeypair();
+      // Encrypt everything except `model` (kept cleartext for relay routing,
+      // mirroring handleCompletion's E2E path); `n` is re-sent normalized so
+      // the operator prices exactly what we reserved for.
+      const { model: _dropModel, n: _dropN, ...rest } = parsed;
+      envelope = encryptRequest({ ...rest, n }, operatorPublicKey, ephemeral);
+    } catch (err) {
+      return sendJson(res, 502, {
+        error: { message: `E2E encryption setup failed: ${errMsg(err)}`, type: "halo_e2e_error" },
+      });
+    }
+
+    try {
+      const result = await vaultSendImage(vault, relayBase, {
+        operator: pin.address,
+        priceUsdcPerImage: pin.priceUsdcPerImage,
+        imageCount: n,
+        model,
+        envelope,
+        ephemeralPrivateKey: ephemeral.privateKey,
+        operatorPublicKey,
+        signal: ac.signal,
+      });
+
+      // Accrue what was actually charged into the session budget — mirrors
+      // handleCompletion's accrual — before status/ok branching, same as the
+      // text path.
+      accrueImageBudget(budget, result);
+
+      logReq({
+        model,
+        status: result.status,
+        paid: result.paid,
+        chargedBase: result.chargedBase,
+        operator: pin.address,
+        confidential: false,
+        ms: Date.now() - t0,
+      });
+
+      if (!result.ok) {
+        return sendJson(
+          res,
+          result.status >= 400 ? result.status : 502,
+          result.errorBody ?? {
+            error: { message: "image generation failed", type: "halo_upstream_error" },
+          }
+        );
+      }
+
+      return sendJson(
+        res,
+        200,
+        buildImagesResponseBody(result.images),
+        buildImageResponseHeaders(pin.address, result, budgetHeaders())
+      );
+    } catch (err) {
+      if (err instanceof Error && err.name === "AbortError") {
+        logReq({ model, status: 0, paid: false, confidential: false, ms: Date.now() - t0, note: "client disconnected" });
+        return;
+      }
+      logReq({ model, status: 502, paid: false, confidential: false, ms: Date.now() - t0, note: errMsg(err) });
+      return sendJson(res, 502, { error: { message: errMsg(err), type: "halo_upstream_error" } });
     }
   }
 
@@ -1177,14 +1709,10 @@ export async function cmdConsume(args: Args): Promise<void> {
     console.log(`  endpoint : http://${host}:${port}/v1`);
     console.log(`  wallet   : ${wallet.address}  (Base mainnet)`);
     console.log(`  relay    : ${relayBase}`);
+    console.log(`  rail     : vault (settle ACTUAL tokens; deposit-backed)`);
     console.log(
-      `  rail     : ${vault ? "vault (settle ACTUAL tokens; deposit-backed)" : `exact (sign-per-request, up to $${(Number(maxAmountBase) / 1_000_000).toFixed(2)}/req)`}`
+      `  session  : ${sessionKeyMode === "browser" ? `browser-derived ${vaultSessionKeyAddr} (shared with the Halo web app)` : "wallet (this wallet signs receipts)"}`
     );
-    if (vault) {
-      console.log(
-        `  session  : ${vaultSessionKeyAddr ? `browser-derived ${vaultSessionKeyAddr} (shared with the Halo web app)` : "wallet (this wallet signs receipts)"}`
-      );
-    }
     console.log(
       `  budget   : ${budget.budgetBase > 0n ? `$${usd(budget.budgetBase)} cumulative (warn at ${Math.round(budget.warnPct * 100)}%)` : "uncapped (set --budget-usdc to bound an agent)"}`
     );
@@ -1209,7 +1737,7 @@ export async function cmdConsume(args: Args): Promise<void> {
             server.close(() => r());
             server.closeIdleConnections?.();
           }),
-        vault ? () => vault.flushRedeems() : null,
+        () => vault.flushRedeems(),
         5000
       );
       return shutdownPromise;
@@ -1262,19 +1790,19 @@ function readBody(req: http.IncomingMessage): Promise<string> {
   });
 }
 
-function sendJson(res: http.ServerResponse, status: number, body: unknown): void {
-  // Never throw from here. If the response was already (partly) sent — e.g. an
-  // error surfaced after writeHead — a second writeHead throws
-  // ERR_HTTP_HEADERS_SENT, and when this runs inside the top-level `.catch` that
-  // throw is uncaught and KILLS the whole `consume` daemon (the agent then sees
-  // connection-refused on every later request). Guard on headersSent and swallow
-  // any residual error so one bad request can never take the server down.
+function sendJson(
+  res: http.ServerResponse,
+  status: number,
+  body: unknown,
+  extraHeaders?: Record<string, string>
+): void {
+  // Error reporting must not throw after headers are sent or terminate the daemon.
   try {
     if (res.headersSent || res.writableEnded) {
       res.end();
       return;
     }
-    res.writeHead(status, { "Content-Type": "application/json" });
+    res.writeHead(status, { "Content-Type": "application/json", ...extraHeaders });
     res.end(JSON.stringify(body));
   } catch (e) {
     try {
@@ -1296,8 +1824,7 @@ function shortAddr(a?: string | null): string {
   return a && a.length > 12 ? `${a.slice(0, 6)}…${a.slice(-4)}` : a || "-";
 }
 
-/** One concise line per completion so an operator can see what the agent is
- *  doing and debug "issues on the consumer api" without turning on a profiler. */
+/** Emit one concise completion diagnostic. */
 function logReq(info: {
   model: string;
   status: number;
@@ -1319,14 +1846,7 @@ function logReq(info: {
   );
 }
 
-/**
- * Re-emit a BUFFERED chat.completion as a minimal OpenAI SSE stream so a client
- * that requested stream:true gets a valid `text/event-stream` (we paid for and
- * received the whole answer first — there's no live token stream to proxy).
- * Forwards BOTH content AND tool_calls — a tool-using agent (Hermes, etc.) gets
- * finish_reason "tool_calls" with no tool calls in the deltas otherwise, and
- * hangs waiting for a tool it was never handed. Halo metadata rides as headers.
- */
+/** Convert a buffered completion to OpenAI SSE, preserving content, tool calls, and finish reason. */
 interface BufferedToolCall {
   id?: string;
   type?: string;
@@ -1417,12 +1937,7 @@ function sendBufferedAsSse(
   }
 }
 
-/**
- * Turn a raw relay/operator/facilitator failure into an OpenAI-shaped error whose
- * `message` tells the user (or their agent) HOW to fix it — funding, caps, model
- * availability, confidential. Folds the remedy into `message` because most
- * OpenAI clients/gateways only surface `error.message`.
- */
+/** Convert rail failures to actionable OpenAI errors whose remedy is in `error.message`. */
 function actionableError(
   status: number,
   rawBody: string,
@@ -1460,11 +1975,7 @@ function actionableError(
       },
     };
   }
-  // Payment failed — almost always an unfunded / underfunded wallet. Put the FULL
-  // wallet address up FRONT (and as a structured `walletAddress` field) so it
-  // survives any downstream truncation of the longer detail: the user must be
-  // able to see/copy the complete address to fund it. The reason (`inner`) goes
-  // LAST, where it's safe to clip.
+  // Put the full wallet address before truncatable payment detail and expose it structurally.
   if (status === 402 || low.includes("insufficient") || low.includes("balance") || low.includes("payment required")) {
     const net = "Base mainnet";
     return {

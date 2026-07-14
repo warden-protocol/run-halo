@@ -1,10 +1,3 @@
-/**
- * OperatorRedeemer spec (issue #369). Drives the real redeem driver against a
- * mock facilitator HTTP server — no chain needed. Validates the request shape,
- * retry, coalescing to the latest receipt, and stale-receipt handling.
- *
- * Run: node --require ts-node/register --test src/vaultRedeemer.test.ts
- */
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -18,7 +11,6 @@ const CY = 1n;
 
 interface Hit { consumer: string; operator: string; cumulative: string; signature: string }
 
-/** Mock facilitator: each request runs `handler(hit, n)` → { status, body }. */
 function mockFacilitator(handler: (hit: Hit, n: number) => { status: number; body: unknown }) {
   const hits: Hit[] = [];
   const server = http.createServer((req, res) => {
@@ -83,7 +75,6 @@ test("coalesces many kicks into one redeem of the HIGHEST cumulative", async () 
   try {
     const ledger = new VaultCreditLedger();
     const r = new OperatorRedeemer(fac.url, ledger);
-    // A burst of receipts arrives; each advances `held` and kicks.
     ledger.recordReceipt(C, O, { cumulative: 100n, signature: "0xa", cycle: CY });
     r.kick(C, O);
     ledger.recordReceipt(C, O, { cumulative: 250n, signature: "0xb", cycle: CY });
@@ -91,8 +82,6 @@ test("coalesces many kicks into one redeem of the HIGHEST cumulative", async () 
     ledger.recordReceipt(C, O, { cumulative: 400n, signature: "0xc", cycle: CY });
     r.kick(C, O);
     await r.flush();
-    // Serialized + re-read-latest means the final submit carries the top cumulative,
-    // and once it lands the rest are no-ops (nothing higher owed).
     const last = fac.hits[fac.hits.length - 1];
     assert.equal(last.cumulative, "400");
     assert.equal(last.signature, "0xc");
