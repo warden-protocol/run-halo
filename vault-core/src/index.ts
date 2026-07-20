@@ -70,6 +70,158 @@ export interface VaultState {
   keyEpoch: bigint;
 }
 
+export interface VaultRedeemRequest {
+  consumer: string;
+  operator: string;
+  cumulative: string;
+  cycle: string;
+  signature: string;
+}
+
+export type VaultRedeemRejectedReason =
+  | "invalid-request"
+  | "cycle-mismatch"
+  | "invalid-receipt"
+  | "unavailable";
+
+export type VaultRedeemResponse =
+  | {
+      status: "rejected";
+      reason: VaultRedeemRejectedReason;
+      error: string;
+    }
+  | {
+      status: "pending";
+      transaction: string;
+      cumulative: string;
+      cycle: string;
+      coalesced: boolean;
+    }
+  | {
+      status: "already-redeemed";
+      redeemed: string;
+      cycle: string;
+    }
+  | {
+      status: "confirmed";
+      transaction: string;
+      cumulative: string;
+      cycle: string;
+    }
+  | {
+      status: "reverted";
+      transaction: string;
+      cumulative: string;
+      cycle: string;
+    };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isUintString(value: unknown): value is string {
+  if (typeof value !== "string" || !/^(0|[1-9][0-9]*)$/.test(value)) return false;
+  if (value.length > 78) return false;
+  return BigInt(value) <= (1n << 256n) - 1n;
+}
+
+function isTransactionHash(value: unknown): value is string {
+  return typeof value === "string" && /^0x[0-9a-fA-F]{64}$/.test(value);
+}
+
+/** Parse the facilitator's cycle-aware redeem response without trusting JSON shape. */
+export function parseVaultRedeemResponse(value: unknown): VaultRedeemResponse | null {
+  if (!isRecord(value) || typeof value.status !== "string") return null;
+  switch (value.status) {
+    case "rejected": {
+      const reasons: readonly VaultRedeemRejectedReason[] = [
+        "invalid-request",
+        "cycle-mismatch",
+        "invalid-receipt",
+        "unavailable",
+      ];
+      if (
+        typeof value.reason !== "string" ||
+        !reasons.includes(value.reason as VaultRedeemRejectedReason) ||
+        typeof value.error !== "string" ||
+        value.error.length === 0
+      ) {
+        return null;
+      }
+      return {
+        status: "rejected",
+        reason: value.reason as VaultRedeemRejectedReason,
+        error: value.error,
+      };
+    }
+    case "pending":
+      return isTransactionHash(value.transaction) &&
+        isUintString(value.cumulative) &&
+        isUintString(value.cycle) &&
+        typeof value.coalesced === "boolean"
+        ? {
+            status: "pending",
+            transaction: value.transaction,
+            cumulative: value.cumulative,
+            cycle: value.cycle,
+            coalesced: value.coalesced,
+          }
+        : null;
+    case "already-redeemed":
+      return isUintString(value.redeemed) && isUintString(value.cycle)
+        ? { status: "already-redeemed", redeemed: value.redeemed, cycle: value.cycle }
+        : null;
+    case "confirmed":
+    case "reverted":
+      return isTransactionHash(value.transaction) &&
+        isUintString(value.cumulative) &&
+        isUintString(value.cycle)
+        ? {
+            status: value.status,
+            transaction: value.transaction,
+            cumulative: value.cumulative,
+            cycle: value.cycle,
+          }
+        : null;
+    default:
+      return null;
+  }
+}
+
+export type VaultRedeemDisposition = "collected" | "retry" | "uncollectable";
+
+/** Decide whether a client keeps or clears its signed receipt after a typed response. */
+export function vaultRedeemDisposition(
+  response: VaultRedeemResponse,
+  expected?: Pick<VaultRedeemRequest, "cumulative" | "cycle">
+): VaultRedeemDisposition {
+  switch (response.status) {
+    case "confirmed": {
+      const matches =
+        !expected ||
+        (isUintString(expected.cumulative) &&
+          response.cycle === expected.cycle &&
+          BigInt(response.cumulative) >= BigInt(expected.cumulative));
+      return matches ? "collected" : "retry";
+    }
+    case "already-redeemed": {
+      const matches =
+        !expected ||
+        (isUintString(expected.cumulative) &&
+          response.cycle === expected.cycle &&
+          BigInt(response.redeemed) >= BigInt(expected.cumulative));
+      return matches ? "collected" : "retry";
+    }
+    case "pending":
+    case "reverted":
+      return "retry";
+    case "rejected":
+      return response.reason === "cycle-mismatch" || response.reason === "invalid-receipt"
+        ? "uncollectable"
+        : "retry";
+  }
+}
+
 export const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 
 /** Relationship between the registered session key and the intended signer. */
@@ -148,10 +300,6 @@ export class ImageEditPlaintextError extends Error {
     this.name = "ImageEditPlaintextError";
     this.code = code;
   }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function hasExactKeys(value: Record<string, unknown>, expected: string[]): boolean {

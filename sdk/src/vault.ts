@@ -24,13 +24,17 @@ import {
   estimateReservationTokens,
   formatUsdcBase,
   meterVaultResponse,
+  parseVaultRedeemResponse,
   priceTokens,
   requiredVaultReservationBase,
   selectVaultOperatorFromList,
+  vaultRedeemDisposition,
   vaultDomain,
   withReservationMargin,
   type OpsState,
   type SessionKeyStatus,
+  type VaultRedeemRequest,
+  type VaultRedeemResponse,
   type VaultState,
 } from "@halo/vault-core";
 import { getChain } from "./chains";
@@ -424,21 +428,33 @@ export class HaloVaultClient {
     if (!res.ok || !body.hash) throw new Error(body.error || `reserve failed (HTTP ${res.status})`);
     return body.hash;
   }
-  private async postRedeem(operator: string, cumulative: bigint, signature: string): Promise<string> {
+  private async postRedeem(
+    operator: string,
+    cumulative: bigint,
+    cycle: bigint,
+    signature: string
+  ): Promise<VaultRedeemResponse> {
+    const request: VaultRedeemRequest = {
+      consumer: await this.consumer(),
+      operator,
+      cumulative: cumulative.toString(),
+      cycle: cycle.toString(),
+      signature,
+    };
     const res = await fetch(`${this.facBase()}/vault/redeem`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        consumer: await this.consumer(),
-        operator,
-        cumulative: cumulative.toString(),
-        signature,
-      }),
+      body: JSON.stringify(request),
       signal: AbortSignal.timeout(60_000),
     });
-    const body = (await res.json().catch(() => ({}))) as { hash?: string; error?: string };
-    if (!res.ok || !body.hash) throw new Error(body.error || `redeem failed (HTTP ${res.status})`);
-    return body.hash;
+    const raw = await res.json().catch(() => null);
+    const outcome = parseVaultRedeemResponse(raw);
+    if (outcome) return outcome;
+    const error =
+      raw && typeof raw === "object" && "error" in raw
+        ? String((raw as { error?: unknown }).error ?? "")
+        : "";
+    throw new Error(error || `invalid redeem response (HTTP ${res.status})`);
   }
 
   private async pushReceipt(
@@ -860,8 +876,46 @@ export class HaloVaultClient {
         }
       } catch {}
 
-      await this.postRedeem(pending.operator, pending.cumulative, pending.signature);
-      clearIfCurrent();
+      const outcome = await this.postRedeem(
+        pending.operator,
+        pending.cumulative,
+        pending.cycle,
+        pending.signature
+      );
+      const disposition = vaultRedeemDisposition(outcome, {
+        cumulative: pending.cumulative.toString(),
+        cycle: pending.cycle.toString(),
+      });
+      if (disposition === "collected") {
+        clearIfCurrent();
+        return;
+      }
+      if (disposition === "uncollectable") {
+        clearIfCurrent();
+        this.cfg.log(
+          `vault receipt is uncollectable; abandoning: ${outcome.status === "rejected" ? outcome.error : outcome.status}`
+        );
+        return;
+      }
+      switch (outcome.status) {
+        case "confirmed":
+        case "already-redeemed":
+          this.cfg.log("vault redeem returned mismatched canonical coverage; retained for retry");
+          break;
+        case "pending":
+          this.cfg.log(
+            `vault redeem pending at ${outcome.transaction}; retained cycle ${pending.cycle} receipt for recheck`
+          );
+          break;
+        case "reverted":
+          this.cfg.log(
+            `vault redeem ${outcome.transaction} reverted; retained cycle ${pending.cycle} receipt for retry`
+          );
+          break;
+        case "rejected":
+          this.cfg.log(`vault redeem rejected transiently; retained for retry: ${outcome.error}`);
+          break;
+      }
     } catch (e) {
       const cls = classifyRedeemError(errStr(e));
       if (cls === "collected") {

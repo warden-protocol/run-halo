@@ -552,7 +552,12 @@ test("default payInference does not wait for a slow facilitator redeem", async (
   HaloVaultClient.prototype.postRedeem = async () => {
     redeemStarted();
     await slowRedeem;
-    return "0xredeem";
+    return {
+      status: "confirmed",
+      transaction: `0x${"a".repeat(64)}`,
+      cumulative: "10",
+      cycle: "1",
+    };
   };
 
   const paymentResponse = Buffer.from(JSON.stringify({ amountUsdc: "10" })).toString("base64");
@@ -624,6 +629,143 @@ test("retains transient redeem failures for a later retry", async () => {
   assert.equal(client.pendingRedeemCount, 1);
 });
 
+test("retains pending and reverted facilitator outcomes for recheck", async () => {
+  for (const status of ["pending", "reverted"]) {
+    const client = new HaloVaultClient(
+      { getAddress: async () => "0x0000000000000000000000000000000000000004" },
+      {
+        facilitatorUrl: "https://facilitator.invalid",
+        rpcUrl: "http://127.0.0.1:1",
+        chainId: 8453,
+      }
+    );
+    client.signReceipt = async () => "0xsigned";
+    client.readOps = async () => ({
+      locked: 1_000n,
+      redeemed: 0n,
+      expiry: 0n,
+      created: 0n,
+      cycle: 1n,
+    });
+    client.postRedeem = async () => ({
+      status,
+      transaction: `0x${"d".repeat(64)}`,
+      cumulative: "100",
+      cycle: "1",
+      ...(status === "pending" ? { coalesced: false } : {}),
+    });
+    client.recordAndRedeem(
+      "0x0000000000000000000000000000000000000005",
+      { locked: 1_000n, redeemed: 0n, expiry: 0n, created: 0n, cycle: 1n },
+      1n,
+      100n
+    );
+    await client.flushRedeems();
+    assert.equal(client.pendingRedeemCount, 1, `${status} must retain the signed receipt`);
+  }
+});
+
+test("typed rejected outcomes clear only cycle-mismatched or invalid receipts", async () => {
+  for (const reason of ["cycle-mismatch", "invalid-receipt", "invalid-request", "unavailable"]) {
+    const client = new HaloVaultClient(
+      { getAddress: async () => "0x0000000000000000000000000000000000000004" },
+      {
+        facilitatorUrl: "https://facilitator.invalid",
+        rpcUrl: "http://127.0.0.1:1",
+        chainId: 8453,
+      }
+    );
+    client.signReceipt = async () => "0xsigned";
+    client.readOps = async () => ({
+      locked: 1_000n,
+      redeemed: 0n,
+      expiry: 0n,
+      created: 0n,
+      cycle: 1n,
+    });
+    client.postRedeem = async () => ({ status: "rejected", reason, error: reason });
+    client.recordAndRedeem(
+      "0x0000000000000000000000000000000000000005",
+      { locked: 1_000n, redeemed: 0n, expiry: 0n, created: 0n, cycle: 1n },
+      1n,
+      100n
+    );
+    await client.flushRedeems();
+    const clears = reason === "cycle-mismatch" || reason === "invalid-receipt";
+    assert.equal(client.pendingRedeemCount, clears ? 0 : 1, reason);
+  }
+});
+
+test("canonical coverage from another cycle cannot clear the SDK receipt", async () => {
+  const client = new HaloVaultClient(
+    { getAddress: async () => "0x0000000000000000000000000000000000000004" },
+    {
+      facilitatorUrl: "https://facilitator.invalid",
+      rpcUrl: "http://127.0.0.1:1",
+      chainId: 8453,
+    }
+  );
+  client.signReceipt = async () => "0xsigned";
+  client.readOps = async () => ({
+    locked: 1_000n,
+    redeemed: 0n,
+    expiry: 0n,
+    created: 0n,
+    cycle: 1n,
+  });
+  client.postRedeem = async () => ({
+    status: "already-redeemed",
+    redeemed: "100",
+    cycle: "2",
+  });
+  client.recordAndRedeem(
+    "0x0000000000000000000000000000000000000005",
+    { locked: 1_000n, redeemed: 0n, expiry: 0n, created: 0n, cycle: 1n },
+    1n,
+    100n
+  );
+  await client.flushRedeems();
+  assert.equal(client.pendingRedeemCount, 1);
+});
+
+test("postRedeem carries the signed cycle and parses the typed pending response", async (t) => {
+  const originalFetch = global.fetch;
+  let sent;
+  global.fetch = async (_url, init) => {
+    sent = JSON.parse(init.body);
+    return new Response(
+      JSON.stringify({
+        status: "pending",
+        transaction: `0x${"e".repeat(64)}`,
+        cumulative: "100",
+        cycle: "7",
+        coalesced: false,
+      }),
+      { status: 202, headers: { "content-type": "application/json" } }
+    );
+  };
+  t.after(() => {
+    global.fetch = originalFetch;
+  });
+  const client = new HaloVaultClient(
+    { getAddress: async () => "0x0000000000000000000000000000000000000004" },
+    {
+      facilitatorUrl: "https://facilitator.invalid",
+      rpcUrl: "http://127.0.0.1:1",
+      chainId: 8453,
+    }
+  );
+  client.consumer = async () => "0x0000000000000000000000000000000000000004";
+  const result = await client.postRedeem(
+    "0x0000000000000000000000000000000000000005",
+    100n,
+    7n,
+    "0xsigned"
+  );
+  assert.equal(sent.cycle, "7");
+  assert.equal(result.status, "pending");
+});
+
 test("does not double-submit a redeem while one attempt is in flight", async () => {
   const client = new HaloVaultClient(
     { getAddress: async () => "0x0000000000000000000000000000000000000014" },
@@ -648,7 +790,12 @@ test("does not double-submit a redeem while one attempt is in flight", async () 
     calls += 1;
     redeemStarted();
     await gate;
-    return "0xredeem";
+    return {
+      status: "confirmed",
+      transaction: `0x${"b".repeat(64)}`,
+      cumulative: "100",
+      cycle: "2",
+    };
   };
   const operator = "0x0000000000000000000000000000000000000015";
   client.recordAndRedeem(
@@ -1421,7 +1568,12 @@ test("recordAndRedeem clamps to the high-water reservation ceiling, not a stale 
   client.readOps = async () => ({ locked: 2_000n, redeemed: 0n, expiry: 0n, created: 0n, cycle: 1n });
   client.postRedeem = async (_operator, cumulative) => {
     submitted.push(cumulative);
-    return "0xredeem";
+    return {
+      status: "confirmed",
+      transaction: `0x${"c".repeat(64)}`,
+      cumulative: cumulative.toString(),
+      cycle: "1",
+    };
   };
   const operator = "0x0000000000000000000000000000000000000053";
   client.recordAndRedeem(operator, { locked: 2_000n, redeemed: 0n, expiry: 0n, created: 0n, cycle: 1n }, 1n, 1_500n);

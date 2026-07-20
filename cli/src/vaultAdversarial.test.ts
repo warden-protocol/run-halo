@@ -212,7 +212,15 @@ test("TRANSIENT OVERMATCH: an RPC error containing 'already'/'stale' is RETRIED,
 
 test("SWEEP: re-kicks pairs that still hold an unredeemed receipt", async () => {
   const C = "0x1111111111111111111111111111111111111111";
-  const fac = await mockFacilitator(() => ({ status: 200, body: { hash: "0xok" } }));
+  const fac = await mockFacilitator(() => ({
+    status: 200,
+    body: {
+      status: "confirmed",
+      transaction: `0x${"a".repeat(64)}`,
+      cumulative: "700",
+      cycle: "1",
+    },
+  }));
   try {
     const l = new VaultCreditLedger();
     l.recordReceipt(C, OP, { cumulative: 700n, signature: "0xsig", cycle: 1n });
