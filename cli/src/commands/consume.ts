@@ -8,8 +8,10 @@ import { loadWallet } from "../wallet";
 import {
   generateEphemeralKeypair,
   encryptRequest,
+  encryptBytes,
   decryptResponse,
   decryptBytes,
+  ENCRYPTION_ALG,
   hexToPubkey,
   isEncryptedEnvelope,
   EncryptedEnvelope,
@@ -44,16 +46,28 @@ import {
 import {
   MAX_VAULT_RESERVATION_ATTEMPTS,
   RESERVATION_PRICE_MARGIN_BPS,
+  IMAGE_EDIT_MAX_BODY_BYTES,
+  IMAGE_EDIT_MAX_INPUT_BYTES,
+  IMAGE_EDIT_MAX_OUTPUT_IMAGES,
+  IMAGE_EDIT_MAX_PROMPT_BYTES,
   estimateReservationTokens,
   meterVaultResponse,
   priceImages,
   requiredVaultReservationBase,
   selectVaultImageOperatorFromList,
   selectVaultOperatorFromList,
+  serializeImageEditPlaintext,
   settlementAmount,
   withReservationMargin,
   type VaultOperatorSelectionReason,
 } from "@halo/vault-core";
+import {
+  detectImageFormat,
+  MalformedImageError,
+  stripImageMetadata,
+  UnsupportedImageFormatError,
+  type ImageFormat,
+} from "../imageStrip";
 import { setCliVersionHeader } from "../versionHeader";
 import { restartIntoManagedInstall, startAutoUpdateMonitor } from "../update";
 import { relayCliVersion } from "../relayVersion";
@@ -179,16 +193,21 @@ interface VaultImageOperatorSelectionResult {
 export async function selectVaultImageOperator(
   relayBase: string,
   model: string,
-  requireAddress?: string
+  requireAddress?: string,
+  requireEditCapability = false,
+  signal?: AbortSignal
 ): Promise<VaultImageOperatorSelectionResult> {
   try {
-    const res = await fetch(`${relayBase}/v1/operators`, { signal: AbortSignal.timeout(10_000) });
+    const timeout = AbortSignal.timeout(10_000);
+    const requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+    const res = await fetch(`${relayBase}/v1/operators`, { signal: requestSignal });
     if (!res.ok) return { pin: null, reason: "no_operator" };
     const { operators } = (await res.json()) as {
       operators: Array<{
         address: string;
         models: string[];
         imageModels?: string[];
+        imageEditModels?: string[];
         imagePricing?: Record<string, number>;
         encryptionPubkey?: string | null;
         pubkeyAttestation?: string | null;
@@ -206,9 +225,13 @@ export async function selectVaultImageOperator(
     const selection = selectVaultImageOperatorFromList(authenticated, model, {
       requireAddress,
       randomizeCheapestTies: !requireAddress,
+      requireEditCapability,
     });
     if (!selection.selected) {
-      const pricedSelection = selectVaultImageOperatorFromList(operators, model, { requireAddress });
+      const pricedSelection = selectVaultImageOperatorFromList(operators, model, {
+        requireAddress,
+        requireEditCapability,
+      });
       return {
         pin: null,
         reason: pricedSelection.selected ? "no_encrypted_operator" : selection.reason,
@@ -224,6 +247,7 @@ export async function selectVaultImageOperator(
       reason: selection.reason,
     };
   } catch {
+    if (signal?.aborted) throw signal.reason;
     return { pin: null, reason: "no_operator" };
   }
 }
@@ -321,6 +345,60 @@ export function buildImageRelayRequest(
   };
 }
 
+/** Build the dedicated relay request for one v2-encrypted image edit. */
+export function buildImageEditRelayRequest(
+  relayBase: string,
+  operator: string,
+  consumer: string,
+  model: string,
+  envelope: BytesEncryptedEnvelope
+): { url: string; headers: Record<string, string>; body: Record<string, unknown> } {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "x-halo-payment-mode": "vault",
+    "x-halo-operator": operator,
+    "x-halo-vault-consumer": consumer,
+    "x-halo-accept-media": "1",
+  };
+  setCliVersionHeader(headers);
+  return {
+    url: `${relayBase.replace(/\/+$/, "")}/v1/images/edit`,
+    headers,
+    body: { model, acceptMedia: true, _enc: envelope },
+  };
+}
+
+export function imageEditRelayBodyBytes(model: string, envelope: BytesEncryptedEnvelope): number {
+  return Buffer.byteLength(JSON.stringify({ model, acceptMedia: true, _enc: envelope }), "utf8");
+}
+
+export function imageEditRelayBodyBytesForPlaintext(
+  model: string,
+  plaintextByteLength: number
+): number {
+  if (!Number.isSafeInteger(plaintextByteLength) || plaintextByteLength < 0) {
+    throw new Error("image edit plaintext byte length must be a non-negative safe integer");
+  }
+  const emptyEnvelope: BytesEncryptedEnvelope = {
+    v: 2,
+    alg: ENCRYPTION_ALG,
+    epk: "",
+    nonce: "",
+    ct: "",
+  };
+  const ephemeralPublicKeyHexLength = 32 * 2;
+  const nonceHexLength = 12 * 2;
+  const gcmTagByteLength = 16;
+  const sealedByteLength = plaintextByteLength + gcmTagByteLength;
+  const ciphertextBase64Length = 4 * Math.ceil(sealedByteLength / 3);
+  return (
+    imageEditRelayBodyBytes(model, emptyEnvelope) +
+    ephemeralPublicKeyHexLength +
+    nonceHexLength +
+    ciphertextBase64Length
+  );
+}
+
 export interface DecodedImage {
   mime: string;
   bytes: Buffer;
@@ -331,6 +409,22 @@ export interface ConsumedImageStream {
   /** Base-unit settlement amount parsed from the halo-settlement frame's
    *  `paymentResponse`, or null when no valid settlement rode the stream. */
   settlementBase: bigint | null;
+}
+
+function validateDecryptedImage(mime: string, bytes: Buffer): DecodedImage {
+  if (bytes.length === 0) throw new Error("decrypted image is empty");
+  const expectedMime: Partial<Record<ImageFormat, DecodedImage["mime"]>> = {
+    jpeg: "image/jpeg",
+    png: "image/png",
+    webp: "image/webp",
+  };
+  const format = detectImageFormat(bytes);
+  const expected = expectedMime[format];
+  if (!expected) throw new Error(`decrypted media has unsupported image format ${format}`);
+  if (mime.trim().toLowerCase() !== expected) {
+    throw new Error(`decrypted media MIME ${JSON.stringify(mime)} does not match ${expected}`);
+  }
+  return { mime: expected, bytes };
 }
 
 /**
@@ -398,10 +492,21 @@ export async function consumeImageSseStream(
     for (const imageIndex of [...byImage.keys()].sort((a, b) => a - b)) {
       const envelope = reassembleMediaEnvelope(byImage.get(imageIndex) ?? []);
       const padded = decryptMedia(envelope);
-      const unpacked = unpackMediaPlaintext(trimPadding(padded));
-      images.push({ mime: unpacked.mime, bytes: unpacked.bytes });
+      try {
+        const unpacked = unpackMediaPlaintext(trimPadding(padded));
+        const bytes = Buffer.from(unpacked.bytes);
+        try {
+          images.push(validateDecryptedImage(unpacked.mime, bytes));
+        } catch (err) {
+          bytes.fill(0);
+          throw err;
+        }
+      } finally {
+        padded.fill(0);
+      }
     }
   } catch (err) {
+    for (const image of images) image.bytes.fill(0);
     throw new Error(`image media decode failed: ${err instanceof Error ? err.message : String(err)}`);
   }
   return { images, settlementBase };
@@ -500,6 +605,7 @@ export function modelAllowlistGate(
       error: {
         message: `model ${model || "(none)"} is not in this consumer's allowlist (${allowedModels.join(", ")})`,
         type: "halo_model_not_allowed",
+        code: "model_not_allowed",
       },
     },
   };
@@ -522,8 +628,8 @@ export function reserveImageBudget(
   budget: SessionBudgetState,
   ceilingBase: bigint,
   budgetUrl: string
-): { admitted: true } | { admitted: false; body: unknown } {
-  if (budget.budgetBase <= 0n) return { admitted: true };
+): { admitted: true; reserved: boolean } | { admitted: false; body: unknown } {
+  if (budget.budgetBase <= 0n) return { admitted: true, reserved: false };
   const usd = (b: bigint) => (Number(b) / 1_000_000).toFixed(4);
   if (budget.spentBase + budget.reservedBase + ceilingBase > budget.budgetBase) {
     return {
@@ -544,7 +650,31 @@ export function reserveImageBudget(
     };
   }
   budget.reservedBase += ceilingBase;
-  return { admitted: true };
+  return { admitted: true, reserved: true };
+}
+
+export function growImageBudgetReservation(
+  budget: SessionBudgetState,
+  currentCeilingBase: bigint,
+  requiredCeilingBase: bigint,
+  alreadyReserved: boolean,
+  budgetUrl: string
+): { admitted: true; reserved: boolean } | { admitted: false; body: unknown } {
+  if (requiredCeilingBase <= currentCeilingBase) {
+    return { admitted: true, reserved: alreadyReserved };
+  }
+  const increase = requiredCeilingBase - currentCeilingBase;
+  if (alreadyReserved && budget.budgetBase <= 0n) {
+    budget.reservedBase += increase;
+    return { admitted: true, reserved: true };
+  }
+  const admission = reserveImageBudget(
+    budget,
+    alreadyReserved ? increase : requiredCeilingBase,
+    budgetUrl
+  );
+  if (!admission.admitted) return admission;
+  return { admitted: true, reserved: alreadyReserved || admission.reserved };
 }
 
 /** Refuse an image request whose announced per-image ceiling exceeds --max-usdc. */
@@ -588,49 +718,96 @@ export function accrueImageBudget(
   }
 }
 
-/**
- * Send one image-generation inference over the HaloVault rail — the image
- * analog of `vaultSend`. Reservation is sized from the ANNOUNCED per-image
- * price, never token pricing (invariant #7). The redeemed amount is metered
- * ONLY from the operator's settlement (invariant #2), CAPPED to what the
- * DECODED image count justifies, and refused outright when a positive
- * settlement is claimed alongside ZERO decoded images (invariant #1/#3):
- * never charge more than images actually delivered, and never trust an
- * operator-claimed settlement over what was actually decoded.
- */
-export async function vaultSendImage(
-  client: VaultConsumeClient,
-  relayBase: string,
-  opts: {
-    operator: string;
-    priceUsdcPerImage: number;
-    imageCount: number;
-    model: string;
-    envelope: EncryptedEnvelope;
-    ephemeralPrivateKey: Uint8Array;
-    operatorPublicKey: Uint8Array;
-    signal: AbortSignal;
-  }
-): Promise<{
+interface VaultImageSendCommonOptions {
+  operator: string;
+  priceUsdcPerImage: number;
+  imageCount: number;
+  model: string;
+  ephemeralPrivateKey: Uint8Array;
+  operatorPublicKey: Uint8Array;
+  signal: AbortSignal;
+}
+
+type ImageReservationRequirementAdmission =
+  | { admitted: true }
+  | { admitted: false; status: number; errorBody: unknown };
+
+export type VaultImageSendOptions = VaultImageSendCommonOptions &
+  (
+    | { kind?: "generation"; envelope: EncryptedEnvelope }
+    | {
+        kind: "edit";
+        envelope: BytesEncryptedEnvelope;
+        admitReservationRequirement: (
+          requiredBase: bigint
+        ) => ImageReservationRequirementAdmission;
+      }
+  );
+
+export type VaultImageEditSendOptions = VaultImageSendCommonOptions & {
+  envelope: BytesEncryptedEnvelope;
+  admitReservationRequirement: (
+    requiredBase: bigint
+  ) => ImageReservationRequirementAdmission;
+};
+
+export interface VaultImageSendResult {
   ok: boolean;
   status: number;
   images: DecodedImage[];
   paid: boolean;
   chargedBase?: string;
   errorBody?: unknown;
-}> {
-  const estCost = withReservationMargin(priceImages(opts.priceUsdcPerImage, opts.imageCount));
+}
+
+/**
+ * Send one image inference over the HaloVault rail. Reservation is sized from
+ * the announced per-image price, never token pricing (invariant #7). The
+ * redeemed amount is metered ONLY from the operator's settlement (invariant
+ * #2), CAPPED to what the smaller of the requested and DECODED image counts
+ * justifies, and refused outright when a positive settlement is claimed
+ * alongside ZERO decoded images (invariant #1/#3): never charge more than
+ * images actually delivered, and never trust an operator-claimed settlement
+ * over what was actually decoded.
+ */
+export async function vaultSendImage(
+  client: VaultConsumeClient,
+  relayBase: string,
+  opts: VaultImageSendOptions
+): Promise<VaultImageSendResult> {
+  let acceptedChargeCeiling = priceImages(opts.priceUsdcPerImage, opts.imageCount);
+  const estCost = withReservationMargin(acceptedChargeCeiling);
   let ops: OpsState;
   let keyEpoch: bigint;
-  ({ ops, keyEpoch } = await client.ensureReservation(opts.operator, estCost));
+  ({ ops, keyEpoch } = await client.ensureReservation(opts.operator, estCost, opts.signal));
 
+  opts.signal.throwIfAborted();
   const consumer = await client.consumer();
   const send = (): Promise<Response> => {
-    const built = buildImageRelayRequest(relayBase, opts.operator, consumer, opts.model, opts.envelope);
+    const built =
+      opts.kind === "edit"
+        ? buildImageEditRelayRequest(
+            relayBase,
+            opts.operator,
+            consumer,
+            opts.model,
+            opts.envelope
+          )
+        : buildImageRelayRequest(
+            relayBase,
+            opts.operator,
+            consumer,
+            opts.model,
+            opts.envelope
+          );
+    const body = JSON.stringify(built.body);
+    if (opts.kind === "edit" && Buffer.byteLength(body, "utf8") > IMAGE_EDIT_MAX_BODY_BYTES) {
+      throw new Error(`serialized image edit relay body exceeds ${IMAGE_EDIT_MAX_BODY_BYTES} bytes`);
+    }
     return fetch(built.url, {
       method: "POST",
       headers: built.headers,
-      body: JSON.stringify(built.body),
+      body,
       signal: opts.signal,
     });
   };
@@ -648,7 +825,22 @@ export async function vaultSendImage(
     if (required === null) {
       return { ok: false, status: res.status, images: [], paid: false, errorBody: parseJsonOrWrapError(text) };
     }
-    ({ ops, keyEpoch } = await client.ensureReservation(opts.operator, required));
+    if (opts.kind === "edit" && required > acceptedChargeCeiling) {
+      opts.signal.throwIfAborted();
+      const admission = opts.admitReservationRequirement(required);
+      if (!admission.admitted) {
+        return {
+          ok: false,
+          status: admission.status,
+          images: [],
+          paid: false,
+          errorBody: admission.errorBody,
+        };
+      }
+      acceptedChargeCeiling = required;
+    }
+    opts.signal.throwIfAborted();
+    ({ ops, keyEpoch } = await client.ensureReservation(opts.operator, required, opts.signal));
     res = await send();
   }
 
@@ -729,28 +921,58 @@ export async function vaultSendImage(
   // Invariant #2: meter from the operator settlement ONLY. No token-price
   // fallback for images — an unmeterable response is left unmetered, never
   // guessed from the client-requested `n` or any other estimate. Cap the
-  // redeemed amount to what the DECODED image count justifies (invariant #1):
-  // never pay more than `priceImages(perImage, decodedCount)`, even when the
-  // operator's settlement claims more — e.g. it settled for the requested `n`
-  // but fewer images' frames actually made it through decode.
-  const justified = priceImages(opts.priceUsdcPerImage, stream.images.length);
+  // redeemed amount and returned media to the requested count and the number
+  // actually decoded (invariant #1). Extra operator-controlled frames cannot
+  // expand either the caller result or the admitted payment ceiling.
+  const deliveredImages = stream.images.slice(0, opts.imageCount);
+  for (const extra of stream.images.slice(opts.imageCount)) extra.bytes.fill(0);
+  const justified =
+    opts.kind === "edit"
+      ? proportionalImageChargeCeiling(
+          acceptedChargeCeiling,
+          opts.imageCount,
+          deliveredImages.length
+        )
+      : priceImages(opts.priceUsdcPerImage, deliveredImages.length);
   const paidCost =
-    stream.images.length > 0 && cost !== null && cost > 0n
+    deliveredImages.length > 0 && cost !== null && cost > 0n
       ? cost <= justified
         ? cost
         : justified
       : null;
   if (paidCost !== null) {
+    opts.signal.throwIfAborted();
     client.recordAndRedeem(opts.operator, ops, keyEpoch, paidCost);
   }
 
   return {
     ok: true,
     status: res.status,
-    images: stream.images,
+    images: deliveredImages,
     paid: paidCost !== null,
     chargedBase: paidCost !== null ? paidCost.toString() : undefined,
   };
+}
+
+function proportionalImageChargeCeiling(
+  requestCeiling: bigint,
+  requestedImages: number,
+  deliveredImages: number
+): bigint {
+  if (deliveredImages <= 0 || requestCeiling <= 0n) return 0n;
+  if (deliveredImages >= requestedImages) return requestCeiling;
+  const requested = BigInt(requestedImages);
+  const perImageCeiling = (requestCeiling + requested - 1n) / requested;
+  const deliveredCeiling = perImageCeiling * BigInt(deliveredImages);
+  return deliveredCeiling < requestCeiling ? deliveredCeiling : requestCeiling;
+}
+
+export function vaultSendImageEdit(
+  client: VaultConsumeClient,
+  relayBase: string,
+  opts: VaultImageEditSendOptions
+): Promise<VaultImageSendResult> {
+  return vaultSendImage(client, relayBase, { ...opts, kind: "edit" });
 }
 
 /** Probe a local consume /health. Returns the health info if a halo consume is
@@ -849,6 +1071,406 @@ export function drainForShutdown(
     const flushed = flushRedeems ? flushRedeems().catch(() => {}) : Promise.resolve();
     void Promise.all([closeServer(), flushed]).then(finish);
   });
+}
+
+export type ConsumeRequestHandler = (
+  req: http.IncomingMessage,
+  res: http.ServerResponse
+) => Promise<void>;
+
+export function createConsumeHttpServer(handler: ConsumeRequestHandler): http.Server {
+  const server = http.createServer((req, res) => {
+    handler(req, res).catch((err) => {
+      sendJson(res, 500, { error: { message: errMsg(err), type: "halo_internal_error" } });
+    });
+  });
+  server.on("clientError", (_err, socket) => {
+    try {
+      if (socket.writable) socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
+      else socket.destroy();
+    } catch {
+      /* socket already gone */
+    }
+  });
+  server.requestTimeout = 360_000;
+  server.headersTimeout = 65_000;
+  server.keepAliveTimeout = 75_000;
+  return server;
+}
+
+export interface ConsumeInferenceRoutes {
+  completion: ConsumeRequestHandler;
+  imageGeneration: ConsumeRequestHandler;
+  imageEdit: ConsumeRequestHandler;
+}
+
+export function dispatchConsumeInferenceRoute(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  routes: ConsumeInferenceRoutes
+): Promise<void> | null {
+  if (req.method !== "POST") return null;
+  const url = (req.url || "").split("?")[0];
+  if (url === "/v1/chat/completions") return routes.completion(req, res);
+  if (url === "/v1/images/generations") return routes.imageGeneration(req, res);
+  if (url === "/v1/images/edits") return routes.imageEdit(req, res);
+  return null;
+}
+
+interface ImageEditOperatorPin {
+  address: string;
+  priceUsdcPerImage: number;
+  encryptionPubkey: string | null;
+}
+
+export interface ImageEditHandlerDependencies {
+  allowedModels: string[] | undefined;
+  confidentialOnly?: boolean;
+  maxAmountBase: bigint;
+  budget: SessionBudgetState;
+  budgetUrl: string;
+  budgetHeaders: () => Record<string, string>;
+  selectOperator: (
+    model: string,
+    requireAddress: string | undefined,
+    signal: AbortSignal
+  ) => Promise<{ pin: ImageEditOperatorPin | null; reason: VaultImageOperatorSelectionResult["reason"] }>;
+  sendImage: (opts: VaultImageEditSendOptions) => Promise<VaultImageSendResult>;
+  encryptPayload?: typeof encryptBytes;
+  preflightBodyBytes?: typeof imageEditRelayBodyBytesForPlaintext;
+  logRequest?: (info: {
+    model: string;
+    status: number;
+    paid: boolean;
+    chargedBase?: string;
+    operator?: string | null;
+    confidential: boolean;
+    ms: number;
+    note?: string;
+  }) => void;
+}
+
+export function createImageEditHandler(
+  deps: ImageEditHandlerDependencies
+): ConsumeRequestHandler {
+  return async (req, res): Promise<void> => {
+    const startedAt = Date.now();
+    const wantConfidential =
+      deps.confidentialOnly === true ||
+      /^(1|true|required|yes)$/i.test(String(req.headers["x-halo-confidential"] || ""));
+    const ac = new AbortController();
+    let model = "(none)";
+    let operator: string | null = null;
+    let sensitivePlaintext: Uint8Array | null = null;
+    let sensitiveEnvelope: BytesEncryptedEnvelope | null = null;
+    let sensitivePrivateKey: Uint8Array | null = null;
+    let sensitiveOperatorKey: Uint8Array | null = null;
+    let reserved = false;
+    let ceilingBase = 0n;
+    const clearSensitive = (): void => {
+      sensitivePlaintext?.fill(0);
+      sensitivePlaintext = null;
+      sensitivePrivateKey?.fill(0);
+      sensitivePrivateKey = null;
+      sensitiveOperatorKey?.fill(0);
+      sensitiveOperatorKey = null;
+      if (sensitiveEnvelope) {
+        sensitiveEnvelope.epk = "";
+        sensitiveEnvelope.nonce = "";
+        sensitiveEnvelope.ct = "";
+        sensitiveEnvelope = null;
+      }
+    };
+    const release = (): void => {
+      if (!reserved) return;
+      reserved = false;
+      releaseImageBudget(deps.budget, ceilingBase);
+    };
+    const onClose = (): void => {
+      if (!res.writableFinished) ac.abort();
+      release();
+    };
+    ac.signal.addEventListener("abort", clearSensitive, { once: true });
+    res.once("close", onClose);
+
+    try {
+      const parsed = await readImageEditMultipart(req, ac.signal);
+      model = parsed.model;
+
+      if (wantConfidential) {
+        parsed.image.bytes.fill(0);
+        throw new ImageEditRequestError(
+          400,
+          "image_edit_confidential_unsupported",
+          "Image editing has no confidential TEE adapter; remove --confidential or X-Halo-Confidential for this route.",
+          "halo_confidential_error"
+        );
+      }
+
+      let stripped: Buffer;
+      let mime: "image/jpeg" | "image/png" | "image/webp";
+      try {
+        ({ bytes: stripped, mime } = stripUploadedEditImage(parsed.image.bytes, parsed.image.contentType));
+      } finally {
+        parsed.image.bytes.fill(0);
+      }
+      if (stripped.length > IMAGE_EDIT_MAX_INPUT_BYTES) {
+        stripped.fill(0);
+        throw new ImageEditRequestError(
+          413,
+          "image_too_large",
+          `stripped image exceeds ${IMAGE_EDIT_MAX_INPUT_BYTES} bytes`
+        );
+      }
+
+      let plaintext: Uint8Array;
+      try {
+        plaintext = serializeImageEditPlaintext({
+          prompt: parsed.prompt,
+          n: parsed.n,
+          image: { mime, b64_json: stripped.toString("base64") },
+        });
+      } catch (err) {
+        stripped.fill(0);
+        throw new ImageEditRequestError(400, "invalid_image_edit_schema", errMsg(err));
+      }
+      sensitivePlaintext = plaintext;
+      stripped.fill(0);
+
+      const preflightBodyBytes =
+        deps.preflightBodyBytes ?? imageEditRelayBodyBytesForPlaintext;
+      if (preflightBodyBytes(model, plaintext.byteLength) > IMAGE_EDIT_MAX_BODY_BYTES) {
+        throw new ImageEditRequestError(
+          413,
+          "encrypted_body_too_large",
+          `serialized encrypted image edit body exceeds ${IMAGE_EDIT_MAX_BODY_BYTES} bytes`
+        );
+      }
+
+      if (!deps.allowedModels || deps.allowedModels.length === 0) {
+        plaintext.fill(0);
+        throw new ImageEditRequestError(
+          403,
+          "image_edit_allowlist_required",
+          "image editing requires a non-empty consume.allowedModels allowlist",
+          "halo_model_not_allowed"
+        );
+      }
+      const allowlistGate = modelAllowlistGate(model, deps.allowedModels);
+      if (allowlistGate) {
+        plaintext.fill(0);
+        sendJson(res, allowlistGate.status, allowlistGate.body, deps.budgetHeaders());
+        return;
+      }
+
+      const pinned = (collectHaloHeaders(req)["x-halo-operator"] || "").trim() || undefined;
+      const selection = await deps.selectOperator(model, pinned, ac.signal);
+      if (ac.signal.aborted) {
+        plaintext.fill(0);
+        return;
+      }
+      if (!selection.pin) {
+        plaintext.fill(0);
+        const noEncryption = selection.reason === "no_encrypted_operator";
+        const message = noEncryption
+          ? pinned
+            ? `pinned operator ${pinned} does not advertise an authenticated E2E key required for encrypted image editing.`
+            : `No edit-capable image operator with an authenticated E2E key is online for "${model}".`
+          : pinned
+            ? `pinned operator ${pinned} is unavailable or lacks exact edit capability, Vault support, or a positive per-image price for "${model}".`
+            : `No priced Vault operator with exact image-edit capability is online for "${model}".`;
+        throw new ImageEditRequestError(
+          503,
+          noEncryption ? "image_operator_no_encryption_key" : "no_image_edit_operator",
+          message,
+          noEncryption ? "halo_e2e_error" : "halo_no_operator"
+        );
+      }
+      const pin = selection.pin;
+      operator = pin.address;
+      if (!pin.encryptionPubkey) {
+        plaintext.fill(0);
+        throw new ImageEditRequestError(
+          503,
+          "image_operator_no_encryption_key",
+          `Image editing for "${model}" requires an authenticated operator E2E key.`,
+          "halo_e2e_error"
+        );
+      }
+
+      let operatorPublicKey: Uint8Array;
+      let ephemeral: EphemeralKeyPair;
+      let envelope: BytesEncryptedEnvelope;
+      try {
+        operatorPublicKey = hexToPubkey(pin.encryptionPubkey);
+        sensitiveOperatorKey = operatorPublicKey;
+        ephemeral = generateEphemeralKeypair();
+        sensitivePrivateKey = ephemeral.privateKey;
+        envelope = (deps.encryptPayload ?? encryptBytes)(plaintext, operatorPublicKey, ephemeral);
+        sensitiveEnvelope = envelope;
+      } catch (err) {
+        throw new ImageEditRequestError(
+          503,
+          "image_edit_encryption_failed",
+          `Image edit encryption setup failed: ${errMsg(err)}`,
+          "halo_e2e_error"
+        );
+      } finally {
+        plaintext.fill(0);
+      }
+
+      const relayBodyBytes = imageEditRelayBodyBytes(model, envelope);
+      if (relayBodyBytes > IMAGE_EDIT_MAX_BODY_BYTES) {
+        throw new ImageEditRequestError(
+          413,
+          "encrypted_body_too_large",
+          `serialized encrypted image edit body exceeds ${IMAGE_EDIT_MAX_BODY_BYTES} bytes`
+        );
+      }
+
+      try {
+        ceilingBase = priceImages(pin.priceUsdcPerImage, parsed.n);
+      } catch (err) {
+        throw new ImageEditRequestError(
+          503,
+          "no_image_edit_operator",
+          `Selected operator has no vault-representable positive image price: ${errMsg(err)}`,
+          "halo_no_operator"
+        );
+      }
+      const perRequestCap = imagePerRequestCapGate(ceilingBase, deps.maxAmountBase);
+      if (perRequestCap) {
+        sendJson(res, perRequestCap.status, perRequestCap.body, deps.budgetHeaders());
+        return;
+      }
+      const admission = reserveImageBudget(deps.budget, ceilingBase, deps.budgetUrl);
+      if (!admission.admitted) {
+        sendJson(res, 402, admission.body, deps.budgetHeaders());
+        return;
+      }
+      reserved = admission.reserved;
+      if (ac.signal.aborted) return;
+
+      const result = await deps.sendImage({
+        operator: pin.address,
+        priceUsdcPerImage: pin.priceUsdcPerImage,
+        imageCount: parsed.n,
+        model,
+        envelope,
+        ephemeralPrivateKey: ephemeral.privateKey,
+        operatorPublicKey,
+        signal: ac.signal,
+        admitReservationRequirement: (requiredBase) => {
+          const perRequestRetryCap = imagePerRequestCapGate(
+            requiredBase,
+            deps.maxAmountBase
+          );
+          if (perRequestRetryCap) {
+            return {
+              admitted: false,
+              status: perRequestRetryCap.status,
+              errorBody: perRequestRetryCap.body,
+            };
+          }
+          const budgetAdmission = growImageBudgetReservation(
+            deps.budget,
+            ceilingBase,
+            requiredBase,
+            reserved,
+            deps.budgetUrl
+          );
+          if (!budgetAdmission.admitted) {
+            return {
+              admitted: false,
+              status: 402,
+              errorBody: budgetAdmission.body,
+            };
+          }
+          reserved = budgetAdmission.reserved;
+          ceilingBase = requiredBase;
+          return { admitted: true };
+        },
+      });
+      accrueImageBudget(deps.budget, result);
+      deps.logRequest?.({
+        model,
+        status: result.status,
+        paid: result.paid,
+        chargedBase: result.chargedBase,
+        operator,
+        confidential: wantConfidential,
+        ms: Date.now() - startedAt,
+      });
+      if (!result.ok) {
+        sendJson(
+          res,
+          result.status >= 400 ? result.status : 502,
+          result.errorBody ?? {
+            error: { message: "image edit failed", type: "halo_upstream_error" },
+          },
+          deps.budgetHeaders()
+        );
+        return;
+      }
+      sendJson(
+        res,
+        200,
+        buildImagesResponseBody(result.images),
+        buildImageResponseHeaders(pin.address, result, deps.budgetHeaders())
+      );
+    } catch (err) {
+      if (ac.signal.aborted || isClientDisconnectError(err)) {
+        deps.logRequest?.({
+          model,
+          status: 0,
+          paid: false,
+          operator,
+          confidential: wantConfidential,
+          ms: Date.now() - startedAt,
+          note: "client disconnected",
+        });
+        return;
+      }
+      if (err instanceof ImageEditRequestError) {
+        deps.logRequest?.({
+          model,
+          status: err.status,
+          paid: false,
+          operator,
+          confidential: wantConfidential,
+          ms: Date.now() - startedAt,
+          note: err.message,
+        });
+        sendJson(
+          res,
+          err.status,
+          { error: { message: err.message, type: err.errorType, code: err.code } },
+          deps.budgetHeaders()
+        );
+        return;
+      }
+      deps.logRequest?.({
+        model,
+        status: 502,
+        paid: false,
+        operator,
+        confidential: wantConfidential,
+        ms: Date.now() - startedAt,
+        note: errMsg(err),
+      });
+      sendJson(
+        res,
+        502,
+        { error: { message: errMsg(err), type: "halo_upstream_error" } },
+        deps.budgetHeaders()
+      );
+    } finally {
+      clearSensitive();
+      release();
+      res.off("close", onClose);
+      ac.signal.removeEventListener("abort", clearSensitive);
+    }
+  };
 }
 
 export async function cmdConsume(args: Args): Promise<void> {
@@ -1022,22 +1644,20 @@ export async function cmdConsume(args: Args): Promise<void> {
     console.error(`  ⚠ unhandled rejection (kept alive): ${errMsg(reason)}`);
   });
 
-  const server = http.createServer((req, res) => {
-    handle(req, res).catch((err) => {
-      sendJson(res, 500, { error: { message: errMsg(err), type: "halo_internal_error" } });
-    });
+  const handleImageEdit = createImageEditHandler({
+    allowedModels,
+    confidentialOnly: confidential,
+    maxAmountBase,
+    budget,
+    budgetUrl: `http://${host}:${port}/v1/budget`,
+    budgetHeaders,
+    selectOperator: (model, pinned, signal) =>
+      selectVaultImageOperator(relayBase, model, pinned, true, signal),
+    sendImage: (opts) => vaultSendImageEdit(vault, relayBase, opts),
+    logRequest: (info) => logReq(info),
   });
-  // A malformed/oversized request line or a client that resets mid-handshake
-  // emits 'clientError'; without a handler Node can surface it as an uncaught
-  // error. Respond 400 if the socket is still writable, else just close.
-  server.on("clientError", (_err, socket) => {
-    try {
-      if (socket.writable) socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
-      else socket.destroy();
-    } catch {
-      /* socket already gone */
-    }
-  });
+
+  const server = createConsumeHttpServer(handle);
   // Bind errors are fatal; otherwise the crash net could leave a live process with no listener.
   server.on("error", (err: NodeJS.ErrnoException) => {
     if (err.code === "EADDRINUSE") {
@@ -1052,11 +1672,6 @@ export async function cmdConsume(args: Args): Promise<void> {
     }
     process.exit(1);
   });
-  // Bound slow headers/bodies while keeping request and keepalive timeouts above legitimate inference latency.
-  server.requestTimeout = 360_000;
-  server.headersTimeout = 65_000;
-  server.keepAliveTimeout = 75_000;
-
   async function handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const url = (req.url || "").split("?")[0];
 
@@ -1127,13 +1742,12 @@ export async function cmdConsume(args: Args): Promise<void> {
       });
     }
 
-    if (req.method === "POST" && url === "/v1/chat/completions") {
-      return handleCompletion(req, res);
-    }
-
-    if (req.method === "POST" && url === "/v1/images/generations") {
-      return handleImage(req, res);
-    }
+    const inferenceRoute = dispatchConsumeInferenceRoute(req, res, {
+      completion: handleCompletion,
+      imageGeneration: handleImage,
+      imageEdit: handleImageEdit,
+    });
+    if (inferenceRoute) return inferenceRoute;
 
     // GET reports budget state; authenticated POST changes only the ceiling, never accrued spend.
     if (url === "/v1/budget") {
@@ -1610,7 +2224,7 @@ export async function cmdConsume(args: Args): Promise<void> {
     if (!budgetAdmission.admitted) {
       return sendJson(res, 402, budgetAdmission.body, budgetHeaders());
     }
-    imageBudgetReserved = true;
+    imageBudgetReserved = budgetAdmission.reserved;
     // The res.on("close") release listener was registered before the async
     // operator-selection above, so a client disconnect DURING selection fires
     // the one-shot "close" while imageBudgetReserved was still false (a no-op
@@ -1760,6 +2374,522 @@ function collectHaloHeaders(req: http.IncomingMessage): Record<string, string> {
     if (k.toLowerCase().startsWith("x-halo-") && typeof v === "string") out[k] = v;
   }
   return out;
+}
+
+class ImageEditRequestError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string,
+    message: string,
+    readonly errorType = "halo_request_error"
+  ) {
+    super(message);
+    this.name = "ImageEditRequestError";
+  }
+}
+
+class ImageEditClientDisconnectError extends Error {
+  constructor() {
+    super("client disconnected while uploading image edit");
+    this.name = "ImageEditClientDisconnectError";
+  }
+}
+
+interface ParsedImageEditMultipart {
+  model: string;
+  prompt: string;
+  n: number;
+  image: {
+    bytes: Buffer;
+    contentType: string;
+    filename: string;
+  };
+}
+
+interface ParsedMultipartPart {
+  name: string;
+  filename?: string;
+  contentType: string;
+  bytes: Buffer;
+}
+
+const MULTIPART_HEADER_BYTES = 8 * 1024;
+const IMAGE_EDIT_MAX_MODEL_BYTES = 1024;
+const HEADER_TOKEN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+const BOUNDARY_VALUE = /^[0-9A-Za-z'()+_,.\/:=? -]+$/;
+
+function isClientDisconnectError(err: unknown): boolean {
+  return err instanceof ImageEditClientDisconnectError ||
+    (err instanceof Error && err.name === "AbortError");
+}
+
+async function readImageEditMultipart(
+  req: http.IncomingMessage,
+  signal: AbortSignal
+): Promise<ParsedImageEditMultipart> {
+  let boundary: string;
+  try {
+    boundary = multipartBoundary(req.headers["content-type"]);
+  } catch (err) {
+    discardRequestBody(req);
+    throw err;
+  }
+
+  const body = await readBoundedRequestBody(req, IMAGE_EDIT_MAX_BODY_BYTES, signal);
+  try {
+    const parts = parseMultipartBody(body, boundary);
+    try {
+      const byName = new Map(parts.map((part) => [part.name, part]));
+      const modelPart = byName.get("model");
+      const promptPart = byName.get("prompt");
+      const imagePart = byName.get("image");
+      const nPart = byName.get("n");
+      if (!modelPart) {
+        throw new ImageEditRequestError(
+          400,
+          "missing_model",
+          "multipart field model is required"
+        );
+      }
+      if (!promptPart) {
+        throw new ImageEditRequestError(
+          400,
+          "missing_prompt",
+          "multipart field prompt is required"
+        );
+      }
+      if (!imagePart) {
+        throw new ImageEditRequestError(
+          400,
+          "missing_image",
+          "multipart file image is required"
+        );
+      }
+      if (
+        modelPart.filename !== undefined ||
+        promptPart.filename !== undefined ||
+        nPart?.filename !== undefined
+      ) {
+        throw new ImageEditRequestError(
+          400,
+          "invalid_multipart_field",
+          "model, prompt, and n must be ordinary multipart fields"
+        );
+      }
+      if (imagePart.filename === undefined || imagePart.filename.trim().length === 0) {
+        throw new ImageEditRequestError(
+          400,
+          "invalid_image_part",
+          "image must be a multipart file with a non-empty filename"
+        );
+      }
+      if (imagePart.bytes.length === 0) {
+        throw new ImageEditRequestError(
+          400,
+          "invalid_image_part",
+          "image file must be non-empty"
+        );
+      }
+
+      const model = decodeMultipartText(modelPart, IMAGE_EDIT_MAX_MODEL_BYTES, "model").trim();
+      if (!model) {
+        throw new ImageEditRequestError(400, "invalid_model", "model must be non-empty");
+      }
+      const prompt = decodeMultipartText(promptPart, IMAGE_EDIT_MAX_PROMPT_BYTES, "prompt");
+      if (!prompt.trim()) {
+        throw new ImageEditRequestError(400, "invalid_prompt", "prompt must be non-empty");
+      }
+
+      let n = 1;
+      if (nPart) {
+        const rawN = decodeMultipartText(nPart, 16, "n").trim();
+        if (!/^[1-9]\d*$/.test(rawN)) {
+          throw new ImageEditRequestError(
+            400,
+            "invalid_image_count",
+            `n must be an integer from 1 to ${IMAGE_EDIT_MAX_OUTPUT_IMAGES}`
+          );
+        }
+        n = Number(rawN);
+        if (!Number.isSafeInteger(n) || n > IMAGE_EDIT_MAX_OUTPUT_IMAGES) {
+          throw new ImageEditRequestError(
+            400,
+            "invalid_image_count",
+            `n must be an integer from 1 to ${IMAGE_EDIT_MAX_OUTPUT_IMAGES}`
+          );
+        }
+      }
+
+      return {
+        model,
+        prompt,
+        n,
+        image: {
+          bytes: Buffer.from(imagePart.bytes),
+          contentType: imagePart.contentType,
+          filename: imagePart.filename,
+        },
+      };
+    } finally {
+      for (const part of parts) part.bytes.fill(0);
+    }
+  } finally {
+    body.fill(0);
+  }
+}
+
+function multipartBoundary(contentType: string | undefined): string {
+  if (!contentType) {
+    throw new ImageEditRequestError(
+      415,
+      "unsupported_content_type",
+      "Content-Type must be multipart/form-data with a boundary"
+    );
+  }
+  const segments = splitHeaderParameters(contentType);
+  if (segments.shift()?.trim().toLowerCase() !== "multipart/form-data") {
+    throw new ImageEditRequestError(
+      415,
+      "unsupported_content_type",
+      "Content-Type must be multipart/form-data; JSON and raw image bodies are not supported"
+    );
+  }
+  let boundary: string | undefined;
+  for (const segment of segments) {
+    const [key, value] = headerParameter(segment);
+    if (key !== "boundary" || boundary !== undefined) {
+      throw new ImageEditRequestError(
+        400,
+        "invalid_multipart_boundary",
+        "multipart Content-Type must contain exactly one boundary parameter"
+      );
+    }
+    boundary = value;
+  }
+  if (
+    !boundary ||
+    boundary.length > 70 ||
+    boundary.endsWith(" ") ||
+    !BOUNDARY_VALUE.test(boundary)
+  ) {
+    throw new ImageEditRequestError(
+      400,
+      "invalid_multipart_boundary",
+      "multipart boundary is missing or invalid"
+    );
+  }
+  return boundary;
+}
+
+function splitHeaderParameters(value: string): string[] {
+  const parts: string[] = [];
+  let start = 0;
+  let quoted = false;
+  let escaped = false;
+  for (let i = 0; i < value.length; i++) {
+    const char = value[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (quoted && char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (char === '"') {
+      quoted = !quoted;
+      continue;
+    }
+    if (!quoted && char === ";") {
+      parts.push(value.slice(start, i));
+      start = i + 1;
+    }
+  }
+  if (quoted || escaped) {
+    throw new ImageEditRequestError(400, "invalid_multipart_header", "unterminated quoted header parameter");
+  }
+  parts.push(value.slice(start));
+  return parts;
+}
+
+function headerParameter(segment: string): [string, string] {
+  const equals = segment.indexOf("=");
+  if (equals <= 0) {
+    throw new ImageEditRequestError(400, "invalid_multipart_header", "malformed multipart header parameter");
+  }
+  const key = segment.slice(0, equals).trim().toLowerCase();
+  if (!HEADER_TOKEN.test(key)) {
+    throw new ImageEditRequestError(400, "invalid_multipart_header", "invalid multipart header parameter name");
+  }
+  const raw = segment.slice(equals + 1).trim();
+  let value: string;
+  if (raw.startsWith('"')) {
+    if (raw.length < 2 || !raw.endsWith('"')) {
+      throw new ImageEditRequestError(400, "invalid_multipart_header", "malformed quoted multipart parameter");
+    }
+    value = raw.slice(1, -1).replace(/\\(.)/g, "$1");
+  } else {
+    if (!raw || !HEADER_TOKEN.test(raw)) {
+      throw new ImageEditRequestError(400, "invalid_multipart_header", "invalid multipart header parameter value");
+    }
+    value = raw;
+  }
+  if (/[\x00\r\n]/.test(value)) {
+    throw new ImageEditRequestError(400, "invalid_multipart_header", "multipart header parameter contains control bytes");
+  }
+  return [key, value];
+}
+
+function parseMultipartBody(body: Buffer, boundary: string): ParsedMultipartPart[] {
+  const marker = Buffer.from(`--${boundary}`, "ascii");
+  const delimiter = Buffer.from(`\r\n--${boundary}`, "ascii");
+  if (body.length < marker.length + 2 || !body.subarray(0, marker.length).equals(marker)) {
+    throw new ImageEditRequestError(400, "malformed_multipart", "multipart body does not start with its boundary");
+  }
+  let cursor = marker.length;
+  if (!body.subarray(cursor, cursor + 2).equals(Buffer.from("\r\n"))) {
+    throw new ImageEditRequestError(400, "malformed_multipart", "multipart body has no first part");
+  }
+  cursor += 2;
+  const parts: ParsedMultipartPart[] = [];
+  const names = new Set<string>();
+
+  try {
+    for (;;) {
+      const headerEnd = body.indexOf("\r\n\r\n", cursor, "ascii");
+      if (headerEnd < 0 || headerEnd - cursor > MULTIPART_HEADER_BYTES) {
+        throw new ImageEditRequestError(400, "malformed_multipart", "multipart part headers are missing or too large");
+      }
+      const headers = parseMultipartPartHeaders(body.subarray(cursor, headerEnd));
+      const next = body.indexOf(delimiter, headerEnd + 4);
+      if (next < 0) {
+        throw new ImageEditRequestError(400, "malformed_multipart", "multipart part has no terminating boundary");
+      }
+      const disposition = parseContentDisposition(headers.get("content-disposition"));
+      if (!new Set(["image", "model", "prompt", "n"]).has(disposition.name)) {
+        throw new ImageEditRequestError(
+          400,
+          "unknown_multipart_field",
+          `unsupported multipart field ${disposition.name}`
+        );
+      }
+      if (names.has(disposition.name)) {
+        throw new ImageEditRequestError(
+          400,
+          "duplicate_multipart_field",
+          `multipart field ${disposition.name} must appear exactly once`
+        );
+      }
+      names.add(disposition.name);
+      parts.push({
+        name: disposition.name,
+        ...(disposition.filename !== undefined ? { filename: disposition.filename } : {}),
+        contentType: headers.get("content-type")?.trim().toLowerCase() ?? "",
+        bytes: Buffer.from(body.subarray(headerEnd + 4, next)),
+      });
+      if (parts.length > 4) {
+        throw new ImageEditRequestError(400, "too_many_multipart_fields", "multipart body has too many fields");
+      }
+
+      cursor = next + delimiter.length;
+      const suffix = body.subarray(cursor, cursor + 2).toString("ascii");
+      if (suffix === "--") {
+        cursor += 2;
+        if (body.subarray(cursor, cursor + 2).toString("ascii") === "\r\n") cursor += 2;
+        if (cursor !== body.length) {
+          throw new ImageEditRequestError(400, "malformed_multipart", "multipart body has an unexpected epilogue");
+        }
+        break;
+      }
+      if (suffix !== "\r\n") {
+        throw new ImageEditRequestError(400, "malformed_multipart", "multipart boundary suffix is malformed");
+      }
+      cursor += 2;
+    }
+    return parts;
+  } catch (err) {
+    for (const part of parts) part.bytes.fill(0);
+    throw err;
+  }
+}
+
+function parseMultipartPartHeaders(raw: Buffer): Map<string, string> {
+  const text = raw.toString("latin1");
+  const headers = new Map<string, string>();
+  for (const line of text.split("\r\n")) {
+    if (!line || /^[ \t]/.test(line)) {
+      throw new ImageEditRequestError(400, "invalid_multipart_header", "folded or empty multipart header");
+    }
+    const colon = line.indexOf(":");
+    const name = line.slice(0, colon).trim().toLowerCase();
+    const value = line.slice(colon + 1).trim();
+    if (colon <= 0 || !HEADER_TOKEN.test(name) || /[\x00\r\n]/.test(value)) {
+      throw new ImageEditRequestError(400, "invalid_multipart_header", "malformed multipart part header");
+    }
+    if (name !== "content-disposition" && name !== "content-type") {
+      throw new ImageEditRequestError(400, "invalid_multipart_header", `unsupported multipart header ${name}`);
+    }
+    if (headers.has(name)) {
+      throw new ImageEditRequestError(400, "invalid_multipart_header", `duplicate multipart header ${name}`);
+    }
+    headers.set(name, value);
+  }
+  return headers;
+}
+
+function parseContentDisposition(value: string | undefined): { name: string; filename?: string } {
+  if (!value) {
+    throw new ImageEditRequestError(400, "invalid_multipart_header", "multipart part lacks Content-Disposition");
+  }
+  const segments = splitHeaderParameters(value);
+  if (segments.shift()?.trim().toLowerCase() !== "form-data") {
+    throw new ImageEditRequestError(400, "invalid_multipart_header", "multipart disposition must be form-data");
+  }
+  const params = new Map<string, string>();
+  for (const segment of segments) {
+    const [key, paramValue] = headerParameter(segment);
+    if ((key !== "name" && key !== "filename") || params.has(key)) {
+      throw new ImageEditRequestError(400, "invalid_multipart_header", "multipart disposition parameters are invalid");
+    }
+    params.set(key, paramValue);
+  }
+  const name = params.get("name");
+  if (!name) {
+    throw new ImageEditRequestError(400, "invalid_multipart_header", "multipart disposition requires name");
+  }
+  return { name, ...(params.has("filename") ? { filename: params.get("filename")! } : {}) };
+}
+
+function decodeMultipartText(part: ParsedMultipartPart, maxBytes: number, name: string): string {
+  if (part.bytes.length > maxBytes) {
+    throw new ImageEditRequestError(413, `${name}_too_large`, `${name} exceeds ${maxBytes} UTF-8 bytes`);
+  }
+  const contentType = part.contentType.split(";", 1)[0].trim();
+  if (contentType && contentType !== "text/plain") {
+    throw new ImageEditRequestError(400, "invalid_multipart_field", `${name} must be a text/plain field`);
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(part.bytes);
+  } catch {
+    throw new ImageEditRequestError(400, "invalid_multipart_field", `${name} is not valid UTF-8`);
+  }
+}
+
+function stripUploadedEditImage(
+  bytes: Buffer,
+  declaredContentType: string
+): { bytes: Buffer; mime: "image/jpeg" | "image/png" | "image/webp" } {
+  const format = detectImageFormat(bytes);
+  let stripped: Buffer;
+  try {
+    stripped = stripImageMetadata(bytes, format);
+  } catch (err) {
+    if (err instanceof UnsupportedImageFormatError || err instanceof MalformedImageError) {
+      throw new ImageEditRequestError(400, "image_strip_failed", err.message);
+    }
+    throw err;
+  }
+  const mimeByFormat: Partial<Record<ImageFormat, "image/jpeg" | "image/png" | "image/webp">> = {
+    jpeg: "image/jpeg",
+    png: "image/png",
+    webp: "image/webp",
+  };
+  const mime = mimeByFormat[format];
+  if (!mime) {
+    stripped.fill(0);
+    throw new ImageEditRequestError(400, "image_strip_failed", "uploaded image format is unsupported");
+  }
+  const claimed = declaredContentType.split(";", 1)[0].trim().toLowerCase();
+  const normalizedClaimed = claimed === "image/jpg" ? "image/jpeg" : claimed;
+  if (normalizedClaimed.startsWith("image/") && normalizedClaimed !== mime) {
+    stripped.fill(0);
+    throw new ImageEditRequestError(
+      400,
+      "image_mime_mismatch",
+      `multipart image Content-Type ${claimed} does not match detected ${mime}`
+    );
+  }
+  return { bytes: stripped, mime };
+}
+
+function readBoundedRequestBody(
+  req: http.IncomingMessage,
+  maxBytes: number,
+  signal: AbortSignal
+): Promise<Buffer> {
+  const declared = req.headers["content-length"];
+  if (typeof declared === "string" && /^\d+$/.test(declared) && BigInt(declared) > BigInt(maxBytes)) {
+    discardRequestBody(req);
+    return Promise.reject(
+      new ImageEditRequestError(413, "request_too_large", `multipart body exceeds ${maxBytes} bytes`)
+    );
+  }
+  return new Promise<Buffer>((resolve, reject) => {
+    let chunks: Buffer[] = [];
+    let size = 0;
+    let settled = false;
+    const cleanup = (): void => {
+      req.off("data", onData);
+      req.off("end", onEnd);
+      req.off("error", onError);
+      req.off("aborted", onAborted);
+      req.off("close", onClose);
+      signal.removeEventListener("abort", onSignalAbort);
+    };
+    const fail = (err: Error): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      for (const chunk of chunks) chunk.fill(0);
+      chunks = [];
+      reject(err);
+    };
+    const onData = (chunk: Buffer | string): void => {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      size += bytes.length;
+      if (size > maxBytes) {
+        bytes.fill(0);
+        fail(new ImageEditRequestError(413, "request_too_large", `multipart body exceeds ${maxBytes} bytes`));
+        discardRequestBody(req);
+        return;
+      }
+      chunks.push(bytes);
+    };
+    const onEnd = (): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      const body = Buffer.concat(chunks, size);
+      for (const chunk of chunks) chunk.fill(0);
+      chunks = [];
+      resolve(body);
+    };
+    const onError = (): void => fail(new ImageEditClientDisconnectError());
+    const onAborted = (): void => fail(new ImageEditClientDisconnectError());
+    const onClose = (): void => {
+      if (!req.complete) fail(new ImageEditClientDisconnectError());
+    };
+    const onSignalAbort = (): void => fail(new ImageEditClientDisconnectError());
+    req.on("data", onData);
+    req.once("end", onEnd);
+    req.once("error", onError);
+    req.once("aborted", onAborted);
+    req.once("close", onClose);
+    signal.addEventListener("abort", onSignalAbort, { once: true });
+    if (signal.aborted) onSignalAbort();
+  });
+}
+
+function discardRequestBody(req: http.IncomingMessage): void {
+  const cleanup = (): void => {
+    req.off("error", cleanup);
+    req.off("end", cleanup);
+    req.off("close", cleanup);
+  };
+  req.once("error", cleanup);
+  req.once("end", cleanup);
+  req.once("close", cleanup);
+  req.resume();
 }
 
 function readBody(req: http.IncomingMessage): Promise<string> {

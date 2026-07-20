@@ -778,6 +778,7 @@ test("reserveImageBudget admits and reserves when the ceiling fits; releaseImage
   const ceiling = 20_000n;
   const admission = reserveImageBudget(budget, ceiling, "http://127.0.0.1:8799/v1/budget");
   assert.equal(admission.admitted, true);
+  if (admission.admitted) assert.equal(admission.reserved, true);
   assert.equal(budget.reservedBase, 20_000n);
   releaseImageBudget(budget, ceiling);
   assert.equal(budget.reservedBase, 0n);
@@ -789,6 +790,7 @@ test("reserveImageBudget is a no-op admit when the session budget is uncapped (b
   const budget = { spentBase: 0n, reservedBase: 0n, budgetBase: 0n };
   const admission = reserveImageBudget(budget, 1_000_000_000n, "http://127.0.0.1:8799/v1/budget");
   assert.equal(admission.admitted, true);
+  if (admission.admitted) assert.equal(admission.reserved, false);
   assert.equal(budget.reservedBase, 0n, "uncapped budget never reserves");
 });
 

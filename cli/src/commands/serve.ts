@@ -12,11 +12,18 @@ import {
   providerForModel,
   allConfiguredModels,
   imagePriceForModel,
+  isPositiveImagePriceRepresentable,
   providerServesConfiguredImageModel,
+  providerServesConfiguredImageEditModel,
 } from "../config";
 import { loadWallet } from "../wallet";
 import { Facilitator } from "../facilitator";
-import { imageEndpointPathFor, wireFormatFor, isTeeProviderSlug } from "../providers";
+import {
+  imageEditAdapterFor,
+  imageEndpointPathFor,
+  wireFormatFor,
+  isTeeProviderSlug,
+} from "../providers";
 import {
   anthropicHeaders,
   anthropicResponseToChatCompletion,
@@ -50,9 +57,13 @@ import {
   shouldRetryRehydration,
 } from "../vaultReceiptRehydration";
 import { releaseAbortedVaultServe, withAbortedStreamCleanup } from "../vaultStreamAbort";
+import { RelayDeliveryResult, RelayDeliveryTracker } from "../relayDelivery";
 import { OperatorRedeemer } from "../vaultRedeemer";
 import {
   formatUsdcBase,
+  ImageEditPlaintextError,
+  ImageEditPlaintextV1,
+  parseImageEditPlaintext,
   priceImages,
   requestCompletionCeilingTokens,
 } from "@halo/vault-core";
@@ -80,6 +91,7 @@ import {
 } from "../provider-breaker";
 import {
   decryptRequest,
+  decryptBytes,
   encryptBytes,
   encryptResponse,
   generateOperatorKeypair,
@@ -132,6 +144,11 @@ interface StreamAbortMessage {
   reason?: string;
 }
 
+interface StreamCompleteMessage {
+  type: "stream-complete";
+  requestId: string;
+}
+
 // Timeout for the upstream provider fetch. Must be shorter than the relay's
 // INFERENCE_TIMEOUT_MS (120s) so the operator can send a proper error response
 // instead of letting the relay time out and return 504.
@@ -141,6 +158,8 @@ const MODEL_WARM_INTERVAL_MS = 4 * 60_000;
 const VAULT_CAPABILITY_RETRY_MS = 60_000;
 const MAX_MEDIA_STREAM_BYTES = 16 * 1024 * 1024;
 const MAX_IMAGE_UPSTREAM_BODY_BYTES = MAX_MEDIA_STREAM_BYTES;
+const MAX_TEE_SIGNATURE_BODY_BYTES = 256 * 1024;
+export const IMAGE_EDIT_PATH = "/v1/images/edit";
 
 interface UpstreamUsage {
   total_tokens: number;
@@ -166,6 +185,37 @@ export function requestAcceptsMedia(
 ): boolean {
   const header = (headers["x-halo-accept-media"] || "").trim().toLowerCase();
   return body.acceptMedia === true || header === "1" || header === "true";
+}
+
+export type ImageServeKind = "text" | "generation" | "edit" | "unsupported-edit";
+
+/** Route identity, never arbitrary multimodal content, selects the edit adapter. */
+export function resolveImageServeKind(
+  cfg: HaloConfig,
+  requestPath: string,
+  model: string
+): ImageServeKind {
+  const imagePrice = imagePriceForModel(cfg, model);
+  if (requestPath !== IMAGE_EDIT_PATH) return imagePrice === null ? "text" : "generation";
+
+  const provider = providerForModel(configProviders(cfg), model);
+  return providerServesConfiguredImageEditModel(provider, model) &&
+    imageEditAdapterFor(provider.slug) !== null &&
+    isPositiveImagePriceRepresentable(imagePrice)
+    ? "edit"
+    : "unsupported-edit";
+}
+
+/** Consumer proof headers can request a TEE proof only from an actual TEE provider. */
+export function shouldFetchTeeProof(
+  providerSlug: string,
+  headers: Record<string, string | undefined>
+): boolean {
+  if (!isTeeProviderSlug(providerSlug)) return false;
+  return (
+    typeof headers["x-client-pub-key"] === "string" ||
+    typeof headers["x-encryption-version"] === "string"
+  );
 }
 
 export function forwardVaultCompletionLimit(
@@ -303,6 +353,115 @@ function imageMimeForFormat(format: ImageFormat): string {
   }
 }
 
+function imageFormatForMime(mime: ImageEditPlaintextV1["image"]["mime"]): ImageFormat {
+  switch (mime) {
+    case "image/jpeg":
+      return "jpeg";
+    case "image/png":
+      return "png";
+    case "image/webp":
+      return "webp";
+  }
+}
+
+export class ImageEditRequestError extends Error {
+  readonly type: string;
+
+  constructor(type: string, message: string) {
+    super(message);
+    this.name = "ImageEditRequestError";
+    this.type = type;
+  }
+}
+
+export interface PreparedImageEditRequest extends ImageEditPlaintextV1 {}
+
+/** Authenticate/decrypt the v2 edit body, validate its shared schema, and strip input metadata. */
+export function openImageEditRequest(
+  outerBody: InferenceRequestMessage["body"],
+  operatorPrivateKey: Uint8Array
+): {
+  edit: PreparedImageEditRequest;
+  consumerPublicKey: Uint8Array;
+  model: string;
+} {
+  const keys = Object.keys(outerBody).sort();
+  const expectedKeys = ["_enc", "acceptMedia", "model"];
+  if (
+    keys.length !== expectedKeys.length ||
+    keys.some((key, index) => key !== expectedKeys[index]) ||
+    typeof outerBody.model !== "string" ||
+    outerBody.model.trim().length === 0 ||
+    outerBody.acceptMedia !== true
+  ) {
+    throw new ImageEditRequestError(
+      "invalid_image_edit_wrapper",
+      "image edit wrapper must contain exactly model, acceptMedia: true, and a v2 _enc envelope"
+    );
+  }
+  const envelope = outerBody._enc;
+  if (!isEncryptedEnvelope(envelope) || envelope.v !== 2) {
+    throw new ImageEditRequestError(
+      "image_edit_encryption_required",
+      "image edits require a v2 encrypted bytes envelope"
+    );
+  }
+
+  let plaintext: Buffer;
+  let consumerPublicKey: Uint8Array;
+  try {
+    const opened = decryptBytes(envelope, operatorPrivateKey);
+    plaintext = opened.plaintext;
+    consumerPublicKey = opened.senderPublicKey;
+  } catch {
+    throw new ImageEditRequestError(
+      "image_edit_decryption_failed",
+      "encrypted image edit payload decryption failed"
+    );
+  }
+
+  let parsed: ImageEditPlaintextV1;
+  try {
+    parsed = parseImageEditPlaintext(plaintext);
+  } catch (err) {
+    if (err instanceof ImageEditPlaintextError) {
+      throw new ImageEditRequestError(err.code, err.message);
+    }
+    throw new ImageEditRequestError("invalid_image_edit_plaintext", "invalid image edit plaintext");
+  }
+
+  const source = Buffer.from(parsed.image.b64_json, "base64");
+  const expectedFormat = imageFormatForMime(parsed.image.mime);
+  if (detectImageFormat(source) !== expectedFormat) {
+    throw new ImageEditRequestError(
+      "image_mime_mismatch",
+      "image edit mime does not match the source image bytes"
+    );
+  }
+  let stripped: Buffer;
+  try {
+    stripped = stripImageMetadata(source, expectedFormat);
+  } catch (err) {
+    if (err instanceof UnsupportedImageFormatError) {
+      throw new ImageEditRequestError("unsupported_input_image_format", err.message);
+    }
+    if (err instanceof MalformedImageError) {
+      throw new ImageEditRequestError("malformed_input_image", err.message);
+    }
+    throw err;
+  }
+
+  return {
+    edit: {
+      prompt: parsed.prompt,
+      n: parsed.n,
+      image: { mime: parsed.image.mime, b64_json: stripped.toString("base64") },
+    },
+    consumerPublicKey,
+    model: outerBody.model,
+  };
+}
+
 function decodeInlineImageBase64(value: string): Buffer {
   const dataUrl = /^data:[^;,]+;base64,(.*)$/i.exec(value);
   const raw = dataUrl ? dataUrl[1] : value;
@@ -321,24 +480,20 @@ function inlineImageBase64FromEntry(value: unknown): string | null {
   if (typeof entry.b64_json === "string" && entry.b64_json.length > 0) {
     return entry.b64_json;
   }
-  if (entryHasUrlOnlyImage(entry)) {
+  const candidates: unknown[] = [entry.url, entry.image_url];
+  if (entry.image_url && typeof entry.image_url === "object") {
+    candidates.push((entry.image_url as { url?: unknown }).url);
+  }
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string" || candidate.length === 0) continue;
+    const inline = /^data:image\/[a-z0-9.+-]+;base64,(.*)$/i.exec(candidate);
+    if (inline) return inline[1];
     throw new UndeliverableImageResponseError(
       "url_only_image_response",
       "upstream returned a URL-only image response; refusing operator-side fetch"
     );
   }
   return null;
-}
-
-function entryHasUrlOnlyImage(entry: Record<string, unknown>): boolean {
-  if (typeof entry.url === "string" && entry.url.length > 0) return true;
-  const imageUrl = entry.image_url;
-  if (typeof imageUrl === "string" && imageUrl.length > 0) return true;
-  if (imageUrl && typeof imageUrl === "object") {
-    const url = (imageUrl as { url?: unknown }).url;
-    return typeof url === "string" && url.length > 0;
-  }
-  return false;
 }
 
 function inlineImageBytesFromEntry(value: unknown): Buffer | null {
@@ -479,6 +634,291 @@ export function prepareImageDeliveryFrames(params: {
   return prepared;
 }
 
+export type VaultImageDeliveryResult =
+  | { ok: true; frames: number }
+  | { ok: false; status: number; type: string; message: string };
+
+/** Prepare and send all media frames, releasing admitted credit on every incomplete delivery. */
+export async function deliverVaultImageFrames(params: {
+  requestId: string;
+  responseData: unknown;
+  imageSettlement: { servedImageCount: number };
+  consumerPublicKey: Uint8Array | undefined;
+  operatorKeys: OperatorKeyPair;
+  isAborted: () => boolean;
+  sendFrame: (frame: MediaChunkFrame) => Promise<void>;
+  release: () => void;
+}): Promise<VaultImageDeliveryResult> {
+  let released = false;
+  const releaseOnce = (): void => {
+    if (released) return;
+    released = true;
+    params.release();
+  };
+  let frames: MediaChunkFrame[];
+  try {
+    frames = prepareImageDeliveryFrames({
+      requestId: params.requestId,
+      responseData: params.responseData,
+      imageSettlement: params.imageSettlement,
+      consumerPublicKey: params.consumerPublicKey,
+      operatorKeys: params.operatorKeys,
+    }).frames;
+  } catch (err) {
+    releaseOnce();
+    const type =
+      err instanceof UndeliverableImageResponseError
+        ? err.type
+        : err instanceof UnsupportedImageFormatError
+          ? "unsupported_image_format"
+          : err instanceof MalformedImageError
+            ? "malformed_image"
+            : "image_delivery_failed";
+    return {
+      ok: false,
+      status: type === "image_encryption_required" ? 400 : 502,
+      type,
+      message: err instanceof Error ? err.message : String(err),
+    };
+  }
+
+  for (const frame of frames) {
+    if (params.isAborted()) {
+      releaseOnce();
+      return {
+        ok: false,
+        status: 499,
+        type: "image_media_delivery_aborted",
+        message: "image media delivery was aborted before settlement",
+      };
+    }
+    try {
+      await params.sendFrame(frame);
+    } catch {
+      releaseOnce();
+      return {
+        ok: false,
+        status: 502,
+        type: "image_media_delivery_failed",
+        message: "image media delivery failed before settlement",
+      };
+    }
+  }
+  if (params.isAborted()) {
+    releaseOnce();
+    return {
+      ok: false,
+      status: 499,
+      type: "image_media_delivery_aborted",
+      message: "image media delivery was aborted before settlement",
+    };
+  }
+  return { ok: true, frames: frames.length };
+}
+
+export interface VaultImageTerminalResponse {
+  type: "inference-response";
+  requestId: string;
+  status: number;
+  headers: Record<string, string>;
+  body: unknown;
+}
+
+export type VaultImageServeCompletion =
+  | {
+      ok: true;
+      terminal: VaultImageTerminalResponse;
+      settlement: ReturnType<typeof priceServedImagesForVault>;
+      servedCumulative: bigint | null;
+    }
+  | {
+      ok: false;
+      status: number;
+      type: string;
+      message: string;
+      terminalSent: boolean;
+    };
+
+/** Own the post-admission image decision path through confirmed terminal delivery. */
+export async function completeVaultImageServe(params: {
+  requestId: string;
+  upstream: {
+    status: number;
+    data: unknown;
+    respHeaders?: Record<string, string>;
+  };
+  imagePrice: number;
+  ceiling: bigint;
+  consumer: string;
+  operator: string;
+  cycle: bigint;
+  creditLedger: VaultCreditLedger;
+  consumerPublicKey: Uint8Array | undefined;
+  operatorKeys: OperatorKeyPair;
+  encryptFailure: (data: unknown) => unknown;
+  sendFrame: (frame: MediaChunkFrame) => Promise<void>;
+  sendTerminal: (terminal: VaultImageTerminalResponse) => Promise<void>;
+  confirmTerminal: (
+    terminal: VaultImageTerminalResponse
+  ) => Promise<RelayDeliveryResult>;
+  isAborted: () => boolean;
+  noteServed?: (consumer: string, operator: string, amount: bigint) => void;
+  postServedEvent?: (
+    settlement: ReturnType<typeof priceServedImagesForVault>,
+    servedCumulative: bigint | null
+  ) => void;
+}): Promise<VaultImageServeCompletion> {
+  let released = false;
+  const releaseOnce = (): void => {
+    if (released) return;
+    released = true;
+    params.creditLedger.releaseInflight(
+      params.consumer,
+      params.operator,
+      params.cycle,
+      params.ceiling
+    );
+  };
+  const sendFailure = async (
+    terminal: VaultImageTerminalResponse,
+    type: string,
+    message: string
+  ): Promise<VaultImageServeCompletion> => {
+    let terminalSent = false;
+    try {
+      await params.sendTerminal(terminal);
+      terminalSent = true;
+    } catch {
+      // Credit is already released; a failed error response cannot create served evidence.
+    }
+    return { ok: false, status: terminal.status, type, message, terminalSent };
+  };
+
+  if (!(params.upstream.status >= 200 && params.upstream.status < 300)) {
+    releaseOnce();
+    const type =
+      (params.upstream.data as { error?: { type?: unknown } })?.error?.type;
+    return sendFailure(
+      {
+        type: "inference-response",
+        requestId: params.requestId,
+        status: params.upstream.status,
+        headers: { ...(params.upstream.respHeaders ?? {}) },
+        body: params.encryptFailure(params.upstream.data),
+      },
+      typeof type === "string" ? type : "image_upstream_failed",
+      "upstream image request failed before delivery"
+    );
+  }
+
+  const settlement = priceServedImagesForVault(
+    params.imagePrice,
+    params.upstream.data,
+    params.ceiling
+  );
+  if (settlement.servedImageCount === 0) {
+    releaseOnce();
+    return sendFailure(
+      {
+        type: "inference-response",
+        requestId: params.requestId,
+        status: 502,
+        headers: { ...(params.upstream.respHeaders ?? {}) },
+        body: buildNoImageTerminalBody(),
+      },
+      "no_image",
+      "upstream image response contained no deliverable inline images"
+    );
+  }
+
+  const delivery = await deliverVaultImageFrames({
+    requestId: params.requestId,
+    responseData: params.upstream.data,
+    imageSettlement: settlement,
+    consumerPublicKey: params.consumerPublicKey,
+    operatorKeys: params.operatorKeys,
+    isAborted: params.isAborted,
+    sendFrame: params.sendFrame,
+    release: releaseOnce,
+  });
+  if (!delivery.ok) {
+    return sendFailure(
+      {
+        type: "inference-response",
+        requestId: params.requestId,
+        status: delivery.status,
+        headers: {},
+        body: { error: { message: delivery.message, type: delivery.type } },
+      },
+      delivery.type,
+      delivery.message
+    );
+  }
+
+  if (params.isAborted()) {
+    releaseOnce();
+    return {
+      ok: false,
+      status: 499,
+      type: "image_media_delivery_aborted",
+      message: "relay aborted image delivery before terminal confirmation",
+      terminalSent: false,
+    };
+  }
+
+  const terminal: VaultImageTerminalResponse = {
+    type: "inference-response",
+    requestId: params.requestId,
+    status: params.upstream.status,
+    headers: {
+      ...(params.upstream.respHeaders ?? {}),
+      "PAYMENT-RESPONSE": Buffer.from(
+        JSON.stringify({
+          success: true,
+          mode: "vault",
+          amountUsdc: settlement.actualAmount.toString(),
+          tokens: settlement.tokens,
+          operator: params.operator,
+        }),
+        "utf-8"
+      ).toString("base64"),
+    },
+    body: buildImageTerminalBody(settlement),
+  };
+  const confirmation = await params.confirmTerminal(terminal);
+  if (!confirmation.ok || params.isAborted()) {
+    releaseOnce();
+    return {
+      ok: false,
+      status: 499,
+      type: "image_terminal_delivery_unconfirmed",
+      message: confirmation.ok
+        ? "relay aborted image delivery after terminal send"
+        : `relay did not confirm terminal image delivery (${confirmation.reason})`,
+      terminalSent: confirmation.ok || confirmation.reason !== "terminal-send-failed",
+    };
+  }
+
+  const servedCumulative = params.creditLedger.settleServed(
+    params.consumer,
+    params.operator,
+    params.cycle,
+    params.ceiling,
+    settlement.actualAmount
+  );
+  try {
+    (params.noteServed ?? noteServed)(
+      params.consumer,
+      params.operator,
+      settlement.actualAmount
+    );
+  } catch {}
+  try {
+    params.postServedEvent?.(settlement, servedCumulative);
+  } catch {}
+  return { ok: true, terminal, settlement, servedCumulative };
+}
+
 type SignedVoucher = {
   voucher: { budgetId: string; operator: string; cumulative: string; expiry: number };
   signature: string;
@@ -532,27 +972,58 @@ function passthroughResponseHeaders(res: { headers: Headers }): Record<string, s
   return out;
 }
 
+interface TeeSignatureOptions {
+  timeoutMs?: number;
+  maxBodyBytes?: number;
+}
+
 /** Fetch the keyed response proof for client-side signer verification; return base64 or `null`. */
-async function fetchTeeSignature(
+export async function fetchTeeSignature(
   baseUrl: string,
   apiKey: string | undefined,
   chatId: string,
-  model: string
+  model: string,
+  options: TeeSignatureOptions = {}
 ): Promise<string | null> {
   if (!apiKey || !chatId) return null;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), options.timeoutMs ?? 10_000);
   try {
     const url =
       `${baseUrl.replace(/\/+$/, "")}/signature/${encodeURIComponent(chatId)}` +
       `?model=${encodeURIComponent(model)}&signing_algo=ecdsa`;
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 10_000);
     const res = await fetch(url, { headers: { Authorization: `Bearer ${apiKey}` }, signal: ctrl.signal });
-    clearTimeout(timer);
     if (!res.ok) return null;
-    return Buffer.from(await res.text(), "utf-8").toString("base64");
+    const text = await readImageUpstreamBody(
+      res,
+      ctrl.signal,
+      options.maxBodyBytes ?? MAX_TEE_SIGNATURE_BODY_BYTES
+    );
+    return Buffer.from(text, "utf-8").toString("base64");
   } catch {
     return null;
+  } finally {
+    clearTimeout(timer);
   }
+}
+
+export async function fetchTeeSignatureForRequest(params: {
+  providerSlug: string;
+  baseUrl: string;
+  apiKey: string | undefined;
+  chatId: string;
+  model: string;
+  headers: Record<string, string | undefined>;
+  options?: TeeSignatureOptions;
+}): Promise<string | null> {
+  if (!shouldFetchTeeProof(params.providerSlug, params.headers)) return null;
+  return fetchTeeSignature(
+    params.baseUrl,
+    params.apiKey,
+    params.chatId,
+    params.model,
+    params.options
+  );
 }
 
 /** Resolve which provider serves a request body's model, plus its plaintext key.
@@ -902,6 +1373,238 @@ export async function callUpstreamImage(
         `  upstream(image) ${res.status} (set HALO_DEBUG_UPSTREAM_ERRORS=1 to print body to this terminal)`
       );
     }
+    return {
+      status: res.status,
+      data: sanitizeUpstreamError(parsed, res.status),
+      usage: zeroUsage,
+      respHeaders: {},
+    };
+  }
+
+  return {
+    status: res.status,
+    data: parsed,
+    usage: zeroUsage,
+    respHeaders: passthroughResponseHeaders(res),
+  };
+}
+
+export function buildOpenRouterImageEditBody(
+  model: string,
+  edit: PreparedImageEditRequest
+): Record<string, unknown> {
+  const expectedFormat = imageFormatForMime(edit.image.mime);
+  const source = Buffer.from(edit.image.b64_json, "base64");
+  if (detectImageFormat(source) !== expectedFormat) {
+    throw new ImageEditRequestError(
+      "image_mime_mismatch",
+      "image edit mime does not match the source image bytes"
+    );
+  }
+  let stripped: Buffer;
+  try {
+    stripped = stripImageMetadata(source, expectedFormat);
+  } catch (err) {
+    if (err instanceof UnsupportedImageFormatError) {
+      throw new ImageEditRequestError("unsupported_input_image_format", err.message);
+    }
+    if (err instanceof MalformedImageError) {
+      throw new ImageEditRequestError("malformed_input_image", err.message);
+    }
+    throw err;
+  }
+
+  return {
+    model,
+    prompt: edit.prompt,
+    n: edit.n,
+    input_references: [
+      {
+        type: "image_url",
+        image_url: {
+          url: `data:${edit.image.mime};base64,${stripped.toString("base64")}`,
+        },
+      },
+    ],
+  };
+}
+
+interface ImageEditUpstreamOptions {
+  timeoutMs?: number;
+}
+
+type ImageEditStreamReadResult = Awaited<
+  ReturnType<ReadableStreamDefaultReader<Uint8Array>["read"]>
+>;
+
+function upstreamAbortError(): Error {
+  const error = new Error("upstream image edit response timed out");
+  error.name = "AbortError";
+  return error;
+}
+
+function readStreamChunk(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  signal: AbortSignal
+): Promise<ImageEditStreamReadResult> {
+  if (signal.aborted) return Promise.reject(upstreamAbortError());
+  return new Promise<ImageEditStreamReadResult>((resolve, reject) => {
+    const onAbort = () => {
+      cleanup();
+      reject(upstreamAbortError());
+    };
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    signal.addEventListener("abort", onAbort, { once: true });
+    reader.read().then(
+      (result) => {
+        cleanup();
+        resolve(result);
+      },
+      (error) => {
+        cleanup();
+        reject(error);
+      }
+    );
+  });
+}
+
+async function readImageUpstreamBody(
+  response: Awaited<ReturnType<typeof fetch>>,
+  signal: AbortSignal,
+  maxBodyBytes: number
+): Promise<string> {
+  const contentLength = response.headers.get("content-length")?.trim();
+  if (
+    contentLength &&
+    /^\d+$/.test(contentLength) &&
+    BigInt(contentLength) > BigInt(maxBodyBytes)
+  ) {
+    void response.body?.cancel().catch(() => undefined);
+    throw new UndeliverableImageResponseError(
+      "image_upstream_body_too_large",
+      `upstream image response exceeds ${maxBodyBytes} bytes`
+    );
+  }
+  if (!response.body) return "";
+
+  const reader = response.body.getReader();
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+  try {
+    for (;;) {
+      const { value, done } = await readStreamChunk(reader, signal);
+      if (done) break;
+      const nextTotal = totalBytes + value.byteLength;
+      if (nextTotal > maxBodyBytes) {
+        throw new UndeliverableImageResponseError(
+          "image_upstream_body_too_large",
+          `upstream image response exceeds ${maxBodyBytes} bytes`
+        );
+      }
+      chunks.push(Buffer.from(value));
+      totalBytes = nextTotal;
+    }
+  } catch (error) {
+    void reader.cancel().catch(() => undefined);
+    throw error;
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      // A pending read retains the lock until cancellation completes.
+    }
+  }
+  return Buffer.concat(chunks, totalBytes).toString("utf8");
+}
+
+/** Call the one tested inline image-edit adapter: OpenRouter's dedicated Image API. */
+export async function callUpstreamImageEdit(
+  cfg: HaloConfig,
+  _apiKey: string | undefined,
+  body: InferenceRequestMessage["body"],
+  edit: PreparedImageEditRequest,
+  options: ImageEditUpstreamOptions = {}
+): Promise<{ status: number; data: unknown; usage: UpstreamUsage; respHeaders: Record<string, string> }> {
+  const zeroUsage: UpstreamUsage = { total_tokens: 0, prompt_tokens: 0, completion_tokens: 0 };
+  const { provider, apiKey } = resolveProvider(cfg, body);
+  if (imageEditAdapterFor(provider.slug) !== "openrouter-images") {
+    return {
+      status: 502,
+      data: {
+        error: {
+          message: `provider "${provider.slug}" does not expose a supported inline image-edit adapter`,
+          type: "unsupported_image_edit_provider",
+        },
+      },
+      usage: zeroUsage,
+      respHeaders: {},
+    };
+  }
+  const model = typeof body.model === "string" ? body.model : "";
+  const outbound = buildOpenRouterImageEditBody(model, edit);
+  const url = `${provider.baseUrl.replace(/\/+$/, "")}/images`;
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Accept: "application/json",
+  };
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+
+  const timeoutMs = options.timeoutMs ?? UPSTREAM_TIMEOUT_MS;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let res: Awaited<ReturnType<typeof fetch>>;
+  let text: string;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(outbound),
+      signal: controller.signal,
+    });
+    text = await readImageUpstreamBody(
+      res,
+      controller.signal,
+      MAX_IMAGE_UPSTREAM_BODY_BYTES
+    );
+  } catch (err) {
+    const oversized =
+      err instanceof UndeliverableImageResponseError &&
+      err.type === "image_upstream_body_too_large";
+    const type = oversized
+      ? err.type
+      : err instanceof Error && (err.name === "AbortError" || controller.signal.aborted)
+        ? "provider_timeout"
+        : "provider_unavailable";
+    return {
+      status: oversized ? 502 : 504,
+      data: {
+        error: {
+          message: oversized ? err.message : "upstream image edit request failed",
+          type,
+        },
+      },
+      usage: zeroUsage,
+      respHeaders: {},
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    parsed = { error: { message: text } };
+  }
+  if (!res.ok) {
+    if (process.env.HALO_DEBUG_UPSTREAM_ERRORS === "1") {
+      debugToTerminal(`  upstream(image-edit) ${res.status} body: ${text.slice(0, 2000)}`);
+    } else {
+      console.error(
+        `  upstream(image-edit) ${res.status} (set HALO_DEBUG_UPSTREAM_ERRORS=1 to print body to this terminal)`
+      );
+    }
+    tripBreakerLogged(provider.slug, classifyUpstreamProviderError(res.status, parsed));
     return {
       status: res.status,
       data: sanitizeUpstreamError(parsed, res.status),
@@ -1500,6 +2203,7 @@ export async function cmdServe(): Promise<void> {
       // Async handlers re-check this before settlement so an undeliverable response is not charged.
       let wsClosed = false;
       const abortedStreams = new Set<string>();
+      const relayDeliveries = new RelayDeliveryTracker();
       console.log(`  connecting to relay: ${wsUrl}`);
       const ws = new WebSocket(wsUrl, {
         perMessageDeflate: false,
@@ -1600,6 +2304,7 @@ export async function cmdServe(): Promise<void> {
             const imageModels = providers
               .flatMap((p) => p.imageModels ?? [])
               .filter((m) => !deannounced.has(m));
+            const imageEditModels = buildImageEditModelsAnnounce(cfg);
             ws.send(
               JSON.stringify({
                 type: "announce",
@@ -1617,6 +2322,7 @@ export async function cmdServe(): Promise<void> {
                   ...([...new Set(imageModels)].length > 0
                     ? { imageModels: [...new Set(imageModels)] }
                     : {}),
+                  ...(imageEditModels.length > 0 ? { imageEditModels } : {}),
                   pricing,
                   ...(Object.keys(imagePricing).length > 0 ? { imagePricing } : {}),
                   // Per-model context window (tokens) so the relay's /v1/models
@@ -1639,7 +2345,7 @@ export async function cmdServe(): Promise<void> {
               console.log("  ✓ vault RPC recovered; re-announced vaultPayments capability");
             } else {
               console.log(
-                `  ✓ announced as ${abbrevAddr(cfg.operator.address)} (${providers.map((p) => p.slug).join("+")}, ${announceModels.length} models${teeModels.length ? `, ${new Set(teeModels).size} confidential` : ""}${imageModels.length ? `, ${new Set(imageModels).size} image` : ""})`
+                `  ✓ announced as ${abbrevAddr(cfg.operator.address)} (${providers.map((p) => p.slug).join("+")}, ${announceModels.length} models${teeModels.length ? `, ${new Set(teeModels).size} confidential` : ""}${imageModels.length ? `, ${new Set(imageModels).size} image` : ""}${imageEditModels.length ? `, ${imageEditModels.length} edit` : ""})`
               );
               announced = true;
               reconnectAttempt = 0;
@@ -1719,9 +2425,18 @@ export async function cmdServe(): Promise<void> {
           const m = msg as StreamAbortMessage;
           if (typeof m.requestId === "string" && m.requestId.length > 0) {
             abortedStreams.add(m.requestId);
+            relayDeliveries.abort(m.requestId);
             console.warn(
               `  ⚠ relay aborted stream ${m.requestId}${m.reason ? ` (${m.reason})` : ""}; releasing any admitted vault credit`
             );
+          }
+          return;
+        }
+
+        if (msg.type === "stream-complete") {
+          const m = msg as StreamCompleteMessage;
+          if (typeof m.requestId === "string" && m.requestId.length > 0) {
+            relayDeliveries.confirm(m.requestId);
           }
           return;
         }
@@ -1741,8 +2456,67 @@ export async function cmdServe(): Promise<void> {
 
         // Decrypt `_enc` after routing; only the outer `model` remains cleartext.
         let consumerPublicKey: Uint8Array | undefined;
+        let imageEditRequest: PreparedImageEditRequest | undefined;
         const encEnvelope = (req.body as { _enc?: unknown })?._enc;
-        if (isEncryptedEnvelope(encEnvelope)) {
+        if (req.path === IMAGE_EDIT_PATH) {
+          try {
+            const opened = openImageEditRequest(req.body, encryptionKeys.privateKey);
+            if (resolveImageServeKind(cfg, req.path, opened.model) !== "edit") {
+              throw new ImageEditRequestError(
+                "image_edit_not_configured",
+                `model "${opened.model}" is not explicitly configured for this operator's supported image-edit adapter`
+              );
+            }
+            consumerPublicKey = opened.consumerPublicKey;
+            imageEditRequest = opened.edit;
+            req.body = {
+              model: opened.model,
+              prompt: opened.edit.prompt,
+              n: opened.edit.n,
+              acceptMedia: true,
+            };
+          } catch (err) {
+            const type =
+              err instanceof ImageEditRequestError ? err.type : "invalid_image_edit_request";
+            const message =
+              err instanceof ImageEditRequestError ? err.message : "invalid image edit request";
+            console.warn(`  ⚠ rejecting image edit ${req.requestId}: ${type}`);
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(
+                JSON.stringify({
+                  type: "inference-response",
+                  requestId: req.requestId,
+                  status: 400,
+                  headers: {},
+                  body: { error: { message, type } },
+                })
+              );
+            }
+            return;
+          }
+        } else if (
+          encEnvelope &&
+          typeof encEnvelope === "object" &&
+          (encEnvelope as { v?: unknown }).v === 2
+        ) {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(
+              JSON.stringify({
+                type: "inference-response",
+                requestId: req.requestId,
+                status: 400,
+                headers: {},
+                body: {
+                  error: {
+                    message: "v2 encrypted image edit payloads are accepted only on /v1/images/edit",
+                    type: "image_edit_wrong_path",
+                  },
+                },
+              })
+            );
+          }
+          return;
+        } else if (isEncryptedEnvelope(encEnvelope)) {
           try {
             const { plaintext, consumerPublicKey: cpk } = decryptRequest(
               encEnvelope,
@@ -1774,6 +2548,7 @@ export async function cmdServe(): Promise<void> {
 
         const requestedModel =
           typeof req.body.model === "string" ? req.body.model : allConfiguredModels(cfg)[0] || "unknown";
+        const imageServeKind = resolveImageServeKind(cfg, req.path, requestedModel);
 
         // Reject open-breaker requests before payment verification or upstream work.
         const brokenSlug = providerForModel(configProviders(cfg), requestedModel).slug;
@@ -1808,9 +2583,10 @@ export async function cmdServe(): Promise<void> {
 
         // Confidential requests stay buffered because SSE reframing would invalidate the byte-exact proof.
         // The client E2EE public key is the canonical confidential-request marker.
-        const teeRequest =
-          typeof req.headers["x-client-pub-key"] === "string" ||
-          typeof req.headers["x-encryption-version"] === "string";
+        const teeRequest = shouldFetchTeeProof(
+          brokenSlug,
+          req.headers as Record<string, string | undefined>
+        );
         const acceptsMedia = requestAcceptsMedia(
           req.body,
           req.headers as Record<string, string | undefined>
@@ -2080,21 +2856,115 @@ export async function cmdServe(): Promise<void> {
                     respHeaders: {},
                   };
                 } else {
-                  upstream =
-                    imagePrice !== null
-                      ? await callUpstreamImage(cfg, upstreamApiKey, req.body)
-                      : await callUpstream(
-                          cfg,
-                          upstreamApiKey,
-                          req.body,
-                          reqHeaders,
-                          vaultCompletionCeiling
-                        );
+                  if (imageServeKind === "edit" && imageEditRequest) {
+                    upstream = await callUpstreamImageEdit(
+                      cfg,
+                      upstreamApiKey,
+                      req.body,
+                      imageEditRequest
+                    );
+                  } else if (imageServeKind === "generation") {
+                    upstream = await callUpstreamImage(cfg, upstreamApiKey, req.body);
+                  } else {
+                    upstream = await callUpstream(
+                      cfg,
+                      upstreamApiKey,
+                      req.body,
+                      reqHeaders,
+                      vaultCompletionCeiling
+                    );
+                  }
                 }
                 const encryptIfNeeded = (data: unknown): unknown =>
                   consumerPublicKey !== undefined
                     ? { _enc: encryptResponse(data, consumerPublicKey, encryptionKeys.privateKey) }
                     : data;
+                if (imagePrice !== null) {
+                  let imageTeeSignature: string | null = null;
+                  if (
+                    teeRequest &&
+                    upstream.status >= 200 &&
+                    upstream.status < 300
+                  ) {
+                    const teeProv = resolveProvider(cfg, req.body);
+                    imageTeeSignature = await fetchTeeSignatureForRequest({
+                      providerSlug: teeProv.provider.slug,
+                      baseUrl: teeProv.provider.baseUrl,
+                      apiKey: teeProv.apiKey,
+                      chatId: (upstream.data as { id?: string })?.id ?? "",
+                      model: requestedModel,
+                      headers: req.headers,
+                    });
+                  }
+                  const completion = await completeVaultImageServe({
+                    requestId: req.requestId,
+                    upstream: {
+                      ...upstream,
+                      respHeaders: {
+                        ...(upstream.respHeaders ?? {}),
+                        ...(imageTeeSignature
+                          ? { "X-Halo-TEE-Signature": imageTeeSignature }
+                          : {}),
+                      },
+                    },
+                    imagePrice,
+                    ceiling: ceilingCost,
+                    consumer: consumerAddr,
+                    operator: cfg.operator.address,
+                    cycle: chk.cycle,
+                    creditLedger,
+                    consumerPublicKey,
+                    operatorKeys: encryptionKeys,
+                    encryptFailure: encryptIfNeeded,
+                    sendFrame: (frame) => sendWsJson(ws, frame),
+                    sendTerminal: (terminal) => sendWsJson(ws, terminal),
+                    confirmTerminal: (terminal) =>
+                      relayDeliveries.sendAndWait(req.requestId, () =>
+                        sendWsJson(ws, terminal)
+                      ),
+                    isAborted: () => abortedStreams.has(req.requestId),
+                    postServedEvent: (settlement, servedCumulative) => {
+                      if (settlement.uncappedAmount > settlement.actualAmount) {
+                        console.warn(
+                          `  ⚠ vault-served at a loss on ${req.requestId}: actual image cost ${fmtUsd(settlement.uncappedAmount)} (${settlement.servedImageCount} image(s)) exceeds this request's reserved ceiling ${fmtUsd(ceilingCost)}; collecting ${fmtUsd(settlement.actualAmount)} — the model returned more images than the reservation covered for "${requestedModel}"`
+                        );
+                      }
+                      console.log(
+                        `  ✓ vault-served ${req.requestId} for ${abbrevAddr(consumerAddr)} — ${fmtUsd(settlement.actualAmount)} (${settlement.servedImageCount} image(s)); awaiting redeem`
+                      );
+                      const eventPayload = {
+                        id: req.requestId,
+                        operator: cfg.operator.address,
+                        consumer: consumerAddr,
+                        model: req.body.model ?? null,
+                        tokens: settlement.tokens,
+                        amountUsdc: settlement.actualAmount.toString(),
+                        durationMs: Date.now() - requestStartedAt,
+                        timestamp: Date.now(),
+                        txHash: null,
+                        mode: "vault" as const,
+                        cumulativeCheckpoint:
+                          servedCumulative === null
+                            ? undefined
+                            : servedCumulative.toString(),
+                      };
+                      const sigMessage = canonicalEventMessage(eventPayload);
+                      wallet
+                        .signMessage(sigMessage)
+                        .then((signature) =>
+                          postEvent(cfg, { ...eventPayload, signature })
+                        )
+                        .catch((err) => logError("event post failed", err));
+                    },
+                  });
+                  creditAdmitted = null;
+                  if (!completion.ok) {
+                    console.warn(
+                      `  ⚠ image vault request ${req.requestId} ended without settlement (${completion.type}); released ${fmtUsd(ceilingCost)} reserved credit`
+                    );
+                  }
+                  return;
+                }
                 if (!(upstream.status >= 200 && upstream.status < 300)) {
                   // Upstream failed — no charge owed; consumer simply won't redeem.
                   // Return the request's reserved ceiling to the credit window.
@@ -2111,159 +2981,32 @@ export async function cmdServe(): Promise<void> {
                   // A small max_tokens gate never bounds a reasoning model's tokens, so the
                   // priced actual can exceed the ceiling; awarding the uncapped price would
                   // over-count the credit ledger and strand a permanent txHash:null indexer row.
-                  const imageSettlement =
-                    imagePrice !== null
-                      ? priceServedImagesForVault(imagePrice, upstream.data, ceilingCost)
-                      : null;
-                  if (imageSettlement && imageSettlement.servedImageCount === 0) {
-                    creditLedger.releaseInflight(
-                      consumerAddr,
-                      cfg.operator.address,
-                      chk.cycle,
-                      ceilingCost
-                    );
-                    creditAdmitted = null;
-                    console.warn(
-                      `  ⚠ image vault request ${req.requestId} returned no detectable images; released ${fmtUsd(ceilingCost)} reserved credit without settlement`
-                    );
-                    out = {
-                      status: 502,
-                      headers: { ...(upstream.respHeaders ?? {}) },
-                      body: buildNoImageTerminalBody(),
-                    };
-                    if (ws.readyState === WebSocket.OPEN) {
-                      ws.send(
-                        JSON.stringify({
-                          type: "inference-response",
-                          requestId: req.requestId,
-                          status: out.status,
-                          headers: out.headers,
-                          body: out.body,
-                        })
-                      );
-                    }
-                    return;
-                  }
-                  const uncappedAmount =
-                    imageSettlement?.uncappedAmount ??
-                    (await priceRequest({
-                      cfg,
-                      model: requestedModel,
-                      promptTokens: upstream.usage.prompt_tokens,
-                      completionTokens: upstream.usage.completion_tokens,
-                      cachedPromptTokens: upstream.usage.cached_prompt_tokens,
-                    }));
-                  const actualAmount =
-                    imageSettlement?.actualAmount ??
-                    collectibleServeAmount(uncappedAmount, ceilingCost);
-                  const servedTokens = imageSettlement?.tokens ?? upstream.usage.total_tokens;
+                  const uncappedAmount = await priceRequest({
+                    cfg,
+                    model: requestedModel,
+                    promptTokens: upstream.usage.prompt_tokens,
+                    completionTokens: upstream.usage.completion_tokens,
+                    cachedPromptTokens: upstream.usage.cached_prompt_tokens,
+                  });
+                  const actualAmount = collectibleServeAmount(uncappedAmount, ceilingCost);
+                  const servedTokens = upstream.usage.total_tokens;
                   if (uncappedAmount > actualAmount) {
                     console.warn(
-                      imageSettlement
-                        ? `  ⚠ vault-served at a loss on ${req.requestId}: actual image cost ${fmtUsd(uncappedAmount)} (${imageSettlement.servedImageCount} image(s)) exceeds this request's reserved ceiling ${fmtUsd(ceilingCost)}; collecting ${fmtUsd(actualAmount)} — the model returned more images than the reservation covered for "${requestedModel}"`
-                        : `  ⚠ vault-served at a loss on ${req.requestId}: actual cost ${fmtUsd(uncappedAmount)} (${upstream.usage.completion_tokens} completion tok) exceeds this request's reserved ceiling ${fmtUsd(ceilingCost)}; collecting ${fmtUsd(actualAmount)} — the model's output ran past the reserved headroom for "${requestedModel}" (raise the reservation ceiling for this model)`
+                      `  ⚠ vault-served at a loss on ${req.requestId}: actual cost ${fmtUsd(uncappedAmount)} (${upstream.usage.completion_tokens} completion tok) exceeds this request's reserved ceiling ${fmtUsd(ceilingCost)}; collecting ${fmtUsd(actualAmount)} — the model's output ran past the reserved headroom for "${requestedModel}" (raise the reservation ceiling for this model)`
                     );
-                  }
-                  if (imageSettlement) {
-                    let mediaFrames: MediaChunkFrame[];
-                    try {
-                      const prepared = prepareImageDeliveryFrames({
-                        requestId: req.requestId,
-                        responseData: upstream.data,
-                        imageSettlement,
-                        consumerPublicKey,
-                        operatorKeys: encryptionKeys,
-                      });
-                      mediaFrames = prepared.frames;
-                    } catch (err) {
-                      creditLedger.releaseInflight(
-                        consumerAddr,
-                        cfg.operator.address,
-                        chk.cycle,
-                        ceilingCost
-                      );
-                      creditAdmitted = null;
-                      const type =
-                        err instanceof UndeliverableImageResponseError
-                          ? err.type
-                          : err instanceof UnsupportedImageFormatError
-                            ? "unsupported_image_format"
-                            : err instanceof MalformedImageError
-                              ? "malformed_image"
-                              : "image_delivery_failed";
-                      const message = err instanceof Error ? err.message : String(err);
-                      console.warn(
-                        `  ⚠ image vault request ${req.requestId} could not prepare deliverable media (${type}); released ${fmtUsd(ceilingCost)} reserved credit without settlement`
-                      );
-                      out = {
-                        status: type === "image_encryption_required" ? 400 : 502,
-                        headers: {},
-                        body: { error: { message, type } },
-                      };
-                      if (ws.readyState === WebSocket.OPEN) {
-                        ws.send(
-                          JSON.stringify({
-                            type: "inference-response",
-                            requestId: req.requestId,
-                            status: out.status,
-                            headers: out.headers,
-                            body: out.body,
-                          })
-                        );
-                      }
-                      return;
-                    }
-
-                    try {
-                      for (const frame of mediaFrames) {
-                        if (abortedStreams.has(req.requestId)) break;
-                        await sendWsJson(ws, frame);
-                      }
-                    } catch (err) {
-                      creditLedger.releaseInflight(
-                        consumerAddr,
-                        cfg.operator.address,
-                        chk.cycle,
-                        ceilingCost
-                      );
-                      creditAdmitted = null;
-                      logError("image media delivery failed", err);
-                      out = {
-                        status: 502,
-                        headers: {},
-                        body: {
-                          error: {
-                            message: "image media delivery failed before settlement",
-                            type: "image_media_delivery_failed",
-                          },
-                        },
-                      };
-                      if (ws.readyState === WebSocket.OPEN) {
-                        ws.send(
-                          JSON.stringify({
-                            type: "inference-response",
-                            requestId: req.requestId,
-                            status: out.status,
-                            headers: out.headers,
-                            body: out.body,
-                          })
-                        );
-                      }
-                      return;
-                    }
                   }
                   // Confidential path: fetch the TEE response signature with the
                   // operator's key and forward it (key never leaves the operator).
                   // Resolve the model's own provider (multi-provider operators).
                   const teeProv = resolveProvider(cfg, req.body);
-                  const teeSig = teeRequest
-                    ? await fetchTeeSignature(
-                        teeProv.provider.baseUrl,
-                        teeProv.apiKey,
-                        (upstream.data as { id?: string })?.id ?? "",
-                        requestedModel
-                      )
-                    : null;
+                  const teeSig = await fetchTeeSignatureForRequest({
+                    providerSlug: teeProv.provider.slug,
+                    baseUrl: teeProv.provider.baseUrl,
+                    apiKey: teeProv.apiKey,
+                    chatId: (upstream.data as { id?: string })?.id ?? "",
+                    model: requestedModel,
+                    headers: req.headers,
+                  });
                   if (
                     releaseAbortedVaultServe({
                       abortedRequestIds: abortedStreams,
@@ -2304,9 +3047,7 @@ export async function cmdServe(): Promise<void> {
                           "utf-8"
                         ).toString("base64"),
                       },
-                      body: imageSettlement
-                        ? buildImageTerminalBody(imageSettlement)
-                        : encryptIfNeeded(upstream.data),
+                      body: encryptIfNeeded(upstream.data),
                     };
                     // Discount what we just served from the cached reservation
                     // headroom so the gate cache never approves past coverage.
@@ -2315,9 +3056,7 @@ export async function cmdServe(): Promise<void> {
                     const servedCumulative = creditLedger.settleServed(consumerAddr, cfg.operator.address, chk.cycle, ceilingCost, actualAmount);
                     creditAdmitted = null;
                     console.log(
-                      imageSettlement
-                        ? `  ✓ vault-served ${req.requestId} for ${abbrevAddr(consumerAddr)} — ${fmtUsd(actualAmount)} (${imageSettlement.servedImageCount} image(s)); awaiting redeem`
-                        : `  ✓ vault-served ${req.requestId} for ${abbrevAddr(consumerAddr)} — ${fmtUsd(actualAmount)} (${upstream.usage.total_tokens} tok); awaiting redeem`
+                      `  ✓ vault-served ${req.requestId} for ${abbrevAddr(consumerAddr)} — ${fmtUsd(actualAmount)} (${upstream.usage.total_tokens} tok); awaiting redeem`
                     );
                     // Fire-and-forget indexer event. txHash is null — the redeem
                     // happens async (consumer-driven); the verifier reconciles.
@@ -2749,6 +3488,7 @@ export async function cmdServe(): Promise<void> {
 
       ws.on("close", (code, reason) => {
         wsClosed = true;
+        relayDeliveries.close();
         stopKeepalive();
         setBreakerChangeHandler(null);
         console.log(`  ✖ disconnected (code=${code}, reason=${reason.toString() || "-"})`);
@@ -2851,6 +3591,22 @@ export function buildImagePricingAnnounce(cfg: HaloConfig): Record<string, numbe
     }
   }
   return out;
+}
+
+/** Exact edit capabilities whose provider has the tested adapter, a vault-representable price, and a closed breaker. */
+export function buildImageEditModelsAnnounce(cfg: HaloConfig): string[] {
+  const providers = configProviders(cfg);
+  return allConfiguredModels(cfg).filter((model) => {
+    const provider = providerForModel(providers, model);
+    const price = imagePriceForModel(cfg, model);
+    return (
+      providerServesConfiguredImageEditModel(provider, model) &&
+      providerServesConfiguredImageModel(provider, model) &&
+      imageEditAdapterFor(provider.slug) !== null &&
+      !isBreakerOpen(provider.slug) &&
+      isPositiveImagePriceRepresentable(price)
+    );
+  });
 }
 
 /** Resolve announced context windows from cached provider catalogs, omitting unknown models. */

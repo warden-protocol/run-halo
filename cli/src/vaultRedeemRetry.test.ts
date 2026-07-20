@@ -7,6 +7,12 @@ import { VaultConsumeClient, type OpsState } from "./vault-consume";
 
 const OP = "0x2222222222222222222222222222222222222222";
 const OPS: OpsState = { locked: 100_000n, redeemed: 0n, expiry: 9_999_999_999n, created: 0n, cycle: 1n };
+const confirmed = (cumulative = "1000") => ({
+  status: "confirmed",
+  transaction: `0x${"a".repeat(64)}`,
+  cumulative,
+  cycle: "1",
+});
 
 function mockFacilitator(handler: (n: number) => { status: number; body: unknown }) {
   let n = 0;
@@ -43,7 +49,7 @@ function client(facUrl: string): VaultConsumeClient {
 }
 
 test("a successful redeem clears the pending receipt", async () => {
-  const fac = await mockFacilitator(() => ({ status: 200, body: { hash: "0xok" } }));
+  const fac = await mockFacilitator(() => ({ status: 200, body: confirmed() }));
   try {
     const c = client(fac.url);
     c.recordAndRedeem(OP, OPS, 0n, 1_000n);
@@ -100,7 +106,7 @@ test("BadSignature (cycle moved on) is abandoned, not retried forever", async ()
 
 test("recovers: transient failures then a success clears it", async () => {
   const fac = await mockFacilitator((n) =>
-    n < 2 ? { status: 500, body: { error: "down" } } : { status: 200, body: { hash: "0xok" } }
+    n < 2 ? { status: 500, body: { error: "down" } } : { status: 200, body: confirmed() }
   );
   try {
     const c = client(fac.url);

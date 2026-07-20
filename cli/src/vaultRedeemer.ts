@@ -1,5 +1,11 @@
 import { VaultCreditLedger } from "./vaultCredit";
-import { classifyRedeemError, formatUsdcBase } from "@halo/vault-core";
+import {
+  classifyRedeemError,
+  formatUsdcBase,
+  parseVaultRedeemResponse,
+  vaultRedeemDisposition,
+  type VaultRedeemRequest,
+} from "@halo/vault-core";
 
 export { classifyRedeemError } from "@halo/vault-core";
 
@@ -50,51 +56,78 @@ export class OperatorRedeemer {
     let lastErr: unknown;
     for (let attempt = 0; attempt < REDEEM_ATTEMPTS; attempt++) {
       try {
+        const request: VaultRedeemRequest = {
+          consumer,
+          operator,
+          cumulative: receipt.cumulative.toString(),
+          cycle: receipt.cycle.toString(),
+          signature: receipt.signature,
+        };
         const res = await fetch(`${this.facBase()}/vault/redeem`, {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            consumer,
-            operator,
-            cumulative: receipt.cumulative.toString(),
-            signature: receipt.signature,
-          }),
+          body: JSON.stringify(request),
           signal: AbortSignal.timeout(60_000),
         });
-        const body = (await res.json().catch(() => ({}))) as {
-          hash?: string;
-          error?: string;
-          status?: string;
-        };
-        if (res.ok && body.hash) {
-          this.ledger.noteRedeemed(consumer, operator, receipt.cumulative, receipt.cycle);
-          this.log(
-            `  ✓ vault redeem ${body.hash} collected ${fmtUsd(receipt.cumulative)} cumulative (${receipt.cumulative} base) from ${abbrev(consumer)}`
-          );
-          return;
+        const raw = await res.json().catch(() => null);
+        const outcome = parseVaultRedeemResponse(raw);
+        if (outcome) {
+          const disposition = vaultRedeemDisposition(outcome, request);
+          if (disposition === "collected") {
+            this.ledger.noteRedeemed(consumer, operator, receipt.cumulative, receipt.cycle);
+            if (outcome.status === "confirmed") {
+              this.log(
+                `  ✓ vault redeem ${outcome.transaction} confirmed ${fmtUsd(receipt.cumulative)} cumulative (${receipt.cumulative} base) from ${abbrev(consumer)}`
+              );
+            }
+            return;
+          }
+          if (disposition === "uncollectable") {
+            this.ledger.noteRedeemed(consumer, operator, receipt.cumulative, receipt.cycle);
+            this.log(
+              `  ⚠ vault receipt from ${abbrev(consumer)} is uncollectable (${outcome.status === "rejected" ? outcome.error.slice(0, 80) : outcome.status}) — abandoning (loss can reach the reservation's collectible ceiling)`
+            );
+            return;
+          }
+          switch (outcome.status) {
+            case "confirmed":
+            case "already-redeemed":
+              lastErr = new Error("facilitator returned mismatched canonical coverage");
+              break;
+            case "pending":
+              this.log(
+                `  ↻ vault redeem ${outcome.transaction} pending for ${abbrev(consumer)}; retaining cycle ${receipt.cycle} receipt`
+              );
+              return;
+            case "reverted":
+              this.log(
+                `  ↻ vault redeem ${outcome.transaction} reverted for ${abbrev(consumer)}; retaining receipt for retry`
+              );
+              return;
+            case "rejected":
+              lastErr = new Error(outcome.error);
+              break;
+          }
+        } else {
+          const error =
+            raw && typeof raw === "object" && "error" in raw
+              ? String((raw as { error?: unknown }).error ?? "")
+              : "";
+          const errStr = error || `invalid redeem response (HTTP ${res.status})`;
+          const cls = classifyRedeemError(errStr);
+          if (cls === "collected") {
+            this.ledger.noteRedeemed(consumer, operator, receipt.cumulative, receipt.cycle);
+            return;
+          }
+          if (cls === "uncollectable") {
+            this.ledger.noteRedeemed(consumer, operator, receipt.cumulative, receipt.cycle);
+            this.log(
+              `  ⚠ vault receipt from ${abbrev(consumer)} is uncollectable (${errStr.slice(0, 80)}) — abandoning (loss can reach the reservation's collectible ceiling)`
+            );
+            return;
+          }
+          lastErr = new Error(errStr);
         }
-        if (res.ok && body.status === "already-redeemed") {
-          // Treat the facilitator's terminal duplicate response as locally complete.
-          this.ledger.noteRedeemed(consumer, operator, receipt.cumulative, receipt.cycle);
-          return;
-        }
-        const errStr = body.error || `HTTP ${res.status}`;
-        const cls = classifyRedeemError(errStr);
-        if (cls === "collected") {
-          // StaleReceipt / ExceedsReservation: a re-scan or earlier attempt
-          // already landed this cumulative (or nothing remains) — not a loss.
-          this.ledger.noteRedeemed(consumer, operator, receipt.cumulative, receipt.cycle);
-          return;
-        }
-        if (cls === "uncollectable") {
-          // Deterministic verification failure: retrying cannot make this receipt collectible.
-          this.ledger.noteRedeemed(consumer, operator, receipt.cumulative, receipt.cycle);
-          this.log(
-            `  ⚠ vault receipt from ${abbrev(consumer)} is uncollectable (${errStr.slice(0, 80)}) — abandoning (loss can reach the reservation's collectible ceiling)`
-          );
-          return;
-        }
-        lastErr = new Error(errStr); // transient → retry
       } catch (err) {
         lastErr = err; // network/timeout → transient → retry
       }

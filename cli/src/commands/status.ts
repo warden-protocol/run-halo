@@ -26,6 +26,10 @@ export async function cmdStatus(): Promise<void> {
       `  Image:     ${imageEntries.map(([m, price]) => `${m} ($${price}/image)`).join(", ")}`
     );
   }
+  const editModels = providers.flatMap((provider) => provider.imageEditModels ?? []);
+  if (editModels.length > 0) {
+    console.log(`  Edits:     ${[...new Set(editModels)].join(", ")}`);
+  }
 
   try {
     const res = await fetch(`${cfg.indexerUrl.replace(/\/+$/, "")}/points/${cfg.operator.address}`);

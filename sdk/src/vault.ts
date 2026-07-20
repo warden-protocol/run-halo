@@ -24,13 +24,17 @@ import {
   estimateReservationTokens,
   formatUsdcBase,
   meterVaultResponse,
+  parseVaultRedeemResponse,
   priceTokens,
   requiredVaultReservationBase,
   selectVaultOperatorFromList,
+  vaultRedeemDisposition,
   vaultDomain,
   withReservationMargin,
   type OpsState,
   type SessionKeyStatus,
+  type VaultRedeemRequest,
+  type VaultRedeemResponse,
   type VaultState,
 } from "@halo/vault-core";
 import { getChain } from "./chains";
@@ -63,13 +67,70 @@ const USDC_DECIMALS = 6;
 const READ_TIMEOUT_MS = 8_000;
 const REDEEM_RETRY_INTERVAL_MS = 20_000;
 
-function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
-  return Promise.race([
-    p,
-    new Promise<T>((_, reject) =>
-      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
-    ),
-  ]);
+function abortReason(signal: AbortSignal): Error {
+  if (signal.reason instanceof Error) return signal.reason;
+  const error = new Error("The operation was aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw abortReason(signal);
+}
+
+function withAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(abortReason(signal));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(abortReason(signal));
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      }
+    );
+  });
+}
+
+function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  label: string,
+  signal?: AbortSignal
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<T>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return withAbort(Promise.race([promise, timeout]), signal).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+function signalWithTimeout(signal: AbortSignal | undefined, ms: number): AbortSignal {
+  const timeout = AbortSignal.timeout(ms);
+  return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) return new Promise<void>((resolve) => setTimeout(resolve, ms));
+  if (signal.aborted) return Promise.reject(abortReason(signal));
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(abortReason(signal));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 
@@ -195,11 +256,12 @@ export class HaloVaultClient {
     return this.cfg.facilitatorUrl.replace(/\/+$/, "");
   }
 
-  async readVaultState(): Promise<VaultState> {
-    const consumer = await this.consumer();
+  async readVaultState(signal?: AbortSignal): Promise<VaultState> {
+    throwIfAborted(signal);
+    const consumer = await withAbort(this.consumer(), signal);
     try {
       const identity = await fetch(`${this.facBase()}/vault/info`, {
-        signal: AbortSignal.timeout(6000),
+        signal: signalWithTimeout(signal, 6000),
       });
       const identityBody = identity.ok
         ? ((await identity.json()) as { vault?: unknown })
@@ -216,7 +278,7 @@ export class HaloVaultClient {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ consumer }),
-        signal: AbortSignal.timeout(6000),
+        signal: signalWithTimeout(signal, 6000),
       });
       if (res.ok) {
         const s = (await res.json()) as Record<string, string>;
@@ -232,7 +294,9 @@ export class HaloVaultClient {
           };
         }
       }
-    } catch {}
+    } catch {
+      throwIfAborted(signal);
+    }
     const [balance, lockedTotal, withdrawable, sessionKey, reserveNonce, keyEpoch] =
       await withTimeout(
         Promise.all([
@@ -244,7 +308,8 @@ export class HaloVaultClient {
           this.vault.keyEpoch(consumer),
         ]),
         READ_TIMEOUT_MS,
-        "vault state read"
+        "vault state read",
+        signal
       );
     return {
       balance: BigInt(balance),
@@ -256,9 +321,15 @@ export class HaloVaultClient {
     };
   }
 
-  async readOps(operator: string): Promise<OpsState> {
-    const consumer = await this.consumer();
-    const r = await withTimeout(this.vault.ops(consumer, operator), READ_TIMEOUT_MS, "ops() read");
+  async readOps(operator: string, signal?: AbortSignal): Promise<OpsState> {
+    throwIfAborted(signal);
+    const consumer = await withAbort(this.consumer(), signal);
+    const r = await withTimeout(
+      this.vault.ops(consumer, operator),
+      READ_TIMEOUT_MS,
+      "ops() read",
+      signal
+    );
     return {
       locked: BigInt(r.locked ?? r[0]),
       redeemed: BigInt(r.redeemed ?? r[1]),
@@ -336,8 +407,10 @@ export class HaloVaultClient {
 
   private async postReserve(
     p: { operator: string; amount: bigint; expiry: bigint; nonce: bigint },
-    signature: string
+    signature: string,
+    signal?: AbortSignal
   ): Promise<string> {
+    throwIfAborted(signal);
     const res = await fetch(`${this.facBase()}/vault/reserve`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -349,27 +422,39 @@ export class HaloVaultClient {
         nonce: p.nonce.toString(),
         signature,
       }),
-      signal: AbortSignal.timeout(60_000),
+      signal: signalWithTimeout(signal, 60_000),
     });
     const body = (await res.json().catch(() => ({}))) as { hash?: string; error?: string };
     if (!res.ok || !body.hash) throw new Error(body.error || `reserve failed (HTTP ${res.status})`);
     return body.hash;
   }
-  private async postRedeem(operator: string, cumulative: bigint, signature: string): Promise<string> {
+  private async postRedeem(
+    operator: string,
+    cumulative: bigint,
+    cycle: bigint,
+    signature: string
+  ): Promise<VaultRedeemResponse> {
+    const request: VaultRedeemRequest = {
+      consumer: await this.consumer(),
+      operator,
+      cumulative: cumulative.toString(),
+      cycle: cycle.toString(),
+      signature,
+    };
     const res = await fetch(`${this.facBase()}/vault/redeem`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        consumer: await this.consumer(),
-        operator,
-        cumulative: cumulative.toString(),
-        signature,
-      }),
+      body: JSON.stringify(request),
       signal: AbortSignal.timeout(60_000),
     });
-    const body = (await res.json().catch(() => ({}))) as { hash?: string; error?: string };
-    if (!res.ok || !body.hash) throw new Error(body.error || `redeem failed (HTTP ${res.status})`);
-    return body.hash;
+    const raw = await res.json().catch(() => null);
+    const outcome = parseVaultRedeemResponse(raw);
+    if (outcome) return outcome;
+    const error =
+      raw && typeof raw === "object" && "error" in raw
+        ? String((raw as { error?: unknown }).error ?? "")
+        : "";
+    throw new Error(error || `invalid redeem response (HTTP ${res.status})`);
   }
 
   private async pushReceipt(
@@ -397,28 +482,39 @@ export class HaloVaultClient {
     }
   }
 
-  private async redeemGrace(): Promise<bigint> {
+  private async redeemGrace(signal?: AbortSignal): Promise<bigint> {
     if (this.redeemGraceCache !== null) return this.redeemGraceCache;
     this.redeemGraceCache = BigInt(
-      await withTimeout(this.vault.redeemGrace(), READ_TIMEOUT_MS, "redeemGrace read")
+      await withTimeout(
+        this.vault.redeemGrace(),
+        READ_TIMEOUT_MS,
+        "redeemGrace read",
+        signal
+      )
     );
     return this.redeemGraceCache;
   }
 
-  private async maxReserveTtl(): Promise<bigint> {
+  private async maxReserveTtl(signal?: AbortSignal): Promise<bigint> {
     if (this.maxReserveTtlCache !== null) return this.maxReserveTtlCache;
     this.maxReserveTtlCache = BigInt(
-      await withTimeout(this.vault.maxReserveTtl(), READ_TIMEOUT_MS, "maxReserveTtl read")
+      await withTimeout(
+        this.vault.maxReserveTtl(),
+        READ_TIMEOUT_MS,
+        "maxReserveTtl read",
+        signal
+      )
     );
     return this.maxReserveTtlCache;
   }
 
-  private async postRelease(operator: string): Promise<string> {
+  private async postRelease(operator: string, signal?: AbortSignal): Promise<string> {
+    throwIfAborted(signal);
     const res = await fetch(`${this.facBase()}/vault/release`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ consumer: await this.consumer(), operator }),
-      signal: AbortSignal.timeout(60_000),
+      signal: signalWithTimeout(signal, 60_000),
     });
     const body = (await res.json().catch(() => ({}))) as { hash?: string; error?: string };
     if (!res.ok || !body.hash) throw new Error(body.error || `release failed (HTTP ${res.status})`);
@@ -426,11 +522,16 @@ export class HaloVaultClient {
   }
 
   /** Reclaim tracked reservations after expiry and grace, retrying dropped releases. */
-  async releaseExpiredReservations(skipOperator?: string): Promise<boolean> {
+  async releaseExpiredReservations(
+    skipOperator?: string,
+    signal?: AbortSignal
+  ): Promise<boolean> {
+    throwIfAborted(signal);
     let grace: bigint;
     try {
-      grace = await this.redeemGrace();
+      grace = await this.redeemGrace(signal);
     } catch {
+      throwIfAborted(signal);
       return false;
     }
     const now = BigInt(nowSec());
@@ -439,9 +540,10 @@ export class HaloVaultClient {
     const skip = skipOperator?.toLowerCase();
     let released = false;
     for (const operator of this.reservedOperators) {
+      throwIfAborted(signal);
       if (operator === skip) continue;
       try {
-        const ops = await this.readOps(operator);
+        const ops = await this.readOps(operator, signal);
         if (ops.locked === 0n) {
           this.reservedOperators.delete(operator);
           this.releaseAttemptedAt.delete(operator);
@@ -451,38 +553,53 @@ export class HaloVaultClient {
         const coolingDown =
           (this.releaseAttemptedAt.get(operator) ?? 0) > nowMs - retryCooldownMs;
         if (eligible && !coolingDown) {
-          await this.postRelease(operator);
+          await this.postRelease(operator, signal);
           this.releaseAttemptedAt.set(operator, nowMs);
           this.cfg.log(
             `releasing expired vault reservation to ${operator.slice(0, 8)}… ($${fmtUsd(ops.locked)}; frees on confirmation)`
           );
           released = true;
         }
-      } catch {}
+      } catch {
+        throwIfAborted(signal);
+      }
     }
     return released;
   }
 
-  /** Ensure serialized, live coverage for an estimated request cost. */
-  ensureReservation(operator: string, estCost: bigint): Promise<{ ops: OpsState; keyEpoch: bigint }> {
-    const job = this.ensureQueue.catch(() => {}).then(() => this.ensureColdReservation(operator, estCost));
+  /** Ensure serialized, live coverage; an optional signal cancels queued and in-flight work. */
+  ensureReservation(
+    operator: string,
+    estCost: bigint,
+    signal?: AbortSignal
+  ): Promise<{ ops: OpsState; keyEpoch: bigint }> {
+    throwIfAborted(signal);
+    const job = this.ensureQueue.catch(() => {}).then(() => {
+      throwIfAborted(signal);
+      return this.ensureColdReservation(operator, estCost, signal);
+    });
     this.ensureQueue = job.then(
       () => {},
       () => {}
     );
-    return job;
+    return withAbort(job, signal);
   }
 
   private async ensureColdReservation(
     operator: string,
-    estCost: bigint
+    estCost: bigint,
+    signal?: AbortSignal
   ): Promise<{ ops: OpsState; keyEpoch: bigint }> {
+    throwIfAborted(signal);
     const REFRESH_MARGIN = 120;
     const target = estCost * this.cfg.reserveMultiple;
-    let [state, ops] = await Promise.all([this.readVaultState(), this.readOps(operator)]);
+    let [state, ops] = await Promise.all([
+      this.readVaultState(signal),
+      this.readOps(operator, signal),
+    ]);
     // Fail closed before work is sent with a signer that cannot redeem receipts.
-    const consumerAddr = await this.consumer();
-    const sessionAddr = await this.sessionAddress();
+    const consumerAddr = await withAbort(this.consumer(), signal);
+    const sessionAddr = await withAbort(this.sessionAddress(), signal);
     if (classifySessionKey(state.sessionKey, sessionAddr) === "mismatch") {
       throw this.sessionKeyMismatchError(state.sessionKey, sessionAddr, consumerAddr);
     }
@@ -496,7 +613,10 @@ export class HaloVaultClient {
     if (ops.locked < estCost || !live()) {
       if (ops.locked > 0n && !live()) {
         // Fail closed: an uncertain lifetime cap must never receive more funds.
-        const [maxTtl, grace] = await Promise.all([this.maxReserveTtl(), this.redeemGrace()]);
+        const [maxTtl, grace] = await Promise.all([
+          this.maxReserveTtl(signal),
+          this.redeemGrace(signal),
+        ]);
         const verdict = classifyReservationRevival(
           ops,
           maxTtl,
@@ -508,11 +628,14 @@ export class HaloVaultClient {
           this.cfg.log(
             `vault reservation to ${operator.slice(0, 8)}… hit its on-chain lifetime cap; reclaiming $${fmtUsd(ops.locked)} and re-reserving fresh`
           );
-          await this.postRelease(operator);
+          await this.postRelease(operator, signal);
           this.releaseAttemptedAt.set(operator.toLowerCase(), Date.now());
           // Re-reserving before release confirmation would top up the dead cycle.
-          await this.waitForRelease(operator);
-          [state, ops] = await Promise.all([this.readVaultState(), this.readOps(operator)]);
+          await this.waitForRelease(operator, signal);
+          [state, ops] = await Promise.all([
+            this.readVaultState(signal),
+            this.readOps(operator, signal),
+          ]);
         } else if (verdict === "wedged") {
           const until = new Date(Number(ops.expiry + grace) * 1000).toISOString();
           throw new Error(
@@ -535,17 +658,26 @@ export class HaloVaultClient {
         }
       }
       if (ops.locked + state.withdrawable < estCost) {
-        if (await this.releaseExpiredReservations(operator)) {
-          [state, ops] = await Promise.all([this.readVaultState(), this.readOps(operator)]);
+        if (await this.releaseExpiredReservations(operator, signal)) {
+          [state, ops] = await Promise.all([
+            this.readVaultState(signal),
+            this.readOps(operator, signal),
+          ]);
         }
       }
       if (ops.locked + state.withdrawable < estCost && this.autoTopUpBase > 0n) {
-        await this.autoTopUp(target);
-        [state, ops] = await Promise.all([this.readVaultState(), this.readOps(operator)]);
+        await this.autoTopUp(target, signal);
+        [state, ops] = await Promise.all([
+          this.readVaultState(signal),
+          this.readOps(operator, signal),
+        ]);
       }
       if (isExpired() && state.withdrawable === 0n && this.autoTopUpBase > 0n) {
-        await this.autoTopUp(target);
-        [state, ops] = await Promise.all([this.readVaultState(), this.readOps(operator)]);
+        await this.autoTopUp(target, signal);
+        [state, ops] = await Promise.all([
+          this.readVaultState(signal),
+          this.readOps(operator, signal),
+        ]);
       }
       const amount = computeReserveAmount({
         estCost,
@@ -568,16 +700,25 @@ export class HaloVaultClient {
         );
       }
       if (amount > 0n) {
+        throwIfAborted(signal);
         const expiry = BigInt(sec + this.cfg.reserveTtlSec);
-        const sig = await this.signReserve({
-          operator,
-          amount,
-          expiry,
-          nonce: state.reserveNonce,
-          keyEpoch: state.keyEpoch,
-        });
-        await this.postReserve({ operator, amount, expiry, nonce: state.reserveNonce }, sig);
-        ops = await this.waitForReservation(operator, ops);
+        const sig = await withAbort(
+          this.signReserve({
+            operator,
+            amount,
+            expiry,
+            nonce: state.reserveNonce,
+            keyEpoch: state.keyEpoch,
+          }),
+          signal
+        );
+        throwIfAborted(signal);
+        await this.postReserve(
+          { operator, amount, expiry, nonce: state.reserveNonce },
+          sig,
+          signal
+        );
+        ops = await this.waitForReservation(operator, ops, signal);
       }
     }
     this.reservedOperators.add(operator.toLowerCase());
@@ -585,21 +726,26 @@ export class HaloVaultClient {
   }
 
   /** Refill the vault until the requested free amount is collectible. */
-  private async autoTopUp(neededFreeBase: bigint): Promise<boolean> {
+  private async autoTopUp(
+    neededFreeBase: bigint,
+    signal?: AbortSignal
+  ): Promise<boolean> {
     if (this.autoTopUpBase <= 0n) return false;
+    throwIfAborted(signal);
     try {
-      const s = await this.readVaultState();
+      const s = await this.readVaultState(signal);
       if (s.withdrawable >= neededFreeBase) return true;
       const targetBalance =
         s.lockedTotal + (neededFreeBase > this.autoTopUpBase ? neededFreeBase : this.autoTopUpBase);
-      const tx = await this.ensureDeposit(targetBalance);
-      const after = await this.readVaultState();
+      const tx = await this.ensureDeposit(targetBalance, signal);
+      const after = await this.readVaultState(signal);
       const covered = after.withdrawable >= neededFreeBase;
       if (tx && covered) {
         this.cfg.log(`vault auto-topped-up (deposit ${tx.slice(0, 10)}…) — staying on the Halo rail`);
       }
       return covered;
     } catch (e) {
+      throwIfAborted(signal);
       this.cfg.log(`vault auto-top-up failed (signer likely out of USDC/ETH): ${errStr(e)}`);
       return false;
     }
@@ -613,34 +759,42 @@ export class HaloVaultClient {
   }
 
   /** Wait until release confirmation makes a fresh reservation cycle possible. */
-  private async waitForRelease(operator: string): Promise<void> {
+  private async waitForRelease(operator: string, signal?: AbortSignal): Promise<void> {
     const deadline = Date.now() + 30_000;
     // eslint-disable-next-line no-constant-condition
     while (true) {
+      throwIfAborted(signal);
       try {
-        if ((await this.readOps(operator)).locked === 0n) return;
+        if ((await this.readOps(operator, signal)).locked === 0n) return;
       } catch {
+        throwIfAborted(signal);
         // Keep polling after transient RPC failures.
       }
       if (Date.now() > deadline) {
         throw new Error("Reclaim didn't confirm on-chain in time — retry shortly.");
       }
-      await new Promise((r) => setTimeout(r, 600));
+      await abortableDelay(600, signal);
     }
   }
 
-  private async waitForReservation(operator: string, before: OpsState): Promise<OpsState> {
+  private async waitForReservation(
+    operator: string,
+    before: OpsState,
+    signal?: AbortSignal
+  ): Promise<OpsState> {
     const deadline = Date.now() + 30_000;
     // eslint-disable-next-line no-constant-condition
     while (true) {
+      throwIfAborted(signal);
       try {
-        const now = await this.readOps(operator);
+        const now = await this.readOps(operator, signal);
         if (now.cycle > before.cycle || now.locked > before.locked) return now;
       } catch {
+        throwIfAborted(signal);
         // Keep polling after transient RPC failures.
       }
       if (Date.now() > deadline) throw new Error("Reservation didn't confirm on-chain in time — retry shortly.");
-      await new Promise((r) => setTimeout(r, 600));
+      await abortableDelay(600, signal);
     }
   }
 
@@ -722,8 +876,46 @@ export class HaloVaultClient {
         }
       } catch {}
 
-      await this.postRedeem(pending.operator, pending.cumulative, pending.signature);
-      clearIfCurrent();
+      const outcome = await this.postRedeem(
+        pending.operator,
+        pending.cumulative,
+        pending.cycle,
+        pending.signature
+      );
+      const disposition = vaultRedeemDisposition(outcome, {
+        cumulative: pending.cumulative.toString(),
+        cycle: pending.cycle.toString(),
+      });
+      if (disposition === "collected") {
+        clearIfCurrent();
+        return;
+      }
+      if (disposition === "uncollectable") {
+        clearIfCurrent();
+        this.cfg.log(
+          `vault receipt is uncollectable; abandoning: ${outcome.status === "rejected" ? outcome.error : outcome.status}`
+        );
+        return;
+      }
+      switch (outcome.status) {
+        case "confirmed":
+        case "already-redeemed":
+          this.cfg.log("vault redeem returned mismatched canonical coverage; retained for retry");
+          break;
+        case "pending":
+          this.cfg.log(
+            `vault redeem pending at ${outcome.transaction}; retained cycle ${pending.cycle} receipt for recheck`
+          );
+          break;
+        case "reverted":
+          this.cfg.log(
+            `vault redeem ${outcome.transaction} reverted; retained cycle ${pending.cycle} receipt for retry`
+          );
+          break;
+        case "rejected":
+          this.cfg.log(`vault redeem rejected transiently; retained for retry: ${outcome.error}`);
+          break;
+      }
     } catch (e) {
       const cls = classifyRedeemError(errStr(e));
       if (cls === "collected") {
@@ -848,29 +1040,37 @@ export class HaloVaultClient {
     });
   }
 
-  /** Deposit a shortfall and register the session signer on the first deposit. */
-  async ensureDeposit(targetBase: bigint): Promise<string | null> {
-    const consumer = await this.consumer();
-    const state = await this.readVaultState();
+  /** Deposit a shortfall and register the session signer; an optional signal stops pending work. */
+  async ensureDeposit(targetBase: bigint, signal?: AbortSignal): Promise<string | null> {
+    throwIfAborted(signal);
+    const consumer = await withAbort(this.consumer(), signal);
+    const state = await this.readVaultState(signal);
     if (state.balance >= targetBase) return null;
     const shortfall = targetBase - state.balance;
     const w = this.signer.connect(this.provider);
     const usdcAddr = getChain(this.cfg.chainId).usdcToken;
     const usdc = new Contract(usdcAddr, ERC20_ABI, w);
-    const bal: bigint = await usdc.balanceOf(consumer);
+    const bal: bigint = await withAbort(usdc.balanceOf(consumer), signal);
     if (bal < shortfall) {
       throw new Error(
         `signer USDC ($${fmtUsd(bal)}) is less than the vault top-up needed ($${fmtUsd(shortfall)}). Fund ${consumer} with USDC on Base.`
       );
     }
-    const allowance: bigint = await usdc.allowance(consumer, this.cfg.vaultAddress);
+    const allowance: bigint = await withAbort(
+      usdc.allowance(consumer, this.cfg.vaultAddress),
+      signal
+    );
     if (allowance < shortfall) {
-      const aTx = await usdc.approve(this.cfg.vaultAddress, MaxUint256);
-      await aTx.wait();
+      throwIfAborted(signal);
+      const aTx = await withAbort(usdc.approve(this.cfg.vaultAddress, MaxUint256), signal);
+      await withAbort(aTx.wait(), signal);
     }
+    throwIfAborted(signal);
     const vault = new Contract(this.cfg.vaultAddress, VAULT_ABI, w);
-    const tx = await vault.deposit(shortfall, await this.sessionAddress());
-    await tx.wait();
+    const sessionAddress = await withAbort(this.sessionAddress(), signal);
+    throwIfAborted(signal);
+    const tx = await withAbort(vault.deposit(shortfall, sessionAddress), signal);
+    await withAbort(tx.wait(), signal);
     return tx.hash as string;
   }
 
@@ -903,13 +1103,13 @@ export interface VaultOperatorPin {
 export async function selectVaultOperator(
   relayUrl: string,
   model: string,
-  opts: { teeOnly?: boolean; maxPriceUsdPerMtok?: number } = {}
+  opts: { teeOnly?: boolean; maxPriceUsdPerMtok?: number; signal?: AbortSignal } = {}
 ): Promise<VaultOperatorPin | null> {
   const relayBase = relayUrl.replace(/\/+$/, "");
-  const { teeOnly = false, maxPriceUsdPerMtok } = opts;
+  const { teeOnly = false, maxPriceUsdPerMtok, signal } = opts;
   try {
     const url = `${relayBase}/v1/operators` + (teeOnly ? "?tee=1" : "");
-    const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+    const res = await fetch(url, { signal: signalWithTimeout(signal, 10_000) });
     if (!res.ok) return null;
     const { operators } = (await res.json()) as {
       operators: Array<{
@@ -934,6 +1134,7 @@ export async function selectVaultOperator(
       encryptionPubkey: operator.encryptionPubkey ?? null,
     };
   } catch {
+    throwIfAborted(signal);
     return null;
   }
 }
@@ -1041,6 +1242,7 @@ export async function payInference(opts: PayInferenceOptions): Promise<Inference
   const pin = await selectVaultOperator(relayBase, model, {
     teeOnly: opts.teeOnly,
     maxPriceUsdPerMtok: opts.maxPriceUsdPerMtok,
+    signal: opts.signal,
   });
   if (!pin) {
     throw new Error(
@@ -1053,13 +1255,13 @@ export async function payInference(opts: PayInferenceOptions): Promise<Inference
   // Shared reasoning headroom keeps reservation and operator gate equal (invariant #7).
   const estTokens = estimateReservationTokens(opts.body);
   const estCost = withReservationMargin(priceTokens(pin.priceUsdPerMtok, estTokens));
-  let { ops, keyEpoch } = await client.ensureReservation(pin.address, estCost);
+  let { ops, keyEpoch } = await client.ensureReservation(pin.address, estCost, opts.signal);
 
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     "x-halo-payment-mode": "vault",
     "x-halo-operator": pin.address,
-    "x-halo-vault-consumer": await client.consumer(),
+    "x-halo-vault-consumer": await withAbort(client.consumer(), opts.signal),
     "x-halo-max-price": String(pin.priceUsdPerMtok),
   };
   if (opts.teeOnly) headers["x-halo-tee"] = "1";
@@ -1086,7 +1288,7 @@ export async function payInference(opts: PayInferenceOptions): Promise<Inference
     opts.log?.(
       `vault reservation was below the operator ceiling; reserving ${required} base units and retrying (attempt ${attempt + 1}/${MAX_VAULT_RESERVATION_ATTEMPTS})`
     );
-    ({ ops, keyEpoch } = await client.ensureReservation(pin.address, required));
+    ({ ops, keyEpoch } = await client.ensureReservation(pin.address, required, opts.signal));
     res = await send();
     text = await res.text();
   }

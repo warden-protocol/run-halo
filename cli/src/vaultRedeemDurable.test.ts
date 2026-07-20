@@ -10,6 +10,12 @@ import { VaultConsumeClient, type OpsState } from "./vault-consume";
 
 const OP = "0x2222222222222222222222222222222222222222";
 const OPS: OpsState = { locked: 100_000n, redeemed: 0n, expiry: 9_999_999_999n, created: 0n, cycle: 1n };
+const confirmed = () => ({
+  status: "confirmed",
+  transaction: `0x${"a".repeat(64)}`,
+  cumulative: "1000",
+  cycle: "1",
+});
 
 function mockFacilitator(handler: (n: number) => { status: number; body: unknown }) {
   let n = 0;
@@ -58,7 +64,7 @@ test("a pending redeem persists to disk and a fresh client resumes + settles it"
     down.close();
   }
 
-  const up = await mockFacilitator(() => ({ status: 200, body: { hash: "0xok" } }));
+  const up = await mockFacilitator(() => ({ status: 200, body: confirmed() }));
   try {
     const b = client(up.url, store);
     assert.equal(b.pendingRedeemCount, 0, "fresh client starts empty (in-memory)");
@@ -122,7 +128,7 @@ test("stale persisted entry (cycle moved on) is dropped on resume, not retried f
 test("a truncated/corrupt pending file is skipped, not fatal, on resume", async () => {
   const store = path.join(os.tmpdir(), `halo-pending-corrupt-${process.pid}-${Date.now()}.json`);
   fs.writeFileSync(store, '[{"key":"0x2222:1","operator":"0x2222","cumu');
-  const fac = await mockFacilitator(() => ({ status: 200, body: { hash: "0xok" } }));
+  const fac = await mockFacilitator(() => ({ status: 200, body: confirmed() }));
   try {
     const c = client(fac.url, store);
     c.resumePendingRedeems();

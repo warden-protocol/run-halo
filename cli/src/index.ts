@@ -10,6 +10,7 @@ import { cmdVault } from "./commands/vault";
 import { HALO_VERSION } from "./version";
 import { checkAndApplyUpdate, restartIntoManagedInstall } from "./update";
 import { shouldPreRunUpdate } from "./commandGating";
+import { parseFlags } from "./flags";
 
 // Fail before dispatch because unsupported Node versions can corrupt setup state mid-command.
 const NODE_MAJOR = parseInt(process.versions.node.split(".")[0], 10);
@@ -32,6 +33,7 @@ halo — Halo operator + payer CLI
     --api-key <key>            provider API key (paid providers only)
     --models <a,b,c>           comma-separated model ids to advertise
     --image-models <a,b,c>     subset of --models priced per returned image (requires --image-price)
+    --image-edit-models <a,b>  exact subset of image models explicitly opted into encrypted editing (OpenRouter adapter)
     --margin <n>               margin pricing: n% over upstream (e.g. 20) — chat/completion models
     --flat <n>                 flat pricing: USD per 1K tokens (e.g. 0.0005) — chat/completion models
     --image-price <n>          per-image overlay: USD per returned image (e.g. 0.02); requires --image-models; composes with --margin/--flat
@@ -48,7 +50,7 @@ halo — Halo operator + payer CLI
     --key-backup <m>           file|skip — skip the private-key backup prompt. Unattended mode defaults to skip.
     --consume / --no-consume   opt in/out of a consumer profile non-interactively (defaults for halo consume)
     --consume-model <id>       default model when a consume request omits one
-    --consume-allow <a,b,c>    models you'll pay for ("" or "any" = no limit)
+    --consume-allow <a,b,c>    models you'll pay for ("" or "any" = no chat/generation limit; edits require an explicit allowlist)
     --consume-max-usdc <n>     per-request spend ceiling in USD (the consumer cost guard)
     --consume-port <n>         local consume endpoint port (default 8799)
 
@@ -60,10 +62,10 @@ halo — Halo operator + payer CLI
     --api-key <secret>         require this bearer token on /v1/* requests
     --max-usdc <n>             per-request spend ceiling in USD (default 0.10)
     --keystore <path>          wallet keystore to pay from (default: operator keystore)
-    --confidential             route only to TEE operators, encrypt to the reported TEE key, and require the response signer to match the attested signer
+    --confidential             require TEE routing for chat; image edits fail closed because no TEE edit adapter exists
     --tee-base-url <url>       TEE provider attestation endpoint (default https://cloud-api.near.ai/v1)
     --no-attestation-verify    DEBUG: skip the DCAP hardware attestation check (signature-only); not recommended
-    --no-e2e                   disable operator end-to-end encryption (sends the prompt to the relay in plaintext)
+    --no-e2e                   disable optional operator E2E for chat completions (sends that prompt to the relay in plaintext); image routes still require encrypted media
     --budget-usdc <n>          cumulative spend cap (USD) for this run — bounds an agent's total spend across many requests (0/unset = uncapped). Raise at runtime: POST /v1/budget {"limitUsd": N}
     --budget-warn-pct <0-1>    warn (X-Halo-Budget-Warning header) at this fraction of the budget (default 0.8)
     --vault-deposit <usd>      auto-managed: top the vault up to this from the wallet's USDC on startup (needs a little ETH for the deposit tx)
@@ -81,27 +83,6 @@ halo — Halo operator + payer CLI
                                                    (set HALO_PASSPHRASE first, or use a --no-wallet-passphrase keystore)
 
 `;
-
-interface Flags {
-  [key: string]: string | boolean;
-}
-
-function parseFlags(argv: string[]): Flags {
-  const out: Flags = {};
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (!a.startsWith("--")) continue;
-    const key = a.slice(2);
-    const next = argv[i + 1];
-    if (next && !next.startsWith("--")) {
-      out[key] = next;
-      i++;
-    } else {
-      out[key] = true;
-    }
-  }
-  return out;
-}
 
 async function main(): Promise<void> {
   const [, , cmd, ...rest] = process.argv;
@@ -157,6 +138,10 @@ async function main(): Promise<void> {
         apiKey: typeof flags["api-key"] === "string" ? flags["api-key"] : undefined,
         models: typeof flags.models === "string" ? flags.models : undefined,
         imageModels: typeof flags["image-models"] === "string" ? flags["image-models"] : undefined,
+        imageEditModels:
+          typeof flags["image-edit-models"] === "string"
+            ? flags["image-edit-models"]
+            : undefined,
         margin: typeof flags.margin === "string" ? Number(flags.margin) : undefined,
         flat: typeof flags.flat === "string" ? Number(flags.flat) : undefined,
         imagePrice:

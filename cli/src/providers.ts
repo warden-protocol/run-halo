@@ -1,4 +1,5 @@
 export type ProviderWireFormat = "openai-compat" | "anthropic";
+export type ImageEditAdapter = "openrouter-images";
 
 export interface ProviderPreset {
   slug: string;
@@ -14,6 +15,8 @@ export interface ProviderPreset {
   wire?: ProviderWireFormat;
   /** OpenAI-compatible image generation path, when this provider supports it. */
   imageEndpointPath?: string;
+  /** Tested inline image-edit wire adapter. Omission means editing is unsupported. */
+  imageEditAdapter?: ImageEditAdapter;
   defaultMarginPercent: number;
 }
 
@@ -78,6 +81,7 @@ export const PROVIDER_PRESETS: Record<string, ProviderPreset> = {
     baseUrl: "https://openrouter.ai/api/v1",
     requiresApiKey: true,
     imageEndpointPath: "/images/generations",
+    imageEditAdapter: "openrouter-images",
     defaultMarginPercent: 30,
   },
   venice: {
@@ -144,6 +148,11 @@ export function wireFormatFor(slug: string): ProviderWireFormat {
 /** Returns the image-generation path for providers with an inline image API. */
 export function imageEndpointPathFor(slug: string): string | null {
   return PROVIDER_PRESETS[slug]?.imageEndpointPath ?? null;
+}
+
+/** Return only a tested inline edit adapter; unknown/custom slugs do not inherit support. */
+export function imageEditAdapterFor(slug: string): ImageEditAdapter | null {
+  return PROVIDER_PRESETS[slug]?.imageEditAdapter ?? null;
 }
 
 /** True when a provider slug serves inside a hardware TEE (confidential mode).

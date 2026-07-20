@@ -71,6 +71,72 @@ test("pricing guards, empty model ids, and refresh bump remain canonical", () =>
   );
 });
 
+test("image edit v1 plaintext round-trips exact schema and shared bounds", () => {
+  const payload = {
+    prompt: "turn this into a watercolor",
+    n: 2,
+    image: { mime: "image/png", b64_json: Buffer.from([1, 2, 3]).toString("base64") },
+  };
+  const encoded = core.serializeImageEditPlaintext(payload);
+
+  assert.deepEqual(core.parseImageEditPlaintext(encoded), payload);
+  assert.equal(core.IMAGE_EDIT_MAX_INPUT_BYTES, 8 * 1024 * 1024);
+  assert.equal(core.IMAGE_EDIT_MAX_BODY_BYTES, 16 * 1024 * 1024);
+  assert.equal(core.IMAGE_EDIT_MAX_PROMPT_BYTES, 32 * 1024);
+  assert.equal(core.IMAGE_EDIT_MAX_OUTPUT_IMAGES, 10);
+});
+
+test("image edit v1 plaintext rejects non-strict schema, UTF-8, count, mime, and base64", () => {
+  const valid = {
+    prompt: "edit",
+    n: 1,
+    image: { mime: "image/jpeg", b64_json: "/9j/" },
+  };
+  const rejects = [
+    [{ ...valid, extra: true }, "invalid_schema"],
+    [{ ...valid, prompt: "   " }, "invalid_prompt"],
+    [{ ...valid, prompt: "x".repeat(core.IMAGE_EDIT_MAX_PROMPT_BYTES + 1) }, "invalid_prompt"],
+    [{ ...valid, n: 0 }, "invalid_image_count"],
+    [{ ...valid, n: 11 }, "invalid_image_count"],
+    [{ ...valid, n: 1.5 }, "invalid_image_count"],
+    [{ ...valid, image: { ...valid.image, mime: "image/gif" } }, "invalid_image_mime"],
+    [{ ...valid, image: { ...valid.image, extra: true } }, "invalid_schema"],
+    [{ ...valid, image: { ...valid.image, b64_json: "AQ=" } }, "invalid_image_base64"],
+    [{ ...valid, image: { ...valid.image, b64_json: "AR==" } }, "invalid_image_base64"],
+  ];
+
+  for (const [payload, code] of rejects) {
+    assert.throws(
+      () => core.validateImageEditPlaintext(payload),
+      (err) => err instanceof core.ImageEditPlaintextError && err.code === code
+    );
+  }
+  assert.throws(
+    () => core.parseImageEditPlaintext(Uint8Array.from([0xc3, 0x28])),
+    (err) => err instanceof core.ImageEditPlaintextError && err.code === "invalid_utf8"
+  );
+  assert.throws(
+    () => core.parseImageEditPlaintext(Buffer.from("not-json", "utf8")),
+    (err) => err instanceof core.ImageEditPlaintextError && err.code === "invalid_json"
+  );
+});
+
+test("image edit v1 plaintext rejects decoded input above the shared 8 MiB bound", () => {
+  const oversized = {
+    prompt: "edit",
+    n: 1,
+    image: {
+      mime: "image/webp",
+      b64_json: Buffer.alloc(core.IMAGE_EDIT_MAX_INPUT_BYTES + 1).toString("base64"),
+    },
+  };
+
+  assert.throws(
+    () => core.validateImageEditPlaintext(oversized),
+    (err) => err instanceof core.ImageEditPlaintextError && err.code === "image_too_large"
+  );
+});
+
 test("price resolution accepts an exact pricing key outside models and rejects non-finite values", () => {
   assert.equal(
     core.resolveModelPriceUsdPerMtok(["advertised/model"], { "requested/model": 0.002 }, "requested/model"),
@@ -310,6 +376,7 @@ test("shared image vault selection uses exact image capability and positive per-
     models: ["dall-e-3-hd"],
     pricing: { "dall-e-3-hd": 0.001 },
     imageModels: ["dall-e-3-hd"],
+    imageEditModels: ["dall-e-3-hd"],
     imagePricing: { "dall-e-3-hd": 0.03 },
     vaultPayments: true,
   };
@@ -349,6 +416,31 @@ test("shared image vault selection uses exact image capability and positive per-
   assert.equal(selected.selected.operator.address, "0xcheap");
   assert.equal(selected.selected.priceUsdcPerImage, 0.03);
   assert.equal(core.selectVaultImageOperatorFromList([free], "image/free").reason, "free_model");
+
+  const editSelected = core.selectVaultImageOperatorFromList(
+    [expensive, cheap, fuzzyCollision],
+    "dall-e-3-hd",
+    { requireEditCapability: true }
+  );
+  assert.equal(editSelected.reason, "selected");
+  assert.equal(editSelected.selected.operator.address, "0xcheap");
+  assert.equal(
+    core.selectVaultImageOperatorFromList([fuzzyCollision], "dall-e-3", {
+      requireEditCapability: true,
+    }).reason,
+    "no_operator"
+  );
+  assert.equal(
+    core.selectVaultImageOperatorFromList([cheap], "dall-e-3", {
+      requireEditCapability: true,
+    }).reason,
+    "no_operator"
+  );
+});
+
+test("shared image-edit size defaults are stable binary byte ceilings", () => {
+  assert.equal(core.IMAGE_EDIT_MAX_INPUT_BYTES, 8 * 1024 * 1024);
+  assert.equal(core.IMAGE_EDIT_MAX_BODY_BYTES, 16 * 1024 * 1024);
 });
 
 test("cumulative receipt advancement keeps the high-water ceiling monotonic", () => {

@@ -308,8 +308,9 @@ instead asks "Also use this wallet to consume?" then prompts for these. The fiel
 - `--consume-model <id>` — model used when a request omits `model` (a default).
 - `--consume-allow "a,b,c"` — the **allowlist** of models the agent will pay for; a
   request for anything else is refused (HTTP 403) *before* any payment. `""`/`"any"`
-  = no limit. This is the agent's guard against accidentally paying for an expensive
-  model.
+  = no limit for chat and image generation, but image editing stays disabled until
+  a nonempty allowlist is configured. This is the agent's guard against accidentally
+  paying for an expensive model.
 - `--consume-max-usdc <n>` — per-request spend ceiling in USD (the cost guard).
 - `--consume-port <n>` — local endpoint port (default 8799).
 
@@ -381,16 +382,40 @@ print(resp.choices[0].message.content)
   bound TOTAL spend — this does. See the budget section below.
 - `--budget-warn-pct <0-1>` (default `0.8`) — warn (response header) at this fraction of the budget.
 - `--keystore <path>` — pay from a different wallet than the operator keystore.
-- `--confidential` — **confidential-only mode**: every request is encrypted to the reported TEE
-  key, routed only to a TEE-advertising operator, and checked against the attested reply signer.
-  It fails closed rather than falling back to plaintext; hardware authenticity remains subject to
-  the verifier limitation below.
+- `--confidential` — **confidential-only chat mode**: chat requests are encrypted to the
+  reported TEE key, routed only to a TEE-advertising operator, and checked against the
+  attested reply signer. It fails closed rather than falling back to plaintext; hardware
+  authenticity remains subject to the verifier limitation below. Image generation does not
+  use the TEE chat path. Image edits have no TEE adapter and are rejected when this flag or
+  request-level `X-Halo-Confidential` requires confidential routing.
 - `--tee-base-url <url>` — TEE provider attestation endpoint (default `https://cloud-api.near.ai/v1`).
 
-**Endpoints:** `POST /v1/chat/completions`, `GET /v1/models`, `GET /health`, `GET /v1/account`
+**Endpoints:** `POST /v1/chat/completions`, `POST /v1/images/generations`,
+`POST /v1/images/edits`, `GET /v1/models`, `GET /health`, `GET /v1/account`
 (this consume wallet's League standing — consume points, tier, streak, requests, total USDC
 spent — plus the session budget), `GET|POST /v1/budget` (cumulative cap). Caller routing
-hints (`X-Halo-Routing`, `X-Halo-Operator`, `X-Halo-Max-Price`, …) are forwarded to the relay.
+hints are forwarded by chat completions. Image routes honor `X-Halo-Operator` locally as an exact
+operator pin and construct fixed relay headers; they do not forward `X-Halo-Routing`,
+`X-Halo-Max-Price`, or arbitrary `X-Halo-*` hints.
+
+**Image edits:** send `multipart/form-data` to the plural local route
+`POST /v1/images/edits` with exactly one file field named `image`, nonempty text fields
+`model` and `prompt`, and optional integer `n` from 1 through 10. JSON/base64 and raw-image
+bodies, multiple images, unknown/duplicate fields, and malformed multipart are rejected.
+The complete upload is capped at 16 MiB; the sidecar accepts JPEG, PNG, or WebP, strips
+metadata locally, rejects stripped input above 8 MiB, then caps the serialized encrypted
+relay body at 16 MiB. Its exact v2 body-size preflight runs before operator discovery. Only
+an exact edit-capable Vault operator with a positive per-image price and authenticated
+encryption key is eligible. Success returns inline `b64_json` plus
+`X-Halo-Operator`, `X-Halo-Paid`, `X-Halo-E2E-Encrypted`, and, when paid,
+`X-Halo-Charged-Base`. Caller-validation errors use
+`{ "error": { "message", "type", "code" } }` with a 4xx status for caller, size,
+allowlist, or budget failures. The local route is plural;
+singular `/v1/images/edit` is relay-internal. The relay cannot read the encrypted prompt
+or pixels, but the selected operator and its upstream provider receive the stripped image
+and prompt. Responses and charges are capped to the requested `n`, even if an operator emits
+extra media frames. Global `--confidential` or request-level `X-Halo-Confidential` fails this
+non-TEE edit route closed before discovery or payment.
 
 **Security:** anything that can reach the endpoint can spend the wallet. The default loopback
 bind keeps it to local processes; add `--api-key` (and only then a non-loopback `--host`) for a
@@ -434,9 +459,9 @@ How the agent uses it through `consume`:
 
 1. **Discover** — `GET /v1/models`; each model carries a `confidential` boolean (true ⇒ a TEE
    operator is online for it). Pick a `confidential: true` model.
-2. **Require** — either run the whole endpoint confidential-only with `halo consume
-   --confidential`, OR require it per request by sending the header `X-Halo-Confidential: true`
-   on `/v1/chat/completions`. Either way it **fails closed** — if no TEE operator can serve the
+2. **Require** — either run the chat-completions path confidential-only with `halo consume
+   --confidential`, OR require it per chat request by sending `X-Halo-Confidential: true`
+   on `/v1/chat/completions`. Either way chat **fails closed** — if no TEE operator can serve the
    model, the request errors; it never silently downgrades to plaintext. Before encrypting, the
    sidecar runs the configured DCAP/NVIDIA attestation verification before encryption, cached per
    model. The current transitive verifier has a known missing-QE-Identity limitation
@@ -445,8 +470,9 @@ How the agent uses it through `consume`:
 3. **Assert** — the response carries `X-Halo-Confidential: true` and `X-Halo-TEE-Verified: true`.
    The agent should treat the reply as untrusted unless `X-Halo-TEE-Verified: true` is present
    (it means the reply signature matched the attested signer; it does not independently close the
-   known hardware-verifier limitation). Check the endpoint's default mode with `GET /health` →
-   `{ "confidential": true|false }`.
+   known hardware-verifier limitation). `GET /health` reports the chat default as
+   `{ "confidential": true|false }`; it is not a claim that image generation is TEE-protected.
+   Image edits reject a confidentiality requirement because no TEE edit adapter exists.
 
 ```bash
 # Per-request confidential, asserting the proof:
@@ -460,12 +486,15 @@ curl -s -D - localhost:8799/v1/chat/completions \
 Confidential models are only the handful served by TEE operators, so set the consume
 `--consume-allow` allowlist accordingly (or check `confidential` per model at runtime).
 
-**Even non-confidential consume can be relay-blind:** by default the sidecar end-to-end-encrypts the
-prompt when the chosen operator exposes an authenticated session key, so the **relay** sees ciphertext (the
-operator still decrypts to serve — use confidential mode to hide from the operator too). `--no-e2e`
-disables it. If no authenticated key is available, the request falls back to plaintext. The consume API and frontend share the operator-E2E and attestation paths, including
-the known verifier limitation above, plus the same economic safeguards (per-request cap,
-operator pinning, reservation coverage, metered settlement, and unfunded rejection).
+**Even non-confidential chat can be relay-blind:** by default the sidecar end-to-end-encrypts a
+chat prompt when the chosen operator exposes an authenticated session key, so the **relay** sees
+ciphertext (the operator still decrypts to serve — use confidential chat mode to hide from the
+operator too). For chat, `--no-e2e` disables that layer and a missing authenticated key can fall
+back to plaintext. Image generation and editing instead require an authenticated operator E2E key;
+`--no-e2e` does not make either image route plaintext-capable, and an unusable key fails closed.
+The consume API and frontend share the operator-E2E and attestation paths, including the known
+verifier limitation above, plus the same economic safeguards (per-request cap, operator pinning,
+reservation coverage, metered settlement, and unfunded rejection).
 
 ### Cumulative spend budget — the agent-volume guard
 
@@ -557,7 +586,10 @@ gas for supported reserve/redeem operations; operators do not need to pre-fund s
 - **(consume) streaming** → `stream: true` is now accepted; consume buffers the paid response and
   re-emits it as OpenAI SSE (tokens arrive in one batch at the end, not incrementally).
 - **(consume) error codes (in `error.code`) for programmatic handling:** `insufficient_funds`
-  (fund the wallet) · `over_cap` (raise `--max-usdc` / `X-Halo-Max-Price`) · `no_operator` (no
+  (fund the wallet) · `over_cap` (for chat, raise `--max-usdc` or lower the caller's
+  `X-Halo-Max-Price` to constrain operator selection; image routes ignore that header, so raise
+  `--max-usdc`, request fewer images,
+  or choose a cheaper operator) · `no_operator` (no
   operator serving that model — check `<relay>/v1/models`) · `confidential_setup_failed` (the
   model has no confidential/TEE operator, or the TEE provider is briefly down — retry, pick a
   model where `confidential: true`, or drop `X-Halo-Confidential`). Each error's `message` also
