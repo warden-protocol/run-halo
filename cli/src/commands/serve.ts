@@ -23,6 +23,7 @@ import {
   imageEndpointPathFor,
   wireFormatFor,
   isTeeProviderSlug,
+  teeModelsForProviderAnnouncement,
 } from "../providers";
 import {
   anthropicHeaders,
@@ -2293,12 +2294,13 @@ export async function cmdServe(): Promise<void> {
             const announceModels = allConfiguredModels(cfg).filter((m) => !deannounced.has(m));
             const pricing = await buildPricingAnnounce(cfg);
             const imagePricing = buildImagePricingAnnounce(cfg);
-            // Models served by a TEE provider → advertised as confidential-capable
-            // so the relay can classify TEE PER MODEL (a multi-provider operator
-            // may serve openrouter + near; only the near models are confidential).
+            // Confidential capability is per model. Models configured for a
+            // provider's non-TEE image route must not inherit its chat capability.
             const teeModels = providers
-              .filter((p) => isTeeProviderSlug(p.slug) && !isBreakerOpen(p.slug))
-              .flatMap((p) => p.models);
+              .filter((p) => !isBreakerOpen(p.slug))
+              .flatMap((p) =>
+                teeModelsForProviderAnnouncement(p.slug, p.models, p.imageModels)
+              );
             // Also exclude image models whose provider breaker is open, so a
             // broken provider isn't advertised as image-capable.
             const imageModels = providers
