@@ -104,6 +104,182 @@ export function deriveSubKeyPrivateKey(signature: string): string {
 
 export const PRICE_DP = 12;
 export const RESERVATION_PRICE_MARGIN_BPS = 2_000n;
+/** Maximum stripped source image accepted by image-edit consumers. */
+export const IMAGE_EDIT_MAX_INPUT_BYTES = 8 * 1024 * 1024;
+/** Maximum serialized image-edit relay body. */
+export const IMAGE_EDIT_MAX_BODY_BYTES = 16 * 1024 * 1024;
+/** Maximum UTF-8 edit prompt size accepted by the v1 encrypted schema. */
+export const IMAGE_EDIT_MAX_PROMPT_BYTES = 32 * 1024;
+/** Maximum requested outputs in one v1 edit. */
+export const IMAGE_EDIT_MAX_OUTPUT_IMAGES = 10;
+
+export const IMAGE_EDIT_MIME_TYPES = [
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+] as const;
+
+export type ImageEditMimeType = (typeof IMAGE_EDIT_MIME_TYPES)[number];
+
+export interface ImageEditPlaintextV1 {
+  prompt: string;
+  n: number;
+  image: {
+    mime: ImageEditMimeType;
+    b64_json: string;
+  };
+}
+
+export type ImageEditPlaintextErrorCode =
+  | "invalid_utf8"
+  | "invalid_json"
+  | "invalid_schema"
+  | "invalid_prompt"
+  | "invalid_image_count"
+  | "invalid_image_mime"
+  | "invalid_image_base64"
+  | "image_too_large";
+
+export class ImageEditPlaintextError extends Error {
+  readonly code: ImageEditPlaintextErrorCode;
+
+  constructor(code: ImageEditPlaintextErrorCode, message: string) {
+    super(message);
+    this.name = "ImageEditPlaintextError";
+    this.code = code;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasExactKeys(value: Record<string, unknown>, expected: string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const wanted = [...expected].sort();
+  return actual.length === wanted.length && actual.every((key, index) => key === wanted[index]);
+}
+
+const BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/** Return decoded bytes only for canonical padded RFC 4648 base64. */
+export function canonicalBase64DecodedLength(value: string): number | null {
+  if (
+    value.length === 0 ||
+    value.length % 4 !== 0 ||
+    /[\r\n]/.test(value) ||
+    !/^[A-Za-z0-9+/]*={0,2}$/.test(value)
+  ) {
+    return null;
+  }
+  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
+  const dataLength = value.length - padding;
+  if (dataLength === 0) return null;
+
+  // Reject non-zero unused bits so one byte string has one canonical spelling.
+  if (padding === 2) {
+    const sextet = BASE64_ALPHABET.indexOf(value[dataLength - 1]);
+    if (sextet < 0 || (sextet & 0x0f) !== 0) return null;
+  } else if (padding === 1) {
+    const sextet = BASE64_ALPHABET.indexOf(value[dataLength - 1]);
+    if (sextet < 0 || (sextet & 0x03) !== 0) return null;
+  }
+  return (value.length / 4) * 3 - padding;
+}
+
+/** Validate the exact, one-source-image v1 edit plaintext object. */
+export function validateImageEditPlaintext(value: unknown): ImageEditPlaintextV1 {
+  if (!isRecord(value) || !hasExactKeys(value, ["prompt", "n", "image"])) {
+    throw new ImageEditPlaintextError(
+      "invalid_schema",
+      "image edit plaintext must contain exactly prompt, n, and image"
+    );
+  }
+  if (typeof value.prompt !== "string" || value.prompt.trim().length === 0) {
+    throw new ImageEditPlaintextError("invalid_prompt", "image edit prompt must be non-empty");
+  }
+  if (new TextEncoder().encode(value.prompt).length > IMAGE_EDIT_MAX_PROMPT_BYTES) {
+    throw new ImageEditPlaintextError(
+      "invalid_prompt",
+      `image edit prompt exceeds ${IMAGE_EDIT_MAX_PROMPT_BYTES} UTF-8 bytes`
+    );
+  }
+  if (
+    typeof value.n !== "number" ||
+    !Number.isInteger(value.n) ||
+    value.n < 1 ||
+    value.n > IMAGE_EDIT_MAX_OUTPUT_IMAGES
+  ) {
+    throw new ImageEditPlaintextError(
+      "invalid_image_count",
+      `image edit n must be an integer from 1 to ${IMAGE_EDIT_MAX_OUTPUT_IMAGES}`
+    );
+  }
+  if (!isRecord(value.image) || !hasExactKeys(value.image, ["mime", "b64_json"])) {
+    throw new ImageEditPlaintextError(
+      "invalid_schema",
+      "image edit image must contain exactly mime and b64_json"
+    );
+  }
+  if (
+    typeof value.image.mime !== "string" ||
+    !(IMAGE_EDIT_MIME_TYPES as readonly string[]).includes(value.image.mime)
+  ) {
+    throw new ImageEditPlaintextError(
+      "invalid_image_mime",
+      `image edit mime must be one of ${IMAGE_EDIT_MIME_TYPES.join(", ")}`
+    );
+  }
+  if (typeof value.image.b64_json !== "string") {
+    throw new ImageEditPlaintextError(
+      "invalid_image_base64",
+      "image edit b64_json must be canonical padded base64"
+    );
+  }
+  const decodedLength = canonicalBase64DecodedLength(value.image.b64_json);
+  if (decodedLength === null) {
+    throw new ImageEditPlaintextError(
+      "invalid_image_base64",
+      "image edit b64_json must be canonical padded base64"
+    );
+  }
+  if (decodedLength > IMAGE_EDIT_MAX_INPUT_BYTES) {
+    throw new ImageEditPlaintextError(
+      "image_too_large",
+      `image edit source exceeds ${IMAGE_EDIT_MAX_INPUT_BYTES} decoded bytes`
+    );
+  }
+  return {
+    prompt: value.prompt,
+    n: value.n,
+    image: {
+      mime: value.image.mime as ImageEditMimeType,
+      b64_json: value.image.b64_json,
+    },
+  };
+}
+
+/** Decode strict UTF-8 JSON and validate the v1 edit plaintext. */
+export function parseImageEditPlaintext(bytes: Uint8Array): ImageEditPlaintextV1 {
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new ImageEditPlaintextError("invalid_utf8", "image edit plaintext is not valid UTF-8");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new ImageEditPlaintextError("invalid_json", "image edit plaintext is not valid JSON");
+  }
+  return validateImageEditPlaintext(parsed);
+}
+
+/** Validate and encode the canonical v1 edit plaintext for v2 encryption. */
+export function serializeImageEditPlaintext(value: unknown): Uint8Array {
+  return new TextEncoder().encode(JSON.stringify(validateImageEditPlaintext(value)));
+}
 
 /** USD-per-1M-tokens to USDC base-unit cost, rounded up. */
 export function priceTokens(usdPerMtok: number, tokens: number): bigint {
@@ -574,6 +750,7 @@ export interface VaultOperatorAdvertisement {
   models: string[];
   pricing?: Record<string, number>;
   imageModels?: string[];
+  imageEditModels?: string[];
   imagePricing?: Record<string, number>;
   tee?: boolean;
   teeModels?: string[];
@@ -715,13 +892,14 @@ export function selectVaultOperatorFromList<T extends VaultOperatorAdvertisement
   return { selected, candidates: withinPrice, reason: "selected" };
 }
 
-/** Select an image-capable vault operator by EXACT imageModels match (never fuzzy matchesModel); missing positive image price is unselectable, never falls back to token pricing (invariant #7). */
+/** Select an image-capable vault operator by exact imageModels match and, when requested, exact imageEditModels match. Missing positive image price is unselectable and never falls back to token pricing (invariant #7). */
 export function selectVaultImageOperatorFromList<T extends VaultOperatorAdvertisement>(
   operators: T[],
   model: string,
   opts: {
     requireAddress?: string;
     randomizeCheapestTies?: boolean;
+    requireEditCapability?: boolean;
   } = {}
 ): VaultImageOperatorSelection<T> {
   const want = opts.requireAddress?.toLowerCase();
@@ -732,7 +910,11 @@ export function selectVaultImageOperatorFromList<T extends VaultOperatorAdvertis
     return { selected: null, candidates: [], reason: "pinned_not_found" };
   }
 
-  const modelPool = addressPool.filter((operator) => operator.imageModels?.includes(model));
+  const modelPool = addressPool.filter(
+    (operator) =>
+      operator.imageModels?.includes(model) &&
+      (!opts.requireEditCapability || operator.imageEditModels?.includes(model))
+  );
   if (modelPool.length === 0) {
     return { selected: null, candidates: [], reason: "no_operator" };
   }

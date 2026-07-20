@@ -2,7 +2,8 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import path from "path";
 import type { EncryptedSecret } from "./secret";
-import { matchesModel } from "@halo/vault-core";
+import { matchesModel, priceImages } from "@halo/vault-core";
+import { imageEditAdapterFor } from "./providers";
 
 export type PricingMode = "margin" | "flat";
 
@@ -25,6 +26,8 @@ export interface ProviderConfig {
   models: string[];
   /** Subset of `models` priced per returned image; a non-image model here settles at $0 (invariant #2: never bill an unmeterable response). */
   imageModels?: string[];
+  /** Explicit exact subset of `imageModels` accepted by this provider's tested edit adapter. */
+  imageEditModels?: string[];
   /** Provider-specific pricing, falling back to top-level pricing. */
   pricing?: PricingConfig;
 }
@@ -111,12 +114,28 @@ export function providerServesConfiguredImageModel(
   return (provider.imageModels ?? []).includes(model);
 }
 
+export function providerServesConfiguredImageEditModel(
+  provider: ProviderConfig,
+  model: string
+): boolean {
+  return (provider.imageEditModels ?? []).includes(model);
+}
+
 /** Per-image rate for `model`, or null if it isn't a configured image model; the provider's `usdcPerImage` overrides the operator-wide default. */
 export function imagePriceForModel(cfg: HaloConfig, model: string): number | null {
   const provider = providerForModel(configProviders(cfg), model);
   if (!providerServesConfiguredImageModel(provider, model)) return null;
   const price = provider.pricing?.usdcPerImage ?? cfg.pricing.usdcPerImage;
   return typeof price === "number" && Number.isFinite(price) && price >= 0 ? price : null;
+}
+
+export function isPositiveImagePriceRepresentable(price: unknown): price is number {
+  if (typeof price !== "number" || !Number.isFinite(price) || price <= 0) return false;
+  try {
+    return priceImages(price, 1) > 0n;
+  } catch {
+    return false;
+  }
 }
 
 const VALID_PRICING_MODES: PricingMode[] = ["margin", "flat"];
@@ -133,19 +152,44 @@ export function validateConfig(cfg: HaloConfig): HaloConfig {
       );
     }
     const imageModels = provider.imageModels ?? [];
-    if (imageModels.length === 0) continue;
-
+    const imageEditModels = provider.imageEditModels ?? [];
     const price = provider.pricing?.usdcPerImage ?? cfg.pricing.usdcPerImage;
-    if (!Number.isFinite(price) || (price ?? -1) < 0) {
-      throw new Error(
-        `imageModels for provider "${provider.slug}" requires a finite non-negative usdcPerImage`
-      );
-    }
-    for (const imageModel of imageModels) {
-      if (!provider.models.includes(imageModel)) {
+    if (imageModels.length > 0) {
+      if (!Number.isFinite(price) || (price ?? -1) < 0) {
         throw new Error(
-          `imageModels entry "${imageModel}" must also be listed in provider "${provider.slug}" models`
+          `imageModels for provider "${provider.slug}" requires a finite non-negative usdcPerImage`
         );
+      }
+      for (const imageModel of imageModels) {
+        if (!provider.models.includes(imageModel)) {
+          throw new Error(
+            `imageModels entry "${imageModel}" must also be listed in provider "${provider.slug}" models`
+          );
+        }
+      }
+    }
+    if (imageEditModels.length > 0) {
+      if (imageEditAdapterFor(provider.slug) === null) {
+        throw new Error(
+          `imageEditModels for provider "${provider.slug}" requires a supported inline image-edit adapter`
+        );
+      }
+      if (!isPositiveImagePriceRepresentable(price)) {
+        throw new Error(
+          `imageEditModels for provider "${provider.slug}" requires a finite positive usdcPerImage that remains non-zero at vault pricing precision`
+        );
+      }
+      for (const editModel of imageEditModels) {
+        if (!provider.models.includes(editModel)) {
+          throw new Error(
+            `imageEditModels entry "${editModel}" must also be listed in provider "${provider.slug}" models`
+          );
+        }
+        if (!imageModels.includes(editModel)) {
+          throw new Error(
+            `imageEditModels entry "${editModel}" must also be listed in provider "${provider.slug}" imageModels`
+          );
+        }
       }
     }
   }

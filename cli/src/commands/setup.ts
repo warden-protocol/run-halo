@@ -16,7 +16,7 @@ import {
   saveConfig,
 } from "../config";
 import { generateAndEncrypt, importAndEncrypt, loadWallet, writeKeystore } from "../wallet";
-import { detectModels, PROVIDER_PRESETS } from "../providers";
+import { detectModels, imageEditAdapterFor, PROVIDER_PRESETS } from "../providers";
 import { providerSupportsMargin } from "../pricing";
 import { encryptSecret, isEncryptedSecret } from "../secret";
 
@@ -26,6 +26,7 @@ export interface SetupFlags {
   apiKey?: string;
   models?: string;
   imageModels?: string; // subset of models priced per image
+  imageEditModels?: string; // explicit subset accepted for image+prompt edits
   margin?: number;
   flat?: number;
   imagePrice?: number;
@@ -163,6 +164,7 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
   if (
     flags.provider ||
     flags.models ||
+    flags.imageEditModels !== undefined ||
     flags.margin !== undefined ||
     flags.flat !== undefined ||
     flags.imagePrice !== undefined
@@ -379,6 +381,7 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
     flags.provider ||
     flags.models ||
     flags.imageModels ||
+    flags.imageEditModels !== undefined ||
     flags.margin !== undefined ||
     flags.flat !== undefined ||
     flags.imagePrice !== undefined
@@ -478,6 +481,9 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
   // together (no default) so no chat model is silently reclassified as image-priced.
   let usdcPerImage: number | undefined;
   let pricedImageModels: string[] = [];
+  let imageOverlayGivenThisRun =
+    flags.imagePrice !== undefined || flags.imageModels !== undefined;
+  let imageEditOverlayGivenThisRun = flags.imageEditModels !== undefined;
   if (flags.imagePrice !== undefined || flags.imageModels !== undefined) {
     if (flags.imagePrice === undefined) {
       throw new Error("--image-models requires --image-price");
@@ -505,6 +511,7 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
       },
       cancel
     );
+    imageOverlayGivenThisRun = true;
     if (wantsImagePricing) {
       const { imgModels } = await prompts(
         {
@@ -532,11 +539,64 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
         cancel
       );
       usdcPerImage = usd;
+    } else {
+      imageEditOverlayGivenThisRun = true;
     }
   }
   for (const imageModel of pricedImageModels) {
     if (!models.includes(imageModel)) {
       throw new Error(`--image-models entry "${imageModel}" must also be listed in --models`);
+    }
+  }
+
+  let configuredImageEditModels: string[] = [];
+  if (flags.imageEditModels !== undefined) {
+    configuredImageEditModels = flags.imageEditModels
+      .split(",")
+      .map((s: string) => s.trim())
+      .filter(Boolean);
+    if (configuredImageEditModels.length > 0 && imageEditAdapterFor(slug) === null) {
+      throw new Error(
+        `--image-edit-models is unsupported for provider "${slug}"; only providers with a tested inline edit adapter may opt in`
+      );
+    }
+    console.log(
+      configuredImageEditModels.length > 0
+        ? `  image editing: ${configuredImageEditModels.join(", ")} (from --image-edit-models)`
+        : "  image editing: disabled (from empty --image-edit-models)"
+    );
+  } else if (
+    !drivenMode &&
+    pricedImageModels.length > 0 &&
+    imageEditAdapterFor(slug) !== null
+  ) {
+    const { wantsImageEditing } = await prompts(
+      {
+        type: "confirm",
+        name: "wantsImageEditing",
+        message: "Accept encrypted image+prompt edits for an exact subset of these image models?",
+        initial: false,
+      },
+      cancel
+    );
+    imageEditOverlayGivenThisRun = true;
+    if (wantsImageEditing) {
+      const { editModels } = await prompts(
+        {
+          type: "multiselect",
+          name: "editModels",
+          message: "Image models to opt into editing",
+          choices: pricedImageModels.map((model) => ({ title: model, value: model })),
+          min: 1,
+        },
+        cancel
+      );
+      configuredImageEditModels = editModels;
+    }
+  }
+  for (const editModel of configuredImageEditModels) {
+    if (!models.includes(editModel)) {
+      throw new Error(`--image-edit-models entry "${editModel}" must also be listed in --models`);
     }
   }
 
@@ -663,8 +723,6 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
     const existingProvider = at >= 0 ? existingList[at] : undefined;
     // Re-running --add-provider without --image-* must not drop the
     // existing per-image overlay.
-    const imageOverlayGivenThisRun =
-      flags.imagePrice !== undefined || flags.imageModels !== undefined;
     const preserved = imageOverlayGivenThisRun ? undefined : existingProvider;
     const effectiveImageModels = imageOverlayGivenThisRun
       ? pricedImageModels
@@ -672,6 +730,9 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
     const effectiveUsdcPerImage = imageOverlayGivenThisRun
       ? usdcPerImage
       : preserved?.pricing?.usdcPerImage ?? usdcPerImage;
+    const effectiveImageEditModels = imageEditOverlayGivenThisRun
+      ? configuredImageEditModels
+      : existingProvider?.imageEditModels ?? [];
     // Preserve existing token pricing only for an existing-slug re-run
     // without --margin/--flat; a brand-new slug uses the driven-mode default,
     // never the primary's cfg.pricing (which would misprice the gateway).
@@ -686,6 +747,9 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
       apiKey: finalApiKey,
       models,
       ...(effectiveImageModels.length > 0 ? { imageModels: effectiveImageModels } : {}),
+      ...(effectiveImageEditModels.length > 0
+        ? { imageEditModels: effectiveImageEditModels }
+        : {}),
       pricing: {
         mode: effectiveTokenPricing.mode,
         marginPercent: effectiveTokenPricing.marginPercent,
@@ -718,6 +782,14 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
 
   const consume = await resolveConsumeConfig(flags, models, existingConfig, cancel);
 
+  for (const editModel of configuredImageEditModels) {
+    if (!pricedImageModels.includes(editModel)) {
+      throw new Error(
+        `--image-edit-models entry "${editModel}" must also be listed in --image-models`
+      );
+    }
+  }
+
   const cfg: HaloConfig = {
     version: 1,
     relayUrl,
@@ -736,6 +808,9 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
       apiKey: finalApiKey,
       models,
       ...(pricedImageModels.length > 0 ? { imageModels: pricedImageModels } : {}),
+      ...(configuredImageEditModels.length > 0
+        ? { imageEditModels: configuredImageEditModels }
+        : {}),
     },
     pricing: {
       mode: pricingMode,
@@ -774,6 +849,9 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
     console.log(
       `  Image:       $${(usdcPerImage ?? 0).toFixed(4)}/image for ${pricedImageModels.join(", ")}`
     );
+  }
+  if (configuredImageEditModels.length > 0) {
+    console.log(`  Edits:       ${configuredImageEditModels.join(", ")}`);
   }
   console.log(`  Relay:       ${relayUrl}`);
   console.log(`  Indexer:     ${indexerUrl}`);

@@ -1469,6 +1469,100 @@ test("ensureReservation serves a covered near-expiry reservation with the whole 
   assert.equal(result.keyEpoch, 7n);
 });
 
+test("ensureReservation rejects an aborted queued job promptly and skips its vault work", async () => {
+  const client = new HaloVaultClient(
+    { getAddress: async () => "0x0000000000000000000000000000000000000068" },
+    { facilitatorUrl: "https://facilitator.invalid", rpcUrl: "http://127.0.0.1:1", chainId: 8453 }
+  );
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => {
+    releaseFirst = resolve;
+  });
+  const calls = [];
+  client.ensureColdReservation = async (operator) => {
+    calls.push(operator);
+    await firstGate;
+    return {
+      ops: { locked: 1_000n, redeemed: 0n, expiry: 0n, created: 0n, cycle: 1n },
+      keyEpoch: 1n,
+    };
+  };
+
+  const first = client.ensureReservation(
+    "0x00000000000000000000000000000000000000a1",
+    1_000n
+  );
+  while (calls.length === 0) await new Promise((resolve) => setImmediate(resolve));
+  const controller = new AbortController();
+  const second = client.ensureReservation(
+    "0x00000000000000000000000000000000000000a2",
+    1_000n,
+    controller.signal
+  );
+  controller.abort(new Error("client disconnected"));
+  await assert.rejects(
+    Promise.race([
+      second,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("queued abort timed out")), 500)
+      ),
+    ]),
+    /client disconnected/
+  );
+  releaseFirst();
+  await first;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(calls, ["0x00000000000000000000000000000000000000a1"]);
+});
+
+test("ensureReservation propagates abort to in-flight vault reads before mutation", async () => {
+  const client = new HaloVaultClient(
+    { getAddress: async () => "0x0000000000000000000000000000000000000069" },
+    { facilitatorUrl: "https://facilitator.invalid", rpcUrl: "http://127.0.0.1:1", chainId: 8453 }
+  );
+  let readStarted;
+  const started = new Promise((resolve) => {
+    readStarted = resolve;
+  });
+  client.readVaultState = async (signal) => {
+    assert.ok(signal);
+    readStarted();
+    return new Promise((_, reject) => {
+      const abort = () => reject(signal.reason);
+      signal.addEventListener("abort", abort, { once: true });
+      if (signal.aborted) abort();
+    });
+  };
+  client.readOps = async (_operator, signal) => {
+    assert.ok(signal);
+    return { locked: 0n, redeemed: 0n, expiry: 0n, created: 0n, cycle: 0n };
+  };
+  let reserveAttempted = false;
+  client.postReserve = async () => {
+    reserveAttempted = true;
+    return "0xreserve";
+  };
+
+  const controller = new AbortController();
+  const reservation = client.ensureReservation(
+    "0x00000000000000000000000000000000000000a3",
+    1_000n,
+    controller.signal
+  );
+  await started;
+  controller.abort(new Error("client disconnected"));
+  await assert.rejects(
+    Promise.race([
+      reservation,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("in-flight abort timed out")), 500)
+      ),
+    ]),
+    /client disconnected/
+  );
+  assert.equal(reserveAttempted, false);
+});
+
 test("ensureReservation still hard-fails when the reservation genuinely can't cover the request", async () => {
   const client = new HaloVaultClient(
     { getAddress: async () => "0x0000000000000000000000000000000000000062" },
