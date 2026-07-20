@@ -156,8 +156,8 @@ pay settlement gas.
 **Hosted gateways** (operator has an API key, just wants to monetize quota):
 - **OpenRouter** (100+ models through one key)
 - **OpenAI, Anthropic, Venice, Together, Fireworks, Groq**
-- **NEAR AI Cloud** (`near` — **confidential TEE** inference; serving NEAR models makes them
-  available to consumers as confidential, see the consume Confidential section)
+- **NEAR AI Cloud** (`near` — **confidential TEE chat**; image generation uses the non-TEE
+  catalog gateway, so configured image models are not advertised as confidential)
 - **Custom** (any OpenAI-compatible endpoint + URL)
 
 **Multiple providers at once.** An operator isn't limited to one gateway — add more with
@@ -385,9 +385,9 @@ print(resp.choices[0].message.content)
 - `--confidential` — **confidential-only chat mode**: chat requests are encrypted to the
   reported TEE key, routed only to a TEE-advertising operator, and checked against the
   attested reply signer. It fails closed rather than falling back to plaintext; hardware
-  authenticity remains subject to the verifier limitation below. Image generation does not
-  use the TEE chat path. Image edits have no TEE adapter and are rejected when this flag or
-  request-level `X-Halo-Confidential` requires confidential routing.
+  authenticity remains subject to the verifier limitation below. Image generation, including
+  NEAR image generation, does not use the TEE chat path. Image edits have no TEE adapter and are
+  rejected when this flag or request-level `X-Halo-Confidential` requires confidential routing.
 - `--tee-base-url <url>` — TEE provider attestation endpoint (default `https://cloud-api.near.ai/v1`).
 
 **Endpoints:** `POST /v1/chat/completions`, `POST /v1/images/generations`,

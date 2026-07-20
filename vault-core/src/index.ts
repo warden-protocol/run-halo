@@ -980,7 +980,7 @@ export function selectVaultOperatorFromList<T extends VaultOperatorAdvertisement
   }
 
   const servesTee = (operator: T): boolean =>
-    operator.teeModels && operator.teeModels.length > 0
+    operator.teeModels !== undefined
       ? operator.teeModels.some((advertised) => matchesModel(advertised, model))
       : operator.tee === true;
   const capabilityPool = teeOnly ? vaultPool.filter(servesTee) : vaultPool;

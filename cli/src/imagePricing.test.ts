@@ -159,6 +159,42 @@ test("callUpstreamImage posts to the provider images endpoint and requests inlin
   assert.equal(seenBody.max_completion_tokens, undefined);
 });
 
+test("callUpstreamImage routes NEAR image requests to the catalog gateway", async (t) => {
+  const cfg = baseConfig({
+    provider: {
+      slug: "near",
+      baseUrl: "https://cloud-api.near.ai/v1",
+      apiKey: "near-key",
+      models: ["flux2-klein"],
+      imageModels: ["flux2-klein"],
+    },
+  });
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  let seenUrl = "";
+  let seenAuth = "";
+  globalThis.fetch = (async (url, init) => {
+    seenUrl = String(url);
+    seenAuth = String((init as { headers?: Record<string, string> }).headers?.Authorization ?? "");
+    return new Response(JSON.stringify({ data: [{ b64_json: pngWithText("ok").toString("base64") }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+
+  const upstream = await callUpstreamImage(cfg, undefined, {
+    model: "flux2-klein",
+    prompt: "draw a halo",
+  });
+
+  assert.equal(upstream.status, 200);
+  assert.equal(seenUrl, "https://cloud-api.near.ai/v1/images/generations");
+  assert.equal(seenAuth, "Bearer near-key");
+});
+
 test("URL-only image responses fail closed instead of being fetched", () => {
   assert.throws(
     () => inlineImageBytesFromResponse({ data: [{ url: "https://provider.test/image.png" }] }),

@@ -339,11 +339,34 @@ test("shared vault selection distinguishes free and legacy pinned operators", ()
     pricing: { model: 0 },
     vaultPayments: true,
   };
+  const explicitNonTee = {
+    address: "0xnontee",
+    models: ["model"],
+    pricing: { model: 0.001 },
+    tee: true,
+    teeModels: [],
+    vaultPayments: true,
+  };
+  const legacyTee = {
+    address: "0xlegacytee",
+    models: ["model"],
+    pricing: { model: 0.001 },
+    tee: true,
+    vaultPayments: true,
+  };
   assert.equal(
     core.selectVaultOperatorFromList([legacy], "model", { requireAddress: legacy.address }).reason,
     "pinned_not_vault_capable"
   );
   assert.equal(core.selectVaultOperatorFromList([free], "model").reason, "free_model");
+  assert.equal(
+    core.selectVaultOperatorFromList([explicitNonTee], "model", { teeOnly: true }).reason,
+    "no_tee_operator"
+  );
+  assert.equal(
+    core.selectVaultOperatorFromList([legacyTee], "model", { teeOnly: true }).reason,
+    "selected"
+  );
 });
 
 test("shared image vault selection uses exact image capability and positive per-image pricing", () => {

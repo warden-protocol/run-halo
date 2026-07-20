@@ -15,6 +15,9 @@ export interface ProviderPreset {
   wire?: ProviderWireFormat;
   /** OpenAI-compatible image generation path, when this provider supports it. */
   imageEndpointPath?: string;
+  /** Whether that image endpoint preserves confidential TEE transport.
+   *  Defaults false. */
+  imageGenerationIsTee?: boolean;
   /** Tested inline image-edit wire adapter. Omission means editing is unsupported. */
   imageEditAdapter?: ImageEditAdapter;
   defaultMarginPercent: number;
@@ -96,11 +99,13 @@ export const PROVIDER_PRESETS: Record<string, ProviderPreset> = {
   near: {
     slug: "near",
     // NEAR exposes an OpenAI-compatible catalog; its confidential path uses model-specific endpoints.
-    label: "NEAR AI Cloud (confidential TEE)",
+    label: "NEAR AI Cloud (TEE chat; non-TEE images)",
     baseUrl: "https://cloud-api.near.ai/v1",
     requiresApiKey: true,
     isPrivacy: true,
     isTee: true,
+    imageEndpointPath: "/images/generations",
+    imageGenerationIsTee: false,
     defaultMarginPercent: 20,
   },
   together: {
@@ -150,6 +155,10 @@ export function imageEndpointPathFor(slug: string): string | null {
   return PROVIDER_PRESETS[slug]?.imageEndpointPath ?? null;
 }
 
+export function imageGenerationIsTeeFor(slug: string): boolean {
+  return PROVIDER_PRESETS[slug]?.imageGenerationIsTee === true;
+}
+
 /** Return only a tested inline edit adapter; unknown/custom slugs do not inherit support. */
 export function imageEditAdapterFor(slug: string): ImageEditAdapter | null {
   return PROVIDER_PRESETS[slug]?.imageEditAdapter ?? null;
@@ -159,6 +168,18 @@ export function imageEditAdapterFor(slug: string): ImageEditAdapter | null {
  *  Kept in sync with the relay's TEE_PROVIDERS set. */
 export function isTeeProviderSlug(slug: string): boolean {
   return PROVIDER_PRESETS[slug]?.isTee === true;
+}
+
+/** The relay currently advertises confidentiality per model, not per request modality. */
+export function teeModelsForProviderAnnouncement(
+  slug: string,
+  models: readonly string[],
+  imageModels: readonly string[] = []
+): string[] {
+  if (!isTeeProviderSlug(slug)) return [];
+  if (imageGenerationIsTeeFor(slug)) return [...models];
+  const nonTeeImageModels = new Set(imageModels);
+  return models.filter((model) => !nonTeeImageModels.has(model));
 }
 
 /** Fetch model IDs across Ollama, Anthropic, and OpenAI-compatible catalog shapes. */
