@@ -1,7 +1,7 @@
 {
   "name": "halo-sdk",
   "version": "0.0.1",
-  "description": "x402 client for Halo",
+  "description": "HaloVault client for Halo",
   "license": "Apache-2.0",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

@@ -61,9 +61,16 @@ test("fan-out simulation: 8 operators each lock ≤ 1/8 of remaining free, depos
 const OP = `0x${"a".repeat(40)}`;
 function reclaimHarness(over: {
   grace?: () => Promise<bigint>;
-  ops?: () => Promise<{ locked: bigint; expiry: bigint }>;
+  ops?: () => Promise<{
+    locked: bigint;
+    redeemed: bigint;
+    expiry: bigint;
+    created: bigint;
+    cycle: bigint;
+  }>;
 }): { c: VaultConsumeClient; releases: () => number } {
-  const wallet = { address: `0x${"1".repeat(40)}` } as never;
+  const address = `0x${"1".repeat(40)}`;
+  const wallet = { address, getAddress: async () => address } as never;
   const c = new VaultConsumeClient(wallet, {
     facilitatorUrl: "http://127.0.0.1:0",
     rpcUrl: "http://127.0.0.1:0",
@@ -72,7 +79,9 @@ function reclaimHarness(over: {
   let releases = 0;
   const a = c as unknown as Record<string, unknown>;
   a.redeemGrace = over.grace ?? (async () => 60n);
-  a.readOps = over.ops ?? (async () => ({ locked: 500n, expiry: 1n }));
+  a.readOps =
+    over.ops ??
+    (async () => ({ locked: 500n, redeemed: 0n, expiry: 1n, created: 0n, cycle: 1n }));
   a.postRelease = async () => {
     releases++;
     return "0xhash";
@@ -82,7 +91,9 @@ function reclaimHarness(over: {
 }
 
 test("reclaim: a settled (locked==0) operator is pruned and never released", async () => {
-  const { c, releases } = reclaimHarness({ ops: async () => ({ locked: 0n, expiry: 1n }) });
+  const { c, releases } = reclaimHarness({
+    ops: async () => ({ locked: 0n, redeemed: 0n, expiry: 1n, created: 0n, cycle: 1n }),
+  });
   const released = await c.releaseExpiredReservations();
   assert.equal(released, false);
   assert.equal(releases(), 0, "nothing to reclaim → no release call");

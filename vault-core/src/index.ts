@@ -1,4 +1,11 @@
-import { getBytes, keccak256, parseUnits, type TypedDataDomain } from "ethers";
+import {
+  getAddress,
+  getBytes,
+  isAddress,
+  keccak256,
+  parseUnits,
+  type TypedDataDomain,
+} from "ethers";
 import {
   EIP712_NAME,
   EIP712_VERSION,
@@ -127,6 +134,240 @@ function isUintString(value: unknown): value is string {
 
 function isTransactionHash(value: unknown): value is string {
   return typeof value === "string" && /^0x[0-9a-fA-F]{64}$/.test(value);
+}
+
+export const VAULT_EVENT_VERSION = 2 as const;
+export const MAX_VAULT_EVENT_ID_BYTES = 128;
+export const MAX_VAULT_EVENT_MODEL_BYTES = 256;
+export const MAX_VAULT_EVENT_TOKENS = 10_000_000;
+export const MAX_VAULT_EVENT_DURATION_MS = 86_400_000;
+export const MAX_VAULT_EVENT_AMOUNT_BASE = 1_000_000_000_000n;
+export const MAX_VAULT_EVENT_CHECKPOINT_BASE = (1n << 256n) - 1n;
+export const MAX_VAULT_EVENT_CYCLE = Number.MAX_SAFE_INTEGER;
+export const MAX_VAULT_EVENT_TIMESTAMP_MS = 8_640_000_000_000_000;
+export const MAX_VAULT_EVENT_BODY_BYTES = 64 * 1024;
+export const MAX_VAULT_EVENT_ACK_BYTES = 16 * 1024;
+
+export interface VaultEventV2Unsigned {
+  eventVersion: typeof VAULT_EVENT_VERSION;
+  id: string;
+  operator: string;
+  consumer: string;
+  model: string | null;
+  tokens: number;
+  amountUsdc: string;
+  durationMs: number;
+  timestamp: string;
+  txHash: null;
+  mode: "vault";
+  vaultCycle: number;
+  cumulativeCheckpoint: string;
+}
+
+export interface VaultEventV2 extends VaultEventV2Unsigned {
+  signature: string;
+}
+
+export type VaultEventV2ErrorCode =
+  | "invalid_event_schema"
+  | "invalid_event_version"
+  | "invalid_event_id"
+  | "invalid_operator"
+  | "invalid_consumer"
+  | "invalid_model"
+  | "invalid_tokens"
+  | "invalid_amount"
+  | "invalid_duration"
+  | "invalid_timestamp"
+  | "invalid_tx_hash"
+  | "invalid_mode"
+  | "invalid_vault_cycle"
+  | "invalid_checkpoint"
+  | "invalid_signature";
+
+export type VaultEventV2Validation =
+  | { ok: true; value: VaultEventV2 }
+  | { ok: false; errorCode: VaultEventV2ErrorCode };
+
+function utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
+}
+
+function isCanonicalPositiveUint(value: unknown, max: bigint): value is string {
+  return (
+    typeof value === "string" &&
+    /^[1-9][0-9]*$/.test(value) &&
+    value.length <= max.toString().length &&
+    BigInt(value) <= max
+  );
+}
+
+function normalizedVaultEventV2(
+  value: unknown,
+  requireSignature: boolean
+):
+  | { ok: true; value: VaultEventV2 }
+  | { ok: false; errorCode: VaultEventV2ErrorCode } {
+  if (!isRecord(value)) {
+    return { ok: false, errorCode: "invalid_event_schema" };
+  }
+  const unsignedKeys = [
+    "eventVersion",
+    "id",
+    "operator",
+    "consumer",
+    "model",
+    "tokens",
+    "amountUsdc",
+    "durationMs",
+    "timestamp",
+    "txHash",
+    "mode",
+    "vaultCycle",
+    "cumulativeCheckpoint",
+  ];
+  const expectedKeys = requireSignature ? [...unsignedKeys, "signature"] : unsignedKeys;
+  const actualKeys = Object.keys(value);
+  const hasExpectedShape =
+    actualKeys.length === expectedKeys.length &&
+    expectedKeys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
+  const hasSignedShapeForCanonicalization =
+    !requireSignature &&
+    actualKeys.length === unsignedKeys.length + 1 &&
+    unsignedKeys.every((key) => Object.prototype.hasOwnProperty.call(value, key)) &&
+    Object.prototype.hasOwnProperty.call(value, "signature");
+  if (!hasExpectedShape && !hasSignedShapeForCanonicalization) {
+    return { ok: false, errorCode: "invalid_event_schema" };
+  }
+  if (value.eventVersion !== VAULT_EVENT_VERSION) {
+    return { ok: false, errorCode: "invalid_event_version" };
+  }
+  if (
+    typeof value.id !== "string" ||
+    !/^[A-Za-z0-9_-]+$/.test(value.id) ||
+    utf8Bytes(value.id) > MAX_VAULT_EVENT_ID_BYTES
+  ) {
+    return { ok: false, errorCode: "invalid_event_id" };
+  }
+  if (typeof value.operator !== "string" || !isAddress(value.operator)) {
+    return { ok: false, errorCode: "invalid_operator" };
+  }
+  if (typeof value.consumer !== "string" || !isAddress(value.consumer)) {
+    return { ok: false, errorCode: "invalid_consumer" };
+  }
+  if (
+    value.model !== null &&
+    (typeof value.model !== "string" ||
+      /[\u0000-\u001f\u007f]/.test(value.model) ||
+      utf8Bytes(value.model) > MAX_VAULT_EVENT_MODEL_BYTES)
+  ) {
+    return { ok: false, errorCode: "invalid_model" };
+  }
+  if (
+    typeof value.tokens !== "number" ||
+    !Number.isSafeInteger(value.tokens) ||
+    value.tokens < 0 ||
+    value.tokens > MAX_VAULT_EVENT_TOKENS
+  ) {
+    return { ok: false, errorCode: "invalid_tokens" };
+  }
+  if (!isCanonicalPositiveUint(value.amountUsdc, MAX_VAULT_EVENT_AMOUNT_BASE)) {
+    return { ok: false, errorCode: "invalid_amount" };
+  }
+  if (
+    typeof value.durationMs !== "number" ||
+    !Number.isSafeInteger(value.durationMs) ||
+    value.durationMs < 0 ||
+    value.durationMs > MAX_VAULT_EVENT_DURATION_MS
+  ) {
+    return { ok: false, errorCode: "invalid_duration" };
+  }
+  if (typeof value.timestamp !== "string") {
+    return { ok: false, errorCode: "invalid_timestamp" };
+  }
+  const timestampMs = Date.parse(value.timestamp);
+  if (
+    !Number.isSafeInteger(timestampMs) ||
+    timestampMs <= 0 ||
+    timestampMs > MAX_VAULT_EVENT_TIMESTAMP_MS ||
+    new Date(timestampMs).toISOString() !== value.timestamp
+  ) {
+    return { ok: false, errorCode: "invalid_timestamp" };
+  }
+  if (value.txHash !== null) {
+    return { ok: false, errorCode: "invalid_tx_hash" };
+  }
+  if (value.mode !== "vault") {
+    return { ok: false, errorCode: "invalid_mode" };
+  }
+  if (
+    typeof value.vaultCycle !== "number" ||
+    !Number.isSafeInteger(value.vaultCycle) ||
+    value.vaultCycle <= 0 ||
+    value.vaultCycle > MAX_VAULT_EVENT_CYCLE
+  ) {
+    return { ok: false, errorCode: "invalid_vault_cycle" };
+  }
+  if (!isCanonicalPositiveUint(value.cumulativeCheckpoint, MAX_VAULT_EVENT_CHECKPOINT_BASE)) {
+    return { ok: false, errorCode: "invalid_checkpoint" };
+  }
+  if (BigInt(value.cumulativeCheckpoint) < BigInt(value.amountUsdc)) {
+    return { ok: false, errorCode: "invalid_checkpoint" };
+  }
+  if (
+    requireSignature &&
+    (typeof value.signature !== "string" || !/^0x[0-9a-fA-F]{130}$/.test(value.signature))
+  ) {
+    return { ok: false, errorCode: "invalid_signature" };
+  }
+
+  return {
+    ok: true,
+    value: {
+      eventVersion: VAULT_EVENT_VERSION,
+      id: value.id,
+      operator: getAddress(value.operator).toLowerCase(),
+      consumer: getAddress(value.consumer).toLowerCase(),
+      model: value.model,
+      tokens: value.tokens,
+      amountUsdc: value.amountUsdc,
+      durationMs: value.durationMs,
+      timestamp: value.timestamp,
+      txHash: null,
+      mode: "vault",
+      vaultCycle: value.vaultCycle,
+      cumulativeCheckpoint: value.cumulativeCheckpoint,
+      signature:
+        typeof value.signature === "string" ? value.signature : `0x${"00".repeat(65)}`,
+    },
+  };
+}
+
+/** Validate and normalize the complete signed-v2 vault event wire payload. */
+export function validateVaultEventV2(value: unknown): VaultEventV2Validation {
+  return normalizedVaultEventV2(value, true);
+}
+
+/** Canonical message binding every immutable signed-v2 vault event field. */
+export function canonicalVaultEventMessage(value: VaultEventV2Unsigned): string {
+  const parsed = normalizedVaultEventV2(value, false);
+  if (!parsed.ok) throw new Error(`invalid vault event v2: ${parsed.errorCode}`);
+  const event = parsed.value;
+  return `halo-vault-event-v2:${JSON.stringify([
+    event.eventVersion,
+    event.id,
+    event.operator,
+    event.consumer,
+    event.model,
+    event.tokens,
+    event.amountUsdc,
+    event.durationMs,
+    event.timestamp,
+    event.txHash,
+    event.mode,
+    event.vaultCycle,
+    event.cumulativeCheckpoint,
+  ])}`;
 }
 
 /** Parse the facilitator's cycle-aware redeem response without trusting JSON shape. */

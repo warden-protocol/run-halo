@@ -1,5 +1,5 @@
 import prompts from "prompts";
-import { WebSocket } from "ws";
+import { WebSocket, type RawData } from "ws";
 import { randomBytes } from "crypto";
 import { createWriteStream, existsSync, mkdirSync, statSync, unlinkSync, writeFileSync } from "fs";
 import path from "path";
@@ -11,6 +11,7 @@ import {
   configProviders,
   providerForModel,
   allConfiguredModels,
+  BASE_CHAIN_ID,
   imagePriceForModel,
   isPositiveImagePriceRepresentable,
   providerServesConfiguredImageModel,
@@ -59,14 +60,24 @@ import {
 } from "../vaultReceiptRehydration";
 import { releaseAbortedVaultServe, withAbortedStreamCleanup } from "../vaultStreamAbort";
 import { RelayDeliveryResult, RelayDeliveryTracker } from "../relayDelivery";
+import { ActiveServeRequests, drainServeForShutdown } from "../serveShutdown";
 import { OperatorRedeemer } from "../vaultRedeemer";
 import {
+  EventOutbox,
+  eventOutboxRuntimeOptions,
+} from "../eventOutbox";
+import {
+  MAX_VAULT_EVENT_AMOUNT_BASE,
+  MAX_VAULT_EVENT_CYCLE,
+  VAULT_EVENT_VERSION,
+  canonicalVaultEventMessage,
   formatUsdcBase,
   ImageEditPlaintextError,
   ImageEditPlaintextV1,
   parseImageEditPlaintext,
   priceImages,
   requestCompletionCeilingTokens,
+  type VaultEventV2Unsigned,
 } from "@halo/vault-core";
 import { isAddress } from "ethers";
 import { decryptSecret, isEncryptedSecret } from "../secret";
@@ -763,11 +774,16 @@ export async function completeVaultImageServe(params: {
     terminal: VaultImageTerminalResponse
   ) => Promise<RelayDeliveryResult>;
   isAborted: () => boolean;
-  noteServed?: (consumer: string, operator: string, amount: bigint) => void;
+  noteServed?: (
+    consumer: string,
+    operator: string,
+    cycle: bigint,
+    amount: bigint
+  ) => void;
   postServedEvent?: (
     settlement: ReturnType<typeof priceServedImagesForVault>,
     servedCumulative: bigint | null
-  ) => void;
+  ) => void | Promise<void>;
 }): Promise<VaultImageServeCompletion> {
   let released = false;
   const releaseOnce = (): void => {
@@ -911,12 +927,11 @@ export async function completeVaultImageServe(params: {
     (params.noteServed ?? noteServed)(
       params.consumer,
       params.operator,
+      params.cycle,
       settlement.actualAmount
     );
   } catch {}
-  try {
-    params.postServedEvent?.(settlement, servedCumulative);
-  } catch {}
+  await params.postServedEvent?.(settlement, servedCumulative);
   return { ok: true, terminal, settlement, servedCumulative };
 }
 
@@ -2053,6 +2068,42 @@ export async function cmdServe(): Promise<void> {
     receiptStore.save(durableReceiptSnapshot(pendingRehydration, ledgerSnap));
   const creditLedger = new VaultCreditLedger(persistReceiptSnapshot);
   const redeemer = new OperatorRedeemer(cfg.facilitator.url, creditLedger, (m) => console.log(m));
+  const outboxRuntime = eventOutboxRuntimeOptions();
+  const eventOutbox = new EventOutbox({
+    filePath: path.join(configDir(), "event-outbox.json"),
+    indexerUrl: cfg.indexerUrl,
+    scope: {
+      chainId: BASE_CHAIN_ID,
+      vaultAddress: selectedVaultAddress,
+      operator: cfg.operator.address,
+    },
+    maxEntries: outboxRuntime.maxEntries,
+    maxBytes: outboxRuntime.maxBytes,
+    concurrency: outboxRuntime.concurrency,
+    requestTimeoutMs: outboxRuntime.requestTimeoutMs,
+    retryBaseMs: outboxRuntime.retryBaseMs,
+    retryCapMs: outboxRuntime.retryCapMs,
+  });
+  for (const checkpoint of eventOutbox.servedCheckpoints()) {
+    creditLedger.restoreServed(
+      checkpoint.consumer,
+      checkpoint.operator,
+      BigInt(checkpoint.vaultCycle),
+      BigInt(checkpoint.cumulativeCheckpoint)
+    );
+  }
+  eventOutbox.start();
+
+  const queueVaultEvent = async (payload: VaultEventV2Unsigned): Promise<void> => {
+    const signature = await wallet.signMessage(canonicalVaultEventMessage(payload));
+    eventOutbox.enqueue({ ...payload, signature });
+  };
+  const vaultEventCycleNumber = (cycle: bigint): number => {
+    if (cycle <= 0n || cycle > BigInt(MAX_VAULT_EVENT_CYCLE)) {
+      throw new Error(`vault cycle ${cycle} is outside the signed event domain`);
+    }
+    return Number(cycle);
+  };
 
   // Re-verification is non-blocking and serialized across the boot pass and sweeps.
   let rehydrating = false;
@@ -2132,6 +2183,7 @@ export async function cmdServe(): Promise<void> {
       return false;
     }
     // A fresh chain read prevents uncollectable receipt tails from freeing credit.
+    eventOutbox.observeOnchain(consumer, cfg.operator.address, v.cycle, v.redeemed);
     creditLedger.syncOnchain(consumer, cfg.operator.address, v.cycle, v.redeemed, v.locked);
     if (creditLedger.recordReceipt(consumer, cfg.operator.address, { cumulative, signature, cycle: v.cycle })) {
       redeemer.kick(consumer, cfg.operator.address);
@@ -2171,17 +2223,25 @@ export async function cmdServe(): Promise<void> {
   let reconnectAttempt = 0;
   let signalShutdownRequested = false;
   let shutdownPromise: Promise<void> | null = null;
+  const activeServeRequests = new ActiveServeRequests();
   let stopUpdateMonitor = (): void => {};
   const gracefulShutdown = (): Promise<void> => {
     if (shutdownPromise) return shutdownPromise;
     shuttingDown = true;
     stopUpdateMonitor();
     console.log("\n  shutting down");
-    // Bound receipt flushing so shutdown cannot hang on the facilitator.
-    shutdownPromise = Promise.race([
-      redeemer.flush().then(() => undefined),
-      new Promise<void>((resolve) => setTimeout(resolve, 3000)),
-    ]);
+    shutdownPromise = drainServeForShutdown({
+      activeRequests: activeServeRequests,
+      flushRedeems: () => redeemer.flush(),
+      redeemFlushTimeoutMs: 3_000,
+      drainOutbox: () => eventOutbox.drain(outboxRuntime.shutdownDrainMs),
+      closeOutbox: () => eventOutbox.close(),
+    }).then((drained) => {
+        if (!drained) {
+          const pending = eventOutbox.status().filter((entry) => entry.state === "pending").length;
+          console.warn(`  ⚠ event outbox shutdown budget expired; ${pending} event(s) remain durable`);
+        }
+    });
     return shutdownPromise;
   };
   const exitGracefully = (): void => {
@@ -2256,7 +2316,7 @@ export async function cmdServe(): Promise<void> {
         }, WS_PING_INTERVAL_MS);
       });
 
-      ws.on("message", async (raw) => {
+      const handleRelayMessage = async (raw: RawData): Promise<void> => {
         let msg:
           | InferenceRequestMessage
           | { type: "connected"; peerId: string }
@@ -2445,6 +2505,18 @@ export async function cmdServe(): Promise<void> {
 
         if (msg.type !== "inference-request") return;
         const req = msg as InferenceRequestMessage;
+        if (shuttingDown) {
+          if (ws.readyState === WebSocket.OPEN) {
+            await sendWsJson(ws, {
+              type: "inference-response",
+              requestId: req.requestId,
+              status: 503,
+              headers: {},
+              body: { error: { type: "operator_shutting_down", message: "operator is shutting down" } },
+            }).catch(() => {});
+          }
+          return;
+        }
         const requestStartedAt = Date.now();
         await withAbortedStreamCleanup(abortedStreams, req.requestId, async () => {
 
@@ -2597,6 +2669,7 @@ export async function cmdServe(): Promise<void> {
 
         // Track admission so every thrown serve releases its credit reservation.
         let creditAdmitted: { consumer: string; ceiling: bigint; cycle: bigint } | null = null;
+        let eventOutboxReserved = false;
         let creditAdmit: AdmitResult;
         const imagePrice = imagePriceForModel(cfg, requestedModel);
 
@@ -2692,6 +2765,11 @@ export async function cmdServe(): Promise<void> {
                       promptTokens: estimateRequestPromptTokens(req.body),
                       completionTokens: vaultCompletionCeiling,
                     });
+              if (ceilingCost <= 0n || ceilingCost > MAX_VAULT_EVENT_AMOUNT_BASE) {
+                throw new Error(
+                  `vault request cost ${ceilingCost} is outside the signed event amount domain`
+                );
+              }
               let chk: ReservationCheck;
               try {
                 chk = await checkReservationCached(consumerAddr, cfg.operator.address, ceilingCost);
@@ -2722,11 +2800,18 @@ export async function cmdServe(): Promise<void> {
                   },
                 };
               } else {
+                vaultEventCycleNumber(chk.cycle);
                 // Cap accumulated unreceipted work by configured credit and on-chain locked funds.
                 // One larger request may be admitted when nothing is outstanding; refresh from current cycle state.
                 const creditWindow = (): bigint =>
                   creditWindowBase() < chk.remaining ? creditWindowBase() : chk.remaining;
                 // Align local cumulative accounting with the on-chain collectible ceiling.
+                eventOutbox.observeOnchain(
+                  consumerAddr,
+                  cfg.operator.address,
+                  chk.cycle,
+                  chk.redeemed
+                );
                 creditLedger.syncOnchain(consumerAddr, cfg.operator.address, chk.cycle, chk.redeemed, chk.remaining);
                 creditAdmit = creditLedger.admit(
                   consumerAddr,
@@ -2745,6 +2830,13 @@ export async function cmdServe(): Promise<void> {
                     chk = { ok: false, reason: "could not refresh on-chain reservation", remaining: 0n, cycle: 0n, redeemed: 0n };
                   }
                   if (chk.ok) {
+                    vaultEventCycleNumber(chk.cycle);
+                    eventOutbox.observeOnchain(
+                      consumerAddr,
+                      cfg.operator.address,
+                      chk.cycle,
+                      chk.redeemed
+                    );
                     creditLedger.syncOnchain(consumerAddr, cfg.operator.address, chk.cycle, chk.redeemed, chk.remaining);
                     creditAdmit = creditLedger.admit(
                       consumerAddr,
@@ -2780,6 +2872,13 @@ export async function cmdServe(): Promise<void> {
                 // Admitted — the ceiling is reserved against the window until we
                 // settle (served) or release (failed). Remember it for both.
                 creditAdmitted = { consumer: consumerAddr, ceiling: ceilingCost, cycle: chk.cycle };
+                eventOutbox.reserve({
+                  id: req.requestId,
+                  operator: cfg.operator.address,
+                  consumer: consumerAddr,
+                  model: req.body.model ?? null,
+                });
+                eventOutboxReserved = true;
                 if (imagePrice !== null && !acceptsMedia) {
                   creditLedger.releaseInflight(
                     consumerAddr,
@@ -2925,7 +3024,7 @@ export async function cmdServe(): Promise<void> {
                         sendWsJson(ws, terminal)
                       ),
                     isAborted: () => abortedStreams.has(req.requestId),
-                    postServedEvent: (settlement, servedCumulative) => {
+                    postServedEvent: async (settlement, servedCumulative) => {
                       if (settlement.uncappedAmount > settlement.actualAmount) {
                         console.warn(
                           `  ⚠ vault-served at a loss on ${req.requestId}: actual image cost ${fmtUsd(settlement.uncappedAmount)} (${settlement.servedImageCount} image(s)) exceeds this request's reserved ceiling ${fmtUsd(ceilingCost)}; collecting ${fmtUsd(settlement.actualAmount)} — the model returned more images than the reservation covered for "${requestedModel}"`
@@ -2934,7 +3033,11 @@ export async function cmdServe(): Promise<void> {
                       console.log(
                         `  ✓ vault-served ${req.requestId} for ${abbrevAddr(consumerAddr)} — ${fmtUsd(settlement.actualAmount)} (${settlement.servedImageCount} image(s)); awaiting redeem`
                       );
-                      const eventPayload = {
+                      if (servedCumulative === null) {
+                        throw new Error("vault event checkpoint unavailable for the active cycle");
+                      }
+                      const eventPayload: VaultEventV2Unsigned = {
+                        eventVersion: VAULT_EVENT_VERSION,
                         id: req.requestId,
                         operator: cfg.operator.address,
                         consumer: consumerAddr,
@@ -2942,21 +3045,13 @@ export async function cmdServe(): Promise<void> {
                         tokens: settlement.tokens,
                         amountUsdc: settlement.actualAmount.toString(),
                         durationMs: Date.now() - requestStartedAt,
-                        timestamp: Date.now(),
+                        timestamp: new Date().toISOString(),
                         txHash: null,
                         mode: "vault" as const,
-                        cumulativeCheckpoint:
-                          servedCumulative === null
-                            ? undefined
-                            : servedCumulative.toString(),
+                        vaultCycle: vaultEventCycleNumber(chk.cycle),
+                        cumulativeCheckpoint: servedCumulative.toString(),
                       };
-                      const sigMessage = canonicalEventMessage(eventPayload);
-                      wallet
-                        .signMessage(sigMessage)
-                        .then((signature) =>
-                          postEvent(cfg, { ...eventPayload, signature })
-                        )
-                        .catch((err) => logError("event post failed", err));
+                      await queueVaultEvent(eventPayload);
                     },
                   });
                   creditAdmitted = null;
@@ -3053,17 +3148,19 @@ export async function cmdServe(): Promise<void> {
                     };
                     // Discount what we just served from the cached reservation
                     // headroom so the gate cache never approves past coverage.
-                    noteServed(consumerAddr, cfg.operator.address, actualAmount);
+                    noteServed(consumerAddr, cfg.operator.address, chk.cycle, actualAmount);
                     // Replace admitted ceiling with actual cost and retain its checkpoint.
                     const servedCumulative = creditLedger.settleServed(consumerAddr, cfg.operator.address, chk.cycle, ceilingCost, actualAmount);
                     creditAdmitted = null;
                     console.log(
                       `  ✓ vault-served ${req.requestId} for ${abbrevAddr(consumerAddr)} — ${fmtUsd(actualAmount)} (${upstream.usage.total_tokens} tok); awaiting redeem`
                     );
-                    // Fire-and-forget indexer event. txHash is null — the redeem
-                    // happens async (consumer-driven); the verifier reconciles.
                     const durationMs = Date.now() - requestStartedAt;
-                    const eventPayload = {
+                    if (servedCumulative === null) {
+                      throw new Error("vault event checkpoint unavailable for the active cycle");
+                    }
+                    const eventPayload: VaultEventV2Unsigned = {
+                      eventVersion: VAULT_EVENT_VERSION,
                       id: req.requestId,
                       operator: cfg.operator.address,
                       consumer: consumerAddr,
@@ -3071,18 +3168,13 @@ export async function cmdServe(): Promise<void> {
                       tokens: servedTokens,
                       amountUsdc: actualAmount.toString(),
                       durationMs,
-                      timestamp: Date.now(),
+                      timestamp: new Date().toISOString(),
                       txHash: null,
                       mode: "vault" as const,
-                      // Omit stale-cycle checkpoints rather than risk incorrect attribution.
-                      cumulativeCheckpoint:
-                        servedCumulative === null ? undefined : servedCumulative.toString(),
+                      vaultCycle: vaultEventCycleNumber(chk.cycle),
+                      cumulativeCheckpoint: servedCumulative.toString(),
                     };
-                    const sigMessage = canonicalEventMessage(eventPayload);
-                    wallet
-                      .signMessage(sigMessage)
-                      .then((signature) => postEvent(cfg, { ...eventPayload, signature }))
-                      .catch((err) => logError("event post failed", err));
+                    await queueVaultEvent(eventPayload);
                   }
                 }
                 }
@@ -3465,6 +3557,11 @@ export async function cmdServe(): Promise<void> {
             headers: {},
             body: failed.data,
           };
+        } finally {
+          if (eventOutboxReserved) {
+            eventOutbox.releaseReservation(req.requestId);
+            eventOutboxReserved = false;
+          }
         }
 
         if (ws.readyState === WebSocket.OPEN) {
@@ -3479,6 +3576,13 @@ export async function cmdServe(): Promise<void> {
           );
         }
         });
+      };
+      ws.on("message", (raw) => {
+        activeServeRequests.tryTrack(() =>
+          handleRelayMessage(raw).catch((err) =>
+            logError("relay message handler failed", err)
+          )
+        );
       });
 
       // Protocol-level pings from the relay are auto-ponged by the ws
@@ -3631,7 +3735,7 @@ async function buildContextLengthAnnounce(cfg: HaloConfig): Promise<Record<strin
   return out;
 }
 
-interface EventPayload {
+interface LegacyBudgetEventPayload {
   id: string;
   operator: string;
   consumer: string;
@@ -3641,15 +3745,11 @@ interface EventPayload {
   durationMs: number;
   timestamp: number;
   txHash: string | null;
-  /** Payment rail this event was served over. Informational — not signed. */
-  mode: "vault" | "budget";
-  /** Unsigned vault checkpoint used for interval-based redeem attribution. */
-  cumulativeCheckpoint?: string;
+  mode: "budget";
 }
 
-/** Indexer signature contract: `halo-event:{id}:{operator}:{consumer}:{amountUsdc}:{tokens}:{timestamp}`.
- * `txHash` remains body-only because it may be unavailable. */
-export function canonicalEventMessage(ev: Omit<EventPayload, "txHash" | "mode" | "cumulativeCheckpoint">): string {
+/** Legacy budget-event signature contract; vault events use signed v2 from vault-core. */
+export function canonicalEventMessage(ev: Omit<LegacyBudgetEventPayload, "txHash" | "mode">): string {
   return `halo-event:${ev.id}:${ev.operator.toLowerCase()}:${ev.consumer.toLowerCase()}:${ev.amountUsdc}:${ev.tokens}:${ev.timestamp}`;
 }
 
@@ -3760,7 +3860,10 @@ function logError(label: string, err: unknown): void {
 
 export { abbrevAddr };
 
-async function postEvent(cfg: HaloConfig, ev: EventPayload & { signature: string }): Promise<void> {
+async function postEvent(
+  cfg: HaloConfig,
+  ev: LegacyBudgetEventPayload & { signature: string }
+): Promise<void> {
   const url = `${cfg.indexerUrl.replace(/\/+$/, "")}/v1/events`;
   await fetch(url, {
     method: "POST",

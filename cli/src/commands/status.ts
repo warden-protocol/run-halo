@@ -1,4 +1,12 @@
-import { loadConfig, configProviders, allConfiguredModels, imagePriceForModel } from "../config";
+import path from "node:path";
+import {
+  loadConfig,
+  configDir,
+  configProviders,
+  allConfiguredModels,
+  imagePriceForModel,
+} from "../config";
+import { readEventOutboxStatus } from "../eventOutbox";
 
 export async function cmdStatus(): Promise<void> {
   const cfg = loadConfig();
@@ -29,6 +37,24 @@ export async function cmdStatus(): Promise<void> {
   const editModels = providers.flatMap((provider) => provider.imageEditModels ?? []);
   if (editModels.length > 0) {
     console.log(`  Edits:     ${[...new Set(editModels)].join(", ")}`);
+  }
+
+  try {
+    const entries = readEventOutboxStatus(path.join(configDir(), "event-outbox.json"));
+    const pending = entries.filter((entry) => entry.state === "pending");
+    const dead = entries.filter((entry) => entry.state === "dead_letter");
+    console.log(`  Outbox:    ${pending.length} pending / ${dead.length} dead-letter`);
+    for (const entry of [...pending, ...dead].slice(0, 20)) {
+      console.log(
+        `             ${entry.id} ${entry.state} attempts=${entry.attempts}${
+          entry.lastErrorCode ? ` error=${entry.lastErrorCode}` : ""
+        }`
+      );
+    }
+  } catch (error) {
+    console.log(
+      `  Outbox:    unreadable (${error instanceof Error ? error.message : String(error)})`
+    );
   }
 
   try {

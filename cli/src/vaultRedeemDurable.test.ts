@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { AddressInfo } from "node:net";
 import { Wallet } from "ethers";
+import { VAULT_ADDRESS } from "@halo/vault-core";
 import { VaultConsumeClient, type OpsState } from "./vault-consume";
 
 const OP = "0x2222222222222222222222222222222222222222";
@@ -36,8 +37,8 @@ function mockFacilitator(handler: (n: number) => { status: number; body: unknown
   );
 }
 
-const client = (facUrl: string, store: string) => {
-  const c = new VaultConsumeClient(Wallet.createRandom(), {
+const client = (facUrl: string, store: string, wallet = Wallet.createRandom()) => {
+  const c = new VaultConsumeClient(wallet, {
     facilitatorUrl: facUrl,
     rpcUrl: "http://127.0.0.1:1",
     chainId: 8453,
@@ -50,9 +51,10 @@ const client = (facUrl: string, store: string) => {
 
 test("a pending redeem persists to disk and a fresh client resumes + settles it", async () => {
   const store = path.join(os.tmpdir(), `halo-pending-${process.pid}-${Date.now()}.json`);
+  const wallet = Wallet.createRandom();
   const down = await mockFacilitator(() => ({ status: 500, body: { error: "down" } }));
   try {
-    const a = client(down.url, store);
+    const a = client(down.url, store, wallet);
     a.recordAndRedeem(OP, OPS, 0n, 1_000n);
     await a.flushRedeems();
     assert.equal(a.pendingRedeemCount, 1, "kept pending after transient failure");
@@ -66,13 +68,13 @@ test("a pending redeem persists to disk and a fresh client resumes + settles it"
 
   const up = await mockFacilitator(() => ({ status: 200, body: confirmed() }));
   try {
-    const b = client(up.url, store);
+    const b = client(up.url, store, wallet);
     assert.equal(b.pendingRedeemCount, 0, "fresh client starts empty (in-memory)");
-    b.resumePendingRedeems();
-    assert.equal(b.pendingRedeemCount, 1, "resumed the persisted pending redeem");
-    await b.flushRedeems();
-    assert.equal(b.pendingRedeemCount, 0, "the resumed redeem settled after restart");
+    await b.resumePendingRedeems();
     assert.ok(up.count() >= 1, "submitted the resumed redeem to the facilitator");
+    assert.equal(b.pendingRedeemCount, 0, "the resumed redeem settled during replay");
+    await b.flushRedeems();
+    assert.equal(b.pendingRedeemCount, 0, "the resumed redeem remains settled after flush");
     const left = JSON.parse(fs.readFileSync(store, "utf-8"));
     assert.equal(left.length, 0, "store emptied once collected");
   } finally {
@@ -97,7 +99,7 @@ test("no store path → in-memory only, no file written (back-compat)", async ()
     c.recordAndRedeem(OP, OPS, 0n, 1_000n);
     await c.flushRedeems();
     assert.equal(c.pendingRedeemCount, 1, "still retries in memory");
-    c.resumePendingRedeems();
+    await c.resumePendingRedeems();
   } finally {
     up.close();
   }
@@ -105,14 +107,26 @@ test("no store path → in-memory only, no file written (back-compat)", async ()
 
 test("stale persisted entry (cycle moved on) is dropped on resume, not retried forever", async () => {
   const store = path.join(os.tmpdir(), `halo-pending-stale-${process.pid}-${Date.now()}.json`);
+  const wallet = Wallet.createRandom();
   fs.writeFileSync(
     store,
-    JSON.stringify([{ key: `${OP}:1`, operator: OP, cumulative: "1000", signature: "0xsig", cycle: "1" }])
+    JSON.stringify([
+      {
+        key: `${OP}:1`,
+        chainId: 8453,
+        vaultAddress: VAULT_ADDRESS,
+        consumer: wallet.address,
+        operator: OP,
+        cumulative: "1000",
+        signature: "0xsig",
+        cycle: "1",
+      },
+    ])
   );
   const fac = await mockFacilitator(() => ({ status: 400, body: { error: "vault submit failed: BadSignature()" } }));
   try {
-    const c = client(fac.url, store);
-    c.resumePendingRedeems();
+    const c = client(fac.url, store, wallet);
+    await c.resumePendingRedeems();
     await c.flushRedeems();
     assert.equal(c.pendingRedeemCount, 0, "stale entry abandoned, not stuck");
     assert.equal(JSON.parse(fs.readFileSync(store, "utf-8")).length, 0, "store self-healed");
@@ -131,7 +145,7 @@ test("a truncated/corrupt pending file is skipped, not fatal, on resume", async 
   const fac = await mockFacilitator(() => ({ status: 200, body: confirmed() }));
   try {
     const c = client(fac.url, store);
-    c.resumePendingRedeems();
+    await c.resumePendingRedeems();
     assert.equal(c.pendingRedeemCount, 0, "corrupt file yields no resumed redeems");
     await c.flushRedeems();
     assert.equal(fac.count(), 0, "nothing submitted from a corrupt file");

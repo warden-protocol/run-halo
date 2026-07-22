@@ -66,6 +66,8 @@ const USDC_DECIMALS = 6;
 
 const READ_TIMEOUT_MS = 8_000;
 const REDEEM_RETRY_INTERVAL_MS = 20_000;
+const RELEASE_RETRY_COOLDOWN_MS = 60_000;
+const MAX_RELEASE_ATTEMPTS = 3;
 
 function abortReason(signal: AbortSignal): Error {
   if (signal.reason instanceof Error) return signal.reason;
@@ -169,6 +171,8 @@ function nowSec(): number {
 interface PersistedPendingRedeem {
   key: string;
   vaultAddress?: string;
+  chainId?: number;
+  consumer?: string;
   operator: string;
   cumulative: string;
   signature: string;
@@ -192,6 +196,7 @@ export class HaloVaultClient {
     string,
     {
       operator: string;
+      consumer: string;
       cumulative: bigint;
       signature: string;
       cycle: bigint;
@@ -203,7 +208,16 @@ export class HaloVaultClient {
   private readonly preservedForeignPending: PersistedPendingRedeem[] = [];
   private redeemRetryTimer: ReturnType<typeof setInterval> | null = null;
   private readonly reservedOperators = new Set<string>();
-  private readonly releaseAttemptedAt = new Map<string, number>();
+  private readonly releaseAttempts = new Map<
+    string,
+    {
+      operator: string;
+      cycle: bigint;
+      attempts: number;
+      lastAttemptAt: number;
+      terminal: boolean;
+    }
+  >();
   private redeemGraceCache: bigint | null = null;
   private maxReserveTtlCache: bigint | null = null;
   private readonly autoTopUpBase: bigint;
@@ -254,6 +268,21 @@ export class HaloVaultClient {
 
   private facBase(): string {
     return this.cfg.facilitatorUrl.replace(/\/+$/, "");
+  }
+
+  private async cycleKey(
+    operator: string,
+    cycle: bigint,
+    knownConsumer?: string
+  ): Promise<string> {
+    const consumer = getAddress(knownConsumer ?? (await this.consumer())).toLowerCase();
+    return JSON.stringify([
+      this.cfg.chainId,
+      this.cfg.vaultAddress.toLowerCase(),
+      consumer,
+      getAddress(operator).toLowerCase(),
+      cycle.toString(),
+    ]);
   }
 
   async readVaultState(signal?: AbortSignal): Promise<VaultState> {
@@ -521,7 +550,55 @@ export class HaloVaultClient {
     return body.hash;
   }
 
-  /** Reclaim tracked reservations after expiry and grace, retrying dropped releases. */
+  private clearReleaseAttempts(operator: string, keepCycle?: bigint): void {
+    const normalized = operator.toLowerCase();
+    for (const [key, state] of this.releaseAttempts) {
+      if (state.operator === normalized && (keepCycle === undefined || state.cycle !== keepCycle)) {
+        this.releaseAttempts.delete(key);
+      }
+    }
+  }
+
+  private async submitBoundedRelease(
+    operator: string,
+    ops: OpsState,
+    signal?: AbortSignal
+  ): Promise<boolean> {
+    const normalized = getAddress(operator).toLowerCase();
+    this.clearReleaseAttempts(normalized, ops.cycle);
+    const key = await this.cycleKey(normalized, ops.cycle);
+    const state = this.releaseAttempts.get(key) ?? {
+      operator: normalized,
+      cycle: ops.cycle,
+      attempts: 0,
+      lastAttemptAt: 0,
+      terminal: false,
+    };
+    this.releaseAttempts.set(key, state);
+    if (state.terminal) {
+      throw new Error(
+        `automatic release exhausted ${MAX_RELEASE_ATTEMPTS} attempts for vault cycle ${ops.cycle}`
+      );
+    }
+    const nowMs = Date.now();
+    if (state.lastAttemptAt > nowMs - RELEASE_RETRY_COOLDOWN_MS) return false;
+    state.attempts += 1;
+    state.lastAttemptAt = nowMs;
+    state.terminal = state.attempts >= MAX_RELEASE_ATTEMPTS;
+    try {
+      await this.postRelease(normalized, signal);
+      return true;
+    } catch (error) {
+      if (state.terminal) {
+        this.cfg.log(
+          `automatic vault release reached its terminal retry limit for cycle ${ops.cycle}; chain state or an explicit operator action must change before retry`
+        );
+      }
+      throw error;
+    }
+  }
+
+  /** Reclaim tracked reservations after expiry and grace with bounded automatic retries. */
   async releaseExpiredReservations(
     skipOperator?: string,
     signal?: AbortSignal
@@ -535,8 +612,6 @@ export class HaloVaultClient {
       return false;
     }
     const now = BigInt(nowSec());
-    const nowMs = Date.now();
-    const retryCooldownMs = 60_000;
     const skip = skipOperator?.toLowerCase();
     let released = false;
     for (const operator of this.reservedOperators) {
@@ -546,15 +621,11 @@ export class HaloVaultClient {
         const ops = await this.readOps(operator, signal);
         if (ops.locked === 0n) {
           this.reservedOperators.delete(operator);
-          this.releaseAttemptedAt.delete(operator);
+          this.clearReleaseAttempts(operator);
           continue;
         }
         const eligible = ops.expiry !== 0n && now > ops.expiry + grace;
-        const coolingDown =
-          (this.releaseAttemptedAt.get(operator) ?? 0) > nowMs - retryCooldownMs;
-        if (eligible && !coolingDown) {
-          await this.postRelease(operator, signal);
-          this.releaseAttemptedAt.set(operator, nowMs);
+        if (eligible && (await this.submitBoundedRelease(operator, ops, signal))) {
           this.cfg.log(
             `releasing expired vault reservation to ${operator.slice(0, 8)}… ($${fmtUsd(ops.locked)}; frees on confirmation)`
           );
@@ -628,8 +699,7 @@ export class HaloVaultClient {
           this.cfg.log(
             `vault reservation to ${operator.slice(0, 8)}… hit its on-chain lifetime cap; reclaiming $${fmtUsd(ops.locked)} and re-reserving fresh`
           );
-          await this.postRelease(operator, signal);
-          this.releaseAttemptedAt.set(operator.toLowerCase(), Date.now());
+          await this.submitBoundedRelease(operator, ops, signal);
           // Re-reserving before release confirmation would top up the dead cycle.
           await this.waitForRelease(operator, signal);
           [state, ops] = await Promise.all([
@@ -806,36 +876,46 @@ export class HaloVaultClient {
     cost: bigint
   ): void {
     if (cost <= 0n) return;
-    const key = `${operator.toLowerCase()}:${ops.cycle}`;
-    const prev = this.cumulative.get(key) ?? ops.redeemed;
-    const { cumulative, ceiling } = advanceCumulativeReceipt({
-      previous: prev,
-      cost,
-      locked: ops.locked,
-      redeemed: ops.redeemed,
-      priorCeiling: this.ceilingByKey.get(key),
-    });
-    this.ceilingByKey.set(key, ceiling);
-    this.cumulative.set(key, cumulative);
-    if (cumulative <= ops.redeemed) return;
     this.redeemQueue = this.redeemQueue.then(async () => {
       try {
+        const consumer = getAddress(await this.consumer()).toLowerCase();
+        const normalizedOperator = getAddress(operator).toLowerCase();
+        const key = await this.cycleKey(normalizedOperator, ops.cycle, consumer);
+        const held = this.pendingRedeems.get(key);
+        let prev = this.cumulative.get(key) ?? ops.redeemed;
+        if (ops.redeemed > prev) prev = ops.redeemed;
+        if (held && held.cumulative > prev) prev = held.cumulative;
+        let priorCeiling = this.ceilingByKey.get(key);
+        if (held && (priorCeiling === undefined || held.cumulative > priorCeiling)) {
+          priorCeiling = held.cumulative;
+        }
+        const { cumulative, ceiling } = advanceCumulativeReceipt({
+          previous: prev,
+          cost,
+          locked: ops.locked,
+          redeemed: ops.redeemed,
+          priorCeiling,
+        });
+        this.ceilingByKey.set(key, ceiling);
+        this.cumulative.set(key, cumulative);
+        if (cumulative <= ops.redeemed) return;
         const signature = await this.signReceipt({
-          operator,
+          operator: normalizedOperator,
           cumulative,
           keyEpoch,
           cycle: ops.cycle,
         });
         // The highest cumulative receipt supersedes earlier receipts in its cycle.
         this.pendingRedeems.set(key, {
-          operator,
+          operator: normalizedOperator,
+          consumer,
           cumulative,
           signature,
           cycle: ops.cycle,
           inFlight: false,
         });
         this.persistPending();
-        await this.pushReceipt(operator, cumulative, signature).catch(() => false);
+        await this.pushReceipt(normalizedOperator, cumulative, signature).catch(() => false);
         await this.attemptRedeem(key);
       } catch (e) {
         // A later cumulative receipt can cover a failed signing attempt.
@@ -967,6 +1047,8 @@ export class HaloVaultClient {
         ...[...this.pendingRedeems.entries()].map(([key, v]) => ({
           key,
           vaultAddress: this.cfg.vaultAddress,
+          chainId: this.cfg.chainId,
+          consumer: v.consumer,
           operator: v.operator,
           cumulative: v.cumulative.toString(),
           signature: v.signature,
@@ -983,14 +1065,14 @@ export class HaloVaultClient {
   }
 
   /** Reload persisted pending receipts and resume settlement. */
-  resumePendingRedeems(): void {
+  resumePendingRedeems(): Promise<void> {
     const f = this.cfg.pendingStorePath;
-    if (!f) return;
+    if (!f) return Promise.resolve();
     let raw: string;
     try {
       raw = readFileSync(f, "utf-8");
     } catch {
-      return;
+      return Promise.resolve();
     }
     let arr: PersistedPendingRedeem[];
     try {
@@ -998,46 +1080,64 @@ export class HaloVaultClient {
     } catch (e) {
       // Surface corruption because the file may represent unpaid work.
       this.cfg.log(`pending vault-redeem file unreadable, cannot resume (${errStr(e)}): ${f}`);
-      return;
+      return Promise.resolve();
     }
-    if (!Array.isArray(arr) || arr.length === 0) return;
-    this.preservedForeignPending.length = 0;
-    let skippedDifferentVault = 0;
-    for (const e of arr) {
-      try {
-        // Legacy entries predate custom-vault support and were always signed for
-        // the consensus vault. Never replay either legacy or explicitly scoped
-        // entries against a different EIP-712 domain.
-        const persistedVault =
-          e.vaultAddress === undefined ? VAULT_ADDRESS : getAddress(e.vaultAddress);
-        if (persistedVault !== this.cfg.vaultAddress) {
-          skippedDifferentVault++;
-          this.preservedForeignPending.push(e);
-          continue;
-        }
-        this.pendingRedeems.set(e.key, {
-          operator: e.operator,
-          cumulative: BigInt(e.cumulative),
-          signature: e.signature,
-          cycle: BigInt(e.cycle),
-          inFlight: false,
-        });
-      } catch {}
-    }
-    if (skippedDifferentVault > 0) {
-      this.cfg.log(
-        `ignored ${skippedDifferentVault} pending vault redeem(s) signed for a different vault`
-      );
-    }
-    if (this.pendingRedeems.size === 0) return;
-    this.cfg.log(`resuming ${this.pendingRedeems.size} pending vault redeem(s) from a prior session`);
-    this.startRedeemRetry();
-    // Queue resumed attempts so flushRedeems waits for them.
     this.redeemQueue = this.redeemQueue.then(async () => {
+      if (!Array.isArray(arr) || arr.length === 0) return;
+      const consumer = getAddress(await this.consumer()).toLowerCase();
+      this.preservedForeignPending.length = 0;
+      let skippedForeignIdentity = 0;
+      for (const e of arr) {
+        try {
+          const persistedVault =
+            e.vaultAddress === undefined ? VAULT_ADDRESS : getAddress(e.vaultAddress);
+          const persistedChain = e.chainId ?? 8453;
+          const persistedConsumer =
+            e.consumer === undefined ? null : getAddress(e.consumer).toLowerCase();
+          if (
+            persistedVault !== this.cfg.vaultAddress ||
+            persistedChain !== this.cfg.chainId ||
+            persistedConsumer !== consumer
+          ) {
+            skippedForeignIdentity++;
+            this.preservedForeignPending.push(e);
+            continue;
+          }
+          const operator = getAddress(e.operator).toLowerCase();
+          const cumulative = BigInt(e.cumulative);
+          const cycle = BigInt(e.cycle);
+          if (cumulative <= 0n || cycle <= 0n || typeof e.signature !== "string" || !e.signature) {
+            continue;
+          }
+          const key = await this.cycleKey(operator, cycle, consumer);
+          this.pendingRedeems.set(key, {
+            operator,
+            consumer,
+            cumulative,
+            signature: e.signature,
+            cycle,
+            inFlight: false,
+          });
+          const priorCumulative = this.cumulative.get(key) ?? 0n;
+          if (cumulative > priorCumulative) this.cumulative.set(key, cumulative);
+          const priorCeiling = this.ceilingByKey.get(key) ?? 0n;
+          if (cumulative > priorCeiling) this.ceilingByKey.set(key, cumulative);
+        } catch {}
+      }
+      if (skippedForeignIdentity > 0) {
+        this.cfg.log(
+          `ignored ${skippedForeignIdentity} pending vault redeem(s) lacking the current chain, vault, and consumer identity`
+        );
+      }
+      this.persistPending();
+      if (this.pendingRedeems.size === 0) return;
+      this.cfg.log(`resuming ${this.pendingRedeems.size} pending vault redeem(s) from a prior session`);
+      this.startRedeemRetry();
       await Promise.allSettled(
         [...this.pendingRedeems.keys()].map((key) => this.attemptRedeem(key))
       );
     });
+    return this.redeemQueue;
   }
 
   /** Deposit a shortfall and register the session signer; an optional signal stops pending work. */

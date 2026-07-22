@@ -67,13 +67,15 @@ install updates in place, while a contributor's unmanaged `npm link` checkout is
 bash <(curl -fsSL https://raw.githubusercontent.com/warden-protocol/run-halo/main/skill/scripts/install.sh)
 ```
 
-The script checks for **Node 20+** (the CLI fails fast on older versions), resolves the latest
-CI-verified `cli-vX.Y.Z` release into `~/.halo/src`, builds `vault-core → sdk → cli` with
-`npm ci`, links it with `npm link`, and verifies with `halo --version`. Future releases apply
-silently in the background; `halo update` forces an immediate check. If Node 20+ is missing,
-the operator installs it manually
-(https://nodejs.org or `nvm install 20 && nvm use 20`) — don't try to install Node from the
-skill.
+The current dependency set requires **Node 22.19+** because the locked CLI dependency
+`undici@8.5.0` declares that minimum. The installer and CLI runtime checks still accept
+Node 20+, so passing those checks does not establish compatibility. The script resolves the
+latest CI-verified `cli-vX.Y.Z` release into `~/.halo/src`, builds
+`vault-core → sdk → cli` with `npm ci`, links it with `npm link`, and verifies with
+`halo --version`. Future releases apply silently in the background; `halo update` forces an
+immediate check. If Node 22.19+ is missing, install it manually
+(https://nodejs.org or `nvm install 22.19.0 && nvm use 22.19.0`) — don't try to install Node
+from the skill.
 
 ### Always probe with doctor first
 

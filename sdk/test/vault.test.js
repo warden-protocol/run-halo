@@ -82,7 +82,7 @@ test("rejects malformed vault addresses and unsupported chains at construction",
   );
 });
 
-test("pending redeem recovery never replays a signature scoped to another vault", (t) => {
+test("pending redeem recovery never replays a foreign or consumer-unscoped signature", async (t) => {
   const dir = mkdtempSync(path.join(tmpdir(), "halo-sdk-vault-scope-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const store = path.join(dir, "pending.json");
@@ -96,6 +96,15 @@ test("pending redeem recovery never replays a signature scoped to another vault"
         operator: "0x0000000000000000000000000000000000000003",
         cumulative: "10",
         signature: "0xsigned-for-other-domain",
+        cycle: "1",
+      },
+      {
+        key: "legacy-operator:1",
+        chainId: 8453,
+        vaultAddress: "0x000000000000000000000000000000000000dEaD",
+        operator: "0x0000000000000000000000000000000000000003",
+        cumulative: "11",
+        signature: "0xunscoped-consumer",
         cycle: "1",
       },
     ])
@@ -112,11 +121,13 @@ test("pending redeem recovery never replays a signature scoped to another vault"
       log: (message) => logs.push(message),
     }
   );
-  client.resumePendingRedeems();
+  await client.resumePendingRedeems();
+  await client.flushRedeems();
   assert.equal(client.pendingRedeemCount, 0);
-  assert.match(logs.join("\n"), /signed for a different vault/);
+  assert.match(logs.join("\n"), /lacking the current chain, vault, and consumer identity/);
   client.persistPending();
   assert.match(readFileSync(store, "utf8"), /signed-for-other-domain/);
+  assert.match(readFileSync(store, "utf8"), /unscoped-consumer/);
 });
 
 test("managed payInference validates and propagates its custom vault option", async (t) => {
@@ -986,6 +997,150 @@ test("reclaims eligible reservations without dropping the retry hint early", asy
   });
   assert.equal(await client.releaseExpiredReservations(), false);
   assert.equal(client.reservedOperators.has(operator), false);
+});
+
+test("automatic release retries become terminal per full cycle identity and reset on a new cycle", async () => {
+  const consumer = "0x0000000000000000000000000000000000000006";
+  const operator = "0x0000000000000000000000000000000000000007";
+  const client = new HaloVaultClient(
+    { getAddress: async () => consumer },
+    {
+      facilitatorUrl: "https://facilitator.invalid",
+      rpcUrl: "http://127.0.0.1:1",
+      chainId: 8453,
+    }
+  );
+  client.reservedOperators.add(operator);
+  client.redeemGrace = async () => 0n;
+  let cycle = 1n;
+  client.readOps = async () => ({
+    locked: 500n,
+    redeemed: 0n,
+    expiry: BigInt(Math.floor(Date.now() / 1000) - 2),
+    created: 0n,
+    cycle,
+  });
+  let releases = 0;
+  client.postRelease = async () => {
+    releases += 1;
+    if (cycle === 1n) throw new Error("release transport failed");
+    return "0xrelease";
+  };
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    assert.equal(await client.releaseExpiredReservations(), false);
+    for (const state of client.releaseAttempts.values()) state.lastAttemptAt = 0;
+  }
+  assert.equal(releases, 3);
+  assert.equal(await client.releaseExpiredReservations(), false);
+  assert.equal(releases, 3, "terminal cycle is never retried automatically");
+
+  cycle = 2n;
+  assert.equal(await client.releaseExpiredReservations(), true);
+  assert.equal(releases, 4, "a new on-chain cycle gets an independent release budget");
+});
+
+test("persisted redeem keys bind chain, vault, consumer, operator, and cycle", async (t) => {
+  const dir = mkdtempSync(path.join(tmpdir(), "halo-sdk-full-redeem-key-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const store = path.join(dir, "pending.json");
+  const consumer = "0x0000000000000000000000000000000000000004";
+  const operator = "0x0000000000000000000000000000000000000005";
+  const client = new HaloVaultClient(
+    { getAddress: async () => consumer },
+    {
+      facilitatorUrl: "https://facilitator.invalid",
+      rpcUrl: "http://127.0.0.1:1",
+      chainId: 8453,
+      pendingStorePath: store,
+    }
+  );
+  client.signReceipt = async () => "0xsigned";
+  client.readOps = async () => ({
+    locked: 1_000n,
+    redeemed: 0n,
+    expiry: 0n,
+    created: 0n,
+    cycle: 9n,
+  });
+  client.postRedeem = async () => {
+    throw new Error("temporarily unavailable");
+  };
+  client.recordAndRedeem(
+    operator,
+    { locked: 1_000n, redeemed: 0n, expiry: 0n, created: 0n, cycle: 9n },
+    1n,
+    100n
+  );
+  await client.flushRedeems();
+
+  const [entry] = JSON.parse(readFileSync(store, "utf8"));
+  assert.equal(entry.chainId, 8453);
+  assert.equal(entry.vaultAddress, VAULT_ADDRESS);
+  assert.equal(entry.consumer, consumer);
+  assert.deepEqual(JSON.parse(entry.key), [
+    8453,
+    VAULT_ADDRESS.toLowerCase(),
+    consumer,
+    operator,
+    "9",
+  ]);
+});
+
+test("a resumed pending high-water cannot be replaced by a lower post-restart receipt", async (t) => {
+  const dir = mkdtempSync(path.join(tmpdir(), "halo-sdk-resumed-high-water-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const store = path.join(dir, "pending.json");
+  const consumer = "0x0000000000000000000000000000000000000004";
+  const operator = "0x0000000000000000000000000000000000000005";
+  writeFileSync(
+    store,
+    JSON.stringify([
+      {
+        key: "ignored-and-recomputed",
+        chainId: 8453,
+        vaultAddress: VAULT_ADDRESS,
+        consumer,
+        operator,
+        cumulative: "100",
+        signature: "0xpending",
+        cycle: "9",
+      },
+    ])
+  );
+  const client = new HaloVaultClient(
+    { getAddress: async () => consumer },
+    {
+      facilitatorUrl: "https://facilitator.invalid",
+      rpcUrl: "http://127.0.0.1:1",
+      chainId: 8453,
+      pendingStorePath: store,
+    }
+  );
+  client.readOps = async () => ({
+    locked: 1_000n,
+    redeemed: 0n,
+    expiry: 0n,
+    created: 0n,
+    cycle: 9n,
+  });
+  client.postRedeem = async () => {
+    throw new Error("temporarily unavailable");
+  };
+  client.pushReceipt = async () => false;
+  client.signReceipt = async ({ cumulative }) => `0xsigned-${cumulative}`;
+
+  await client.resumePendingRedeems();
+  client.recordAndRedeem(
+    operator,
+    { locked: 1_000n, redeemed: 0n, expiry: 0n, created: 0n, cycle: 9n },
+    1n,
+    10n
+  );
+  await client.flushRedeems();
+
+  const [entry] = JSON.parse(readFileSync(store, "utf8"));
+  assert.equal(entry.cumulative, "110");
 });
 
 test("ensureReservation refuses to top up a reservation wedged past its lifetime cap (#473)", async () => {
