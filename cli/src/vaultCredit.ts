@@ -115,6 +115,21 @@ export class VaultCreditLedger {
     if (wasDurable && e.held <= e.redeemed) this.persist();
   }
 
+  /** Restore a durable served high-water before admitting work after restart. */
+  restoreServed(
+    consumer: string,
+    operator: string,
+    cycle: bigint,
+    cumulative: bigint
+  ): void {
+    if (cycle <= 0n || cumulative <= 0n) {
+      throw new Error("restored vault served state must be positive");
+    }
+    const e = this.entryFor(consumer, operator, cycle);
+    if (cycle < e.cycle) return;
+    if (cumulative > e.served) e.served = cumulative;
+  }
+
   /** Reserve a ceiling synchronously while bounding accumulated exposure. */
   admit(
     consumer: string,

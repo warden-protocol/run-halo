@@ -1591,7 +1591,7 @@ export async function cmdConsume(args: Args): Promise<void> {
   }
   // Resume any redeems a prior process left pending (restart-durable settlement).
   // After the freshness gate, so a stale vault never replays receipts.
-  vault.resumePendingRedeems();
+  await vault.resumePendingRedeems();
   if (args.vaultDeposit && args.vaultDeposit > 0) {
     // Auto-managed: top the vault up to the target from the wallet's USDC on
     // startup so the first request has reservable funds. Fails loud (and the

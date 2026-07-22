@@ -22,6 +22,9 @@ export function getVaultAddress(): string {
 /** Apply a non-empty config override, throwing on malformed addresses. */
 export function setActiveVaultAddress(addr?: string | null): void {
   activeVault = resolveVaultAddress(addr);
+  gateCache.clear();
+  latestGateKey.clear();
+  keyCache.clear();
 }
 
 let provider: JsonRpcProvider | null = null;
@@ -144,67 +147,89 @@ export function collectibleServeAmount(actualBase: bigint, ceilingBase: bigint):
   return actualBase < ceilingBase ? actualBase : ceilingBase;
 }
 
-// Approve from cache only while discounted headroom still covers the request.
-
-const GATE_CACHE_TTL_MS = 30_000;
-
 interface GateEntry {
   r: Reservation;
-  at: number;
   servedSinceRead: bigint;
 }
 
-const gateCache = new Map<string, GateEntry>(); // key `${consumer}:${operator}`
+const gateCache = new Map<string, GateEntry>();
+const latestGateKey = new Map<string, string>();
 
-/** Record value served against a reservation (call after a successful upstream). */
-export function noteServed(consumer: string, operator: string, amountBase: bigint): void {
-  const e = gateCache.get(`${consumer.toLowerCase()}:${operator.toLowerCase()}`);
+function pairIdentity(consumer: string, operator: string): string {
+  return JSON.stringify([
+    activeVault.toLowerCase(),
+    consumer.toLowerCase(),
+    operator.toLowerCase(),
+  ]);
+}
+
+/** Full active reservation identity used by all gate accounting. */
+export function reservationGateIdentity(
+  vaultAddress: string,
+  consumer: string,
+  operator: string,
+  cycle: bigint
+): string {
+  return JSON.stringify([
+    vaultAddress.toLowerCase(),
+    consumer.toLowerCase(),
+    operator.toLowerCase(),
+    cycle.toString(),
+  ]);
+}
+
+/** Record value served against the exact admitted reservation cycle. */
+export function noteServed(
+  consumer: string,
+  operator: string,
+  cycle: bigint,
+  amountBase: bigint
+): void {
+  if (amountBase < 0n) throw new Error("noteServed amount must be non-negative");
+  const e = gateCache.get(reservationGateIdentity(activeVault, consumer, operator, cycle));
   if (e) e.servedSinceRead += amountBase;
 }
 
 /** Invalidate a pair after a detected cycle advance so the next gate reads chain state. */
 export function invalidateGate(consumer: string, operator: string): void {
-  gateCache.delete(`${consumer.toLowerCase()}:${operator.toLowerCase()}`);
+  const pair = pairIdentity(consumer, operator);
+  const key = latestGateKey.get(pair);
+  if (key) gateCache.delete(key);
+  latestGateKey.delete(pair);
 }
 
-/** Approve from fresh cached coverage after subtracting locally served value; otherwise re-read chain. */
+/** Re-read the active cycle before every approval; RPC uncertainty fails closed. */
 export async function checkReservationCached(
   consumer: string,
   operator: string,
   requiredBase: bigint,
   nowSec: number = Math.floor(Date.now() / 1000)
 ): Promise<ReservationCheck> {
-  const key = `${consumer.toLowerCase()}:${operator.toLowerCase()}`;
-  const cached = gateCache.get(key);
-  // Verdict from a cached read, discounting what we've served since (so the gate
-  // never approves past confirmed coverage).
-  const fromCache = (e: GateEntry): ReservationCheck =>
-    evaluate(
-      {
-        ...e.r,
-        remaining: e.r.remaining > e.servedSinceRead ? e.r.remaining - e.servedSinceRead : 0n,
-      },
-      requiredBase,
-      nowSec
-    );
-  if (cached && Date.now() - cached.at < GATE_CACHE_TTL_MS) {
-    const verdict = fromCache(cached);
-    if (verdict.ok) return verdict;
-    // Fall through: a cached "no" may just be stale (top-up since the read).
+  const r = await readReservation(consumer, operator);
+  const pair = pairIdentity(consumer, operator);
+  const key = reservationGateIdentity(activeVault, consumer, operator, r.cycle);
+  const priorKey = latestGateKey.get(pair);
+  if (priorKey && priorKey !== key) gateCache.delete(priorKey);
+  latestGateKey.set(pair, key);
+  const prior = gateCache.get(key);
+  if (prior && r.redeemed < prior.r.redeemed) {
+    throw new Error("vault redeemed checkpoint moved backwards within the active cycle");
   }
-  let r: Reservation;
-  try {
-    r = await readReservation(consumer, operator);
-  } catch (err) {
-    // On RPC failure, use only a previously read reservation that still covers the request.
-    if (cached) {
-      const verdict = fromCache(cached);
-      if (verdict.ok) return verdict;
-    }
-    throw err;
-  }
-  gateCache.set(key, { r, at: Date.now(), servedSinceRead: 0n });
-  return evaluate(r, requiredBase, nowSec);
+  const newlyRedeemed = prior ? r.redeemed - prior.r.redeemed : 0n;
+  const servedSinceRead = prior
+    ? prior.servedSinceRead > newlyRedeemed
+      ? prior.servedSinceRead - newlyRedeemed
+      : 0n
+    : 0n;
+  gateCache.set(key, { r, servedSinceRead });
+  return evaluate(
+    {
+      ...r,
+      remaining: r.remaining > servedSinceRead ? r.remaining - servedSinceRead : 0n,
+    },
+    requiredBase,
+    nowSec
+  );
 }
 
 // Verify pushed receipts against the current on-chain session key, cycle, and epoch before freeing credit.
@@ -225,7 +250,7 @@ interface KeyEntry { sessionKey: string; keyEpoch: bigint; at: number }
 const keyCache = new Map<string, KeyEntry>();
 
 async function readConsumerKey(consumer: string): Promise<KeyEntry> {
-  const k = consumer.toLowerCase();
+  const k = JSON.stringify([activeVault.toLowerCase(), consumer.toLowerCase()]);
   const cached = keyCache.get(k);
   if (cached && Date.now() - cached.at < KEY_CACHE_TTL_MS) return cached;
   const c = new Contract(activeVault, VAULT_ABI, rpc());
