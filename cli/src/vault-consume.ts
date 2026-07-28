@@ -2,7 +2,12 @@ import { Wallet, type HDNodeWallet } from "ethers";
 import {
   HaloVaultClient,
   type VaultConfig as SdkVaultConfig,
+  type VaultRedeemTerminalError,
 } from "halo-sdk";
+import {
+  INTERNAL_CLI_VERSION_PROVIDER,
+  type VersionHeaderTarget,
+} from "../../sdk/dist/versionHeader";
 import {
   VAULT_ADDRESS,
   deriveSubKeyPrivateKey,
@@ -15,6 +20,8 @@ import {
   resolveVaultAddress,
   type FacilitatorVaultStatus,
 } from "./vault-address";
+import { HALO_VERSION } from "./version";
+import { relayCliVersion } from "./relayVersion";
 
 export {
   VAULT_ADDRESS,
@@ -45,7 +52,9 @@ export class VaultConsumeClient extends HaloVaultClient {
         ...cfg,
         reserveLiquiditySlots,
         log: (message) => console.log(`  ${message}`),
-      },
+        [INTERNAL_CLI_VERSION_PROVIDER]: (target: VersionHeaderTarget) =>
+          target === "relay" ? relayCliVersion() : HALO_VERSION,
+      } as SdkVaultConfig,
       sessionSigner
     );
   }
@@ -53,6 +62,12 @@ export class VaultConsumeClient extends HaloVaultClient {
 
 export function fmtUsd(base: bigint): string {
   return formatUsdcBase(base);
+}
+
+export function terminalRedeemGuidance(error: VaultRedeemTerminalError): string {
+  return error.reason === "cli-outdated"
+    ? "vault redeem stopped because this Halo version is outdated; signed evidence was quarantined — run `halo update`"
+    : "vault redeem stopped after a structural rejection; signed evidence was quarantined for explicit recovery";
 }
 
 /** Receipt signer mode: main wallet or browser-compatible derived key. */

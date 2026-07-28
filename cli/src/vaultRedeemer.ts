@@ -6,6 +6,7 @@ import {
   vaultRedeemDisposition,
   type VaultRedeemRequest,
 } from "@halo/vault-core";
+import { setFacilitatorCliVersionHeader } from "./versionHeader";
 
 export { classifyRedeemError } from "@halo/vault-core";
 
@@ -63,9 +64,11 @@ export class OperatorRedeemer {
           cycle: receipt.cycle.toString(),
           signature: receipt.signature,
         };
+        const headers = { "content-type": "application/json" };
+        setFacilitatorCliVersionHeader(headers);
         const res = await fetch(`${this.facBase()}/vault/redeem`, {
           method: "POST",
-          headers: { "content-type": "application/json" },
+          headers,
           body: JSON.stringify(request),
           signal: AbortSignal.timeout(60_000),
         });

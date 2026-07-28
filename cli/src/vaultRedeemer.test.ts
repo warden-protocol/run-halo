@@ -4,6 +4,7 @@ import http from "node:http";
 import { AddressInfo } from "node:net";
 import { VaultCreditLedger } from "./vaultCredit";
 import { OperatorRedeemer } from "./vaultRedeemer";
+import { HALO_VERSION } from "./version";
 
 const C = "0x1111111111111111111111111111111111111111";
 const O = "0x2222222222222222222222222222222222222222";
@@ -21,21 +22,37 @@ const confirmed = (cumulative: string) => ({
 
 function mockFacilitator(handler: (hit: Hit, n: number) => { status: number; body: unknown }) {
   const hits: Hit[] = [];
+  const versions: Array<string | undefined> = [];
   const server = http.createServer((req, res) => {
     let raw = "";
     req.on("data", (c) => (raw += c));
     req.on("end", () => {
       const hit = JSON.parse(raw) as Hit;
       hits.push(hit);
+      versions.push(
+        Array.isArray(req.headers["x-halo-cli-version"])
+          ? req.headers["x-halo-cli-version"][0]
+          : req.headers["x-halo-cli-version"]
+      );
       const { status, body } = handler(hit, hits.length);
       res.writeHead(status, { "content-type": "application/json" });
       res.end(JSON.stringify(body));
     });
   });
-  return new Promise<{ url: string; hits: Hit[]; close: () => void }>((resolve) => {
+  return new Promise<{
+    url: string;
+    hits: Hit[];
+    versions: Array<string | undefined>;
+    close: () => void;
+  }>((resolve) => {
     server.listen(0, "127.0.0.1", () => {
       const port = (server.address() as AddressInfo).port;
-      resolve({ url: `http://127.0.0.1:${port}`, hits, close: () => server.close() });
+      resolve({
+        url: `http://127.0.0.1:${port}`,
+        hits,
+        versions,
+        close: () => server.close(),
+      });
     });
   });
 }
@@ -56,6 +73,7 @@ test("kick redeems the held receipt with the correct body, then marks it collect
       cycle: "1",
       signature: "0xsig",
     });
+    assert.deepEqual(fac.versions, [HALO_VERSION]);
     assert.equal(ledger.redeemable(C, O), null, "nothing left owed after a confirmed redeem");
   } finally {
     fac.close();
