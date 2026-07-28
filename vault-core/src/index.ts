@@ -429,7 +429,7 @@ export function parseVaultRedeemResponse(value: unknown): VaultRedeemResponse | 
   }
 }
 
-export type VaultRedeemDisposition = "collected" | "retry" | "uncollectable";
+export type VaultRedeemDisposition = "collected" | "retry" | "terminal" | "uncollectable";
 
 /** Decide whether a client keeps or clears its signed receipt after a typed response. */
 export function vaultRedeemDisposition(
@@ -457,6 +457,7 @@ export function vaultRedeemDisposition(
     case "reverted":
       return "retry";
     case "rejected":
+      if (response.reason === "invalid-request") return "terminal";
       return response.reason === "cycle-mismatch" || response.reason === "invalid-receipt"
         ? "uncollectable"
         : "retry";

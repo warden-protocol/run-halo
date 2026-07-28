@@ -39,6 +39,7 @@ import {
   guardVaultFresh,
   priceTokens,
   resolveSessionSigner,
+  terminalRedeemGuidance,
   fmtUsd as fmtVaultUsd,
   type OpsState,
   type SessionKeyMode,
@@ -1581,6 +1582,11 @@ export async function cmdConsume(args: Args): Promise<void> {
       autoTopUpUsd: args.vaultDeposit,
       // Persist pending redeems per wallet across restarts.
       pendingStorePath: path.join(configDir(), `vault-pending-${wallet.address.toLowerCase()}.json`),
+      deadLetterStorePath: path.join(
+        configDir(),
+        `vault-redeem-dead-letter-${wallet.address.toLowerCase()}.json`
+      ),
+      onTerminalRedeem: (error) => console.error(`  ⚠ ${terminalRedeemGuidance(error)}`),
     },
     vaultSessionSigner
   );

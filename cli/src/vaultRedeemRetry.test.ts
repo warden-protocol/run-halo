@@ -1,9 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import http from "node:http";
 import { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Wallet } from "ethers";
-import { VaultConsumeClient, type OpsState } from "./vault-consume";
+import { VaultRedeemTerminalError } from "halo-sdk";
+import {
+  VaultConsumeClient,
+  terminalRedeemGuidance,
+  type OpsState,
+} from "./vault-consume";
 
 const OP = "0x2222222222222222222222222222222222222222";
 const OPS: OpsState = { locked: 100_000n, redeemed: 0n, expiry: 9_999_999_999n, created: 0n, cycle: 1n };
@@ -12,6 +20,21 @@ const confirmed = (cumulative = "1000") => ({
   transaction: `0x${"a".repeat(64)}`,
   cumulative,
   cycle: "1",
+});
+
+test("CLI terminal redeem guidance distinguishes compatibility from structural recovery", () => {
+  assert.match(
+    terminalRedeemGuidance(new VaultRedeemTerminalError("cli-outdated")),
+    /run `halo update`/
+  );
+  assert.match(
+    terminalRedeemGuidance(new VaultRedeemTerminalError("invalid-request")),
+    /explicit recovery/
+  );
+  assert.doesNotMatch(
+    terminalRedeemGuidance(new VaultRedeemTerminalError("invalid-request")),
+    /signature|cumulative|consumer|operator/
+  );
 });
 
 function mockFacilitator(handler: (n: number) => { status: number; body: unknown }) {
@@ -47,6 +70,56 @@ function client(facUrl: string): VaultConsumeClient {
   c.readOps = async () => OPS;
   return c;
 }
+
+test("relay receipt 426 quarantines before redeem and exposes update guidance", async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "halo-cli-relay-426-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const relay = await mockFacilitator(() => ({
+    status: 426,
+    body: {
+      error: "cli_outdated",
+      detail: "sensitive relay text must not reach guidance or storage",
+    },
+  }));
+  const facilitator = await mockFacilitator(() => ({
+    status: 200,
+    body: confirmed(),
+  }));
+  t.after(() => {
+    relay.close();
+    facilitator.close();
+  });
+  const terminalErrors: VaultRedeemTerminalError[] = [];
+  const pendingStorePath = join(directory, "pending.json");
+  const deadLetterStorePath = join(directory, "dead-letter.json");
+  const c = new VaultConsumeClient(Wallet.createRandom(), {
+    facilitatorUrl: facilitator.url,
+    rpcUrl: "http://127.0.0.1:1",
+    chainId: 8453,
+    relayUrl: relay.url,
+    pendingStorePath,
+    deadLetterStorePath,
+    onTerminalRedeem: (error) => terminalErrors.push(error),
+  });
+  c.readOps = async () => OPS;
+
+  c.recordAndRedeem(OP, OPS, 0n, 1_000n);
+  await c.flushRedeems();
+
+  assert.equal(relay.count(), 1);
+  assert.equal(facilitator.count(), 0);
+  assert.equal(c.pendingRedeemCount, 0);
+  assert.equal(c.deadLetterRedeemCount, 1);
+  assert.equal(terminalErrors.length, 1);
+  assert.equal(terminalErrors[0].reason, "cli-outdated");
+  const guidance = terminalRedeemGuidance(terminalErrors[0]);
+  assert.match(guidance, /run `halo update`/);
+  assert.doesNotMatch(guidance, /sensitive relay text/);
+  assert.doesNotMatch(
+    readFileSync(deadLetterStorePath, "utf8"),
+    /sensitive relay text/
+  );
+});
 
 test("a successful redeem clears the pending receipt", async () => {
   const fac = await mockFacilitator(() => ({ status: 200, body: confirmed() }));

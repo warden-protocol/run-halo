@@ -7,8 +7,7 @@ import {
   isAddress,
   parseUnits,
 } from "ethers";
-import { readFileSync, writeFileSync, mkdirSync, renameSync } from "node:fs";
-import { dirname } from "node:path";
+import { readFileSync } from "node:fs";
 import {
   ERC20_ABI,
   MAX_VAULT_RESERVATION_ATTEMPTS,
@@ -38,6 +37,27 @@ import {
   type VaultState,
 } from "@halo/vault-core";
 import { getChain } from "./chains";
+import {
+  INTERNAL_CLI_VERSION_PROVIDER,
+  SDK_CLI_VERSION,
+  cliVersionHeader,
+  type InternalVersionConfig,
+  type VersionHeaderProvider,
+  type VersionHeaderTarget,
+} from "./versionHeader";
+import {
+  MAX_DEAD_LETTER_ENTRIES,
+  acquireRedeemEvidenceOwnership,
+  parseDeadLetterStore,
+  resolveRedeemEvidencePath,
+  serializeDeadLetterStore,
+  writeDurableFile,
+  writeDurableJson,
+  type PersistedDeadLetterRedeem,
+  type PersistedDeadLetterStore,
+  type RedeemEvidenceOwnership,
+  type RedeemTerminalReason,
+} from "./redeemEvidenceStore";
 
 export {
   VAULT_ADDRESS,
@@ -152,10 +172,36 @@ export interface VaultConfig {
   reserveLiquiditySlots?: bigint;
   /** Auto-top-up target in USD. Zero or unset disables auto-deposit. */
   autoTopUpUsd?: number;
-  /** Node-only pending-redeem store. Unset keeps the queue in memory. */
+  /**
+   * Node-only pending store. When deadLetterStorePath is omitted, a paired
+   * `${pendingStorePath}.dead-letter` target is derived. .lock and
+   * .lock.recovery suffixes are case-insensitively reserved.
+   */
   pendingStorePath?: string;
+  /** Node-only terminal store. .lock and .lock.recovery suffixes are case-insensitively reserved. */
+  deadLetterStorePath?: string;
+  /** Programmatic notification after a redeem becomes terminal. */
+  onTerminalRedeem?: (error: VaultRedeemTerminalError) => void;
   /** Optional diagnostic sink. Defaults to no-op. */
   log?: (msg: string) => void;
+}
+
+export type VaultRedeemTerminalReason = RedeemTerminalReason;
+
+/** Safe programmatic signal for a receipt that automatic redeem must not retry. */
+export class VaultRedeemTerminalError extends Error {
+  readonly reason: VaultRedeemTerminalReason;
+  readonly retryable = false;
+
+  constructor(reason: VaultRedeemTerminalReason) {
+    super(
+      reason === "cli-outdated"
+        ? "Halo client compatibility is outdated"
+        : "Vault redeem request was structurally rejected"
+    );
+    this.name = "VaultRedeemTerminalError";
+    this.reason = reason;
+  }
 }
 
 function fmtUsd(base: bigint): string {
@@ -177,6 +223,36 @@ interface PersistedPendingRedeem {
   cumulative: string;
   signature: string;
   cycle: string;
+  terminalReason?: VaultRedeemTerminalReason;
+}
+
+interface PendingRedeem {
+  operator: string;
+  consumer: string;
+  cumulative: bigint;
+  signature: string;
+  cycle: bigint;
+  inFlight: boolean;
+  terminalError?: VaultRedeemTerminalError;
+}
+
+function samePendingRedeemReceipt(
+  left: PendingRedeem,
+  right: PendingRedeem
+): boolean {
+  return (
+    left.operator === right.operator &&
+    left.consumer === right.consumer &&
+    left.cumulative === right.cumulative &&
+    left.signature === right.signature &&
+    left.cycle === right.cycle
+  );
+}
+
+function isVaultRedeemTerminalReason(
+  value: unknown
+): value is VaultRedeemTerminalReason {
+  return value === "cli-outdated" || value === "invalid-request";
 }
 
 /** Stateful vault client; reuse it to serialize reservations and retain receipts. */
@@ -184,28 +260,34 @@ export class HaloVaultClient {
   private readonly signer: Signer;
   // Must match the consumer's registered on-chain session key.
   private readonly sessionSigner: Signer;
-  private readonly cfg: Required<Omit<VaultConfig, "log">> & { log: (m: string) => void };
+  private readonly cfg: Required<
+    Omit<VaultConfig, "log" | "onTerminalRedeem">
+  > & {
+    log: (m: string) => void;
+    onTerminalRedeem: (error: VaultRedeemTerminalError) => void;
+  };
   private readonly provider: JsonRpcProvider;
   private readonly vault: Contract;
+  private readonly versionHeaderProvider: VersionHeaderProvider;
   private readonly cumulative = new Map<string, bigint>();
   // Prevent stale concurrent snapshots from lowering a cycle's receipt ceiling.
   private readonly ceilingByKey = new Map<string, bigint>();
   private ensureQueue: Promise<unknown> = Promise.resolve();
   private redeemQueue: Promise<void> = Promise.resolve();
-  private readonly pendingRedeems = new Map<
-    string,
-    {
-      operator: string;
-      consumer: string;
-      cumulative: bigint;
-      signature: string;
-      cycle: bigint;
-      inFlight: boolean;
-    }
-  >();
+  private readonly pendingRedeems = new Map<string, PendingRedeem>();
+  private readonly activeRedeemAttempts = new Set<Promise<void>>();
   // Entries signed for another configured vault stay on disk but are never
   // loaded into this client's retry queue.
   private readonly preservedForeignPending: PersistedPendingRedeem[] = [];
+  private readonly deadLetters = new Map<string, PersistedDeadLetterRedeem>();
+  private readonly terminalReasons = new Map<string, VaultRedeemTerminalReason>();
+  private deadLettersLoaded = false;
+  private deadLetterStoreReadable = true;
+  private deadLetterPersistenceFault: Error | null = null;
+  private redeemEvidenceOwnership: RedeemEvidenceOwnership | null = null;
+  private redeemEvidenceClosing = false;
+  private redeemEvidenceClosed = false;
+  private redeemEvidenceClosePromise: Promise<void> | null = null;
   private redeemRetryTimer: ReturnType<typeof setInterval> | null = null;
   private readonly reservedOperators = new Set<string>();
   private readonly releaseAttempts = new Map<
@@ -235,6 +317,14 @@ export class HaloVaultClient {
         `invalid vaultAddress ${JSON.stringify(vaultAddress)} (must be a 20-byte 0x hex address)`
       );
     }
+    const pendingStorePath = cfg.pendingStorePath
+      ? resolveRedeemEvidencePath(cfg.pendingStorePath)
+      : "";
+    const deadLetterStorePath = cfg.deadLetterStorePath
+      ? resolveRedeemEvidencePath(cfg.deadLetterStorePath)
+      : pendingStorePath
+        ? resolveRedeemEvidencePath(`${pendingStorePath}.dead-letter`)
+        : "";
     this.cfg = {
       ...cfg,
       vaultAddress: getAddress(vaultAddress),
@@ -246,12 +336,23 @@ export class HaloVaultClient {
           ? cfg.reserveLiquiditySlots
           : 8n,
       autoTopUpUsd: cfg.autoTopUpUsd ?? 0,
-      pendingStorePath: cfg.pendingStorePath ?? "",
+      pendingStorePath,
+      deadLetterStorePath,
       log: cfg.log ?? (() => {}),
+      onTerminalRedeem: cfg.onTerminalRedeem ?? (() => {}),
     };
     this.autoTopUpBase = BigInt(Math.round((cfg.autoTopUpUsd ?? 0) * 1_000_000));
+    this.versionHeaderProvider =
+      (cfg as VaultConfig & InternalVersionConfig)[INTERNAL_CLI_VERSION_PROVIDER] ??
+      (() => SDK_CLI_VERSION);
     this.provider = new JsonRpcProvider(cfg.rpcUrl, undefined, { staticNetwork: true });
     this.vault = new Contract(this.cfg.vaultAddress, VAULT_ABI, this.provider);
+    if (this.cfg.pendingStorePath || this.cfg.deadLetterStorePath) {
+      this.redeemEvidenceOwnership = acquireRedeemEvidenceOwnership([
+        this.cfg.pendingStorePath,
+        this.cfg.deadLetterStorePath,
+      ]);
+    }
   }
 
   /** Memoized consumer address used by the vault's balance and key mappings. */
@@ -268,6 +369,10 @@ export class HaloVaultClient {
 
   private facBase(): string {
     return this.cfg.facilitatorUrl.replace(/\/+$/, "");
+  }
+
+  private protocolHeaders(target: VersionHeaderTarget): Record<string, string> {
+    return cliVersionHeader(this.versionHeaderProvider(target));
   }
 
   private async cycleKey(
@@ -442,7 +547,10 @@ export class HaloVaultClient {
     throwIfAborted(signal);
     const res = await fetch(`${this.facBase()}/vault/reserve`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        ...this.protocolHeaders("facilitator"),
+      },
       body: JSON.stringify({
         consumer: await this.consumer(),
         operator: p.operator,
@@ -463,6 +571,9 @@ export class HaloVaultClient {
     cycle: bigint,
     signature: string
   ): Promise<VaultRedeemResponse> {
+    if (!this.loadDeadLetters()) {
+      throw new Error("vault redeem dead-letter state is unavailable");
+    }
     const request: VaultRedeemRequest = {
       consumer: await this.consumer(),
       operator,
@@ -472,11 +583,17 @@ export class HaloVaultClient {
     };
     const res = await fetch(`${this.facBase()}/vault/redeem`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        ...this.protocolHeaders("facilitator"),
+      },
       body: JSON.stringify(request),
       signal: AbortSignal.timeout(60_000),
     });
     const raw = await res.json().catch(() => null);
+    if (res.status === 426) {
+      throw new VaultRedeemTerminalError("cli-outdated");
+    }
     const outcome = parseVaultRedeemResponse(raw);
     if (outcome) return outcome;
     const error =
@@ -491,12 +608,17 @@ export class HaloVaultClient {
     cumulative: bigint,
     signature: string
   ): Promise<boolean> {
+    if (!this.loadDeadLetters()) return false;
     const relay = this.cfg.relayUrl.replace(/\/+$/, "");
     if (!relay) return false;
     try {
       const res = await fetch(`${relay}/v1/receipt`, {
         method: "POST",
-        headers: { "content-type": "application/json", "x-halo-operator": operator },
+        headers: {
+          "content-type": "application/json",
+          "x-halo-operator": operator,
+          ...this.protocolHeaders("relay"),
+        },
         body: JSON.stringify({
           consumer: await this.consumer(),
           operator,
@@ -505,8 +627,12 @@ export class HaloVaultClient {
         }),
         signal: AbortSignal.timeout(15_000),
       });
+      if (res.status === 426) {
+        throw new VaultRedeemTerminalError("cli-outdated");
+      }
       return res.status === 202;
-    } catch {
+    } catch (error) {
+      if (error instanceof VaultRedeemTerminalError) throw error;
       return false;
     }
   }
@@ -541,7 +667,10 @@ export class HaloVaultClient {
     throwIfAborted(signal);
     const res = await fetch(`${this.facBase()}/vault/release`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        ...this.protocolHeaders("facilitator"),
+      },
       body: JSON.stringify({ consumer: await this.consumer(), operator }),
       signal: signalWithTimeout(signal, 60_000),
     });
@@ -868,6 +997,178 @@ export class HaloVaultClient {
     }
   }
 
+  private loadDeadLetters(): boolean {
+    if (this.deadLetterPersistenceFault) return false;
+    if (this.deadLettersLoaded) return this.deadLetterStoreReadable;
+    this.deadLettersLoaded = true;
+    const target = this.cfg.deadLetterStorePath;
+    if (!target) return true;
+    let raw: string;
+    try {
+      raw = readFileSync(target, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+      this.deadLetterStoreReadable = false;
+      this.cfg.log(`vault redeem dead-letter file cannot be read; automatic redeem is fenced`);
+      return false;
+    }
+    try {
+      const store = parseDeadLetterStore(raw);
+      for (const entry of store.entries) {
+        this.deadLetters.set(entry.key, entry);
+        this.terminalReasons.set(entry.key, entry.reason);
+      }
+      return true;
+    } catch {
+      this.deadLetterStoreReadable = false;
+      this.cfg.log(`vault redeem dead-letter file is invalid; automatic redeem is fenced`);
+      return false;
+    }
+  }
+
+  private reconcileDeadLettersAfterPersistenceFailure(): void {
+    const target = this.cfg.deadLetterStorePath;
+    if (!target) return;
+    try {
+      const store = parseDeadLetterStore(readFileSync(target, "utf8"));
+      this.deadLetters.clear();
+      for (const entry of store.entries) {
+        this.deadLetters.set(entry.key, entry);
+        this.terminalReasons.set(entry.key, entry.reason);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        this.deadLetters.clear();
+      }
+    }
+  }
+
+  private failDeadLetterPersistence(error: unknown): never {
+    if (!this.deadLetterPersistenceFault) {
+      this.reconcileDeadLettersAfterPersistenceFailure();
+      this.deadLetterStoreReadable = false;
+      this.deadLetterPersistenceFault = new Error(
+        `vault redeem dead-letter persistence became ambiguous; restart is required (${errStr(error)})`
+      );
+    }
+    throw this.deadLetterPersistenceFault;
+  }
+
+  private persistDeadLetters(): void {
+    if (this.deadLetterPersistenceFault) throw this.deadLetterPersistenceFault;
+    if (!this.cfg.deadLetterStorePath) {
+      throw new Error("dead-letter store path is not configured");
+    }
+    try {
+      if (this.deadLetters.size > MAX_DEAD_LETTER_ENTRIES) {
+        throw new Error("dead-letter store entry limit reached");
+      }
+      const serialized = serializeDeadLetterStore({
+        version: 1,
+        entries: [...this.deadLetters.values()],
+      } satisfies PersistedDeadLetterStore);
+      writeDurableFile(this.cfg.deadLetterStorePath, serialized);
+    } catch (error) {
+      this.failDeadLetterPersistence(error);
+    }
+  }
+
+  private notifyTerminalRedeem(error: VaultRedeemTerminalError): void {
+    try {
+      this.cfg.onTerminalRedeem(error);
+    } catch {
+      this.cfg.log(`terminal vault redeem notification failed`);
+    }
+  }
+
+  private deadLetterEntry(
+    key: string,
+    pending: PendingRedeem,
+    reason: VaultRedeemTerminalReason
+  ): PersistedDeadLetterRedeem {
+    return {
+      key,
+      version: 1,
+      vaultAddress: this.cfg.vaultAddress,
+      chainId: this.cfg.chainId,
+      consumer: pending.consumer,
+      operator: pending.operator,
+      cumulative: pending.cumulative.toString(),
+      signature: pending.signature,
+      cycle: pending.cycle.toString(),
+      reason,
+      recordedAt: new Date().toISOString(),
+    };
+  }
+
+  private terminalDeadLetterHighWater(
+    key: string,
+    pending: PendingRedeem,
+    error: VaultRedeemTerminalError
+  ): PersistedDeadLetterRedeem | null {
+    const current = this.pendingRedeems.get(key);
+    const existing = this.deadLetters.get(key);
+    if (error.reason === "invalid-request") {
+      if (!current || !samePendingRedeemReceipt(current, pending)) return null;
+      pending.terminalError = error;
+      current.terminalError = error;
+      if (existing && BigInt(existing.cumulative) >= current.cumulative) {
+        return existing;
+      }
+      return this.deadLetterEntry(key, current, error.reason);
+    }
+
+    pending.terminalError = error;
+    if (current) current.terminalError = error;
+    const activeHighWater =
+      current && current.cumulative >= pending.cumulative ? current : pending;
+    if (existing && BigInt(existing.cumulative) >= activeHighWater.cumulative) {
+      return { ...existing, reason: error.reason };
+    }
+    return this.deadLetterEntry(key, activeHighWater, error.reason);
+  }
+
+  private quarantineTerminalRedeem(
+    key: string,
+    pending: PendingRedeem,
+    error: VaultRedeemTerminalError
+  ): void {
+    const entry = this.terminalDeadLetterHighWater(key, pending, error);
+    if (!entry) return;
+    this.terminalReasons.set(key, entry.reason);
+    const current = this.pendingRedeems.get(key);
+    if (current?.terminalError) {
+      current.terminalError = new VaultRedeemTerminalError(entry.reason);
+    }
+    try {
+      this.persistPending(true);
+    } catch {
+      this.cfg.log(
+        `terminal vault receipt active fence could not be persisted; attempting the terminal store`
+      );
+    }
+    this.deadLetters.set(key, entry);
+    try {
+      this.persistDeadLetters();
+    } catch {
+      this.cfg.log(
+        `terminal vault receipt persistence is ambiguous; retained behind the active terminal fence without automatic retry`
+      );
+      this.notifyTerminalRedeem(error);
+      return;
+    }
+
+    this.pendingRedeems.delete(key);
+    try {
+      this.persistPending(true);
+    } catch {
+      this.cfg.log(
+        `terminal vault receipt is durable but active-store cleanup failed; restart reconciliation will suppress the duplicate`
+      );
+    }
+    this.notifyTerminalRedeem(error);
+  }
+
   /** Record actual cost and enqueue a monotonic cumulative receipt for redemption. */
   recordAndRedeem(
     operator: string,
@@ -876,15 +1177,25 @@ export class HaloVaultClient {
     cost: bigint
   ): void {
     if (cost <= 0n) return;
+    if (this.redeemEvidenceClosing || this.redeemEvidenceClosed) {
+      throw new Error("vault redeem evidence ownership is closing or closed");
+    }
+    if (!this.loadDeadLetters()) return;
     this.redeemQueue = this.redeemQueue.then(async () => {
       try {
+        if (!this.loadDeadLetters()) return;
         const consumer = getAddress(await this.consumer()).toLowerCase();
         const normalizedOperator = getAddress(operator).toLowerCase();
         const key = await this.cycleKey(normalizedOperator, ops.cycle, consumer);
         const held = this.pendingRedeems.get(key);
+        const terminal = this.deadLetters.get(key);
+        const terminalReason = terminal?.reason ?? this.terminalReasons.get(key);
         let prev = this.cumulative.get(key) ?? ops.redeemed;
         if (ops.redeemed > prev) prev = ops.redeemed;
         if (held && held.cumulative > prev) prev = held.cumulative;
+        if (terminal && BigInt(terminal.cumulative) > prev) {
+          prev = BigInt(terminal.cumulative);
+        }
         let priorCeiling = this.ceilingByKey.get(key);
         if (held && (priorCeiling === undefined || held.cumulative > priorCeiling)) {
           priorCeiling = held.cumulative;
@@ -906,20 +1217,49 @@ export class HaloVaultClient {
           cycle: ops.cycle,
         });
         // The highest cumulative receipt supersedes earlier receipts in its cycle.
-        this.pendingRedeems.set(key, {
+        const terminalError = terminalReason
+          ? new VaultRedeemTerminalError(terminalReason)
+          : undefined;
+        const nextPending: PendingRedeem = {
           operator: normalizedOperator,
           consumer,
           cumulative,
           signature,
           cycle: ops.cycle,
           inFlight: false,
-        });
-        this.persistPending();
-        await this.pushReceipt(normalizedOperator, cumulative, signature).catch(() => false);
+          terminalError,
+        };
+        this.pendingRedeems.set(key, nextPending);
+        try {
+          this.persistPending(true);
+        } catch (error) {
+          if (held) {
+            this.pendingRedeems.set(key, held);
+          } else {
+            this.pendingRedeems.delete(key);
+          }
+          throw error;
+        }
+        if (terminalError) {
+          this.quarantineTerminalRedeem(key, nextPending, terminalError);
+          return;
+        }
+        try {
+          await this.pushReceipt(normalizedOperator, cumulative, signature);
+        } catch (error) {
+          if (error instanceof VaultRedeemTerminalError) {
+            this.quarantineTerminalRedeem(
+              key,
+              this.pendingRedeems.get(key)!,
+              error
+            );
+            return;
+          }
+        }
         await this.attemptRedeem(key);
       } catch (e) {
         // A later cumulative receipt can cover a failed signing attempt.
-        this.cfg.log(`vault receipt signing failed (next receipt covers it): ${errStr(e)}`);
+        this.cfg.log(`vault receipt recording failed (next receipt covers it): ${errStr(e)}`);
         if (this.pendingRedeems.size === 0 && this.redeemRetryTimer) {
           clearInterval(this.redeemRetryTimer);
           this.redeemRetryTimer = null;
@@ -929,12 +1269,29 @@ export class HaloVaultClient {
     this.startRedeemRetry();
   }
 
-  private async attemptRedeem(key: string): Promise<void> {
+  private attemptRedeem(key: string): Promise<void> {
+    let tracked: Promise<void>;
+    tracked = this.runRedeemAttempt(key).finally(() => {
+      this.activeRedeemAttempts.delete(tracked);
+    });
+    this.activeRedeemAttempts.add(tracked);
+    return tracked;
+  }
+
+  private async runRedeemAttempt(key: string): Promise<void> {
     const pending = this.pendingRedeems.get(key);
-    if (!pending || pending.inFlight) return;
+    if (
+      !pending ||
+      pending.inFlight ||
+      pending.terminalError ||
+      !this.loadDeadLetters()
+    ) {
+      return;
+    }
     pending.inFlight = true;
     const clearIfCurrent = () => {
-      if (this.pendingRedeems.get(key) === pending) {
+      const current = this.pendingRedeems.get(key);
+      if (current && samePendingRedeemReceipt(current, pending)) {
         this.pendingRedeems.delete(key);
         this.persistPending();
       }
@@ -977,6 +1334,14 @@ export class HaloVaultClient {
         );
         return;
       }
+      if (disposition === "terminal") {
+        this.quarantineTerminalRedeem(
+          key,
+          pending,
+          new VaultRedeemTerminalError("invalid-request")
+        );
+        return;
+      }
       switch (outcome.status) {
         case "confirmed":
         case "already-redeemed":
@@ -997,6 +1362,10 @@ export class HaloVaultClient {
           break;
       }
     } catch (e) {
+      if (e instanceof VaultRedeemTerminalError) {
+        this.quarantineTerminalRedeem(key, pending, e);
+        return;
+      }
       const cls = classifyRedeemError(errStr(e));
       if (cls === "collected") {
         clearIfCurrent();
@@ -1016,31 +1385,76 @@ export class HaloVaultClient {
   }
 
   private startRedeemRetry(): void {
-    if (this.redeemRetryTimer) return;
+    if (this.redeemRetryTimer || this.redeemEvidenceClosing || this.redeemEvidenceClosed) {
+      return;
+    }
     this.redeemRetryTimer = setInterval(() => {
+      if (this.redeemEvidenceClosing || this.redeemEvidenceClosed) return;
       for (const key of [...this.pendingRedeems.keys()]) void this.attemptRedeem(key);
     }, REDEEM_RETRY_INTERVAL_MS);
     this.redeemRetryTimer.unref?.();
   }
 
-  /** Make a final redemption attempt and stop the retry timer. */
-  async flushRedeems(): Promise<void> {
+  private async drainRedeems(): Promise<void> {
+    if (this.redeemRetryTimer) {
+      clearInterval(this.redeemRetryTimer);
+      this.redeemRetryTimer = null;
+    }
     await this.redeemQueue.catch(() => {});
+    if (this.redeemRetryTimer) {
+      clearInterval(this.redeemRetryTimer);
+      this.redeemRetryTimer = null;
+    }
     await Promise.allSettled([...this.pendingRedeems.keys()].map((key) => this.attemptRedeem(key)));
+    while (this.activeRedeemAttempts.size > 0) {
+      await Promise.allSettled([...this.activeRedeemAttempts]);
+    }
     if (this.redeemRetryTimer) {
       clearInterval(this.redeemRetryTimer);
       this.redeemRetryTimer = null;
     }
   }
 
+  /** Make a final redemption attempt and stop the retry timer. */
+  async flushRedeems(): Promise<void> {
+    if (this.redeemEvidenceClosing || this.redeemEvidenceClosed) {
+      throw new Error("vault redeem evidence ownership is closing or closed");
+    }
+    await this.drainRedeems();
+  }
+
+  /**
+   * Quiesce redeem work, then release exclusive ownership of configured evidence.
+   * Call only after admission and every caller that can record a receipt have stopped.
+   */
+  closeRedeemEvidenceStore(): Promise<void> {
+    if (this.redeemEvidenceClosePromise) return this.redeemEvidenceClosePromise;
+    this.redeemEvidenceClosing = true;
+    const ownership = this.redeemEvidenceOwnership;
+    this.redeemEvidenceClosePromise = (async () => {
+      await this.drainRedeems();
+      ownership?.release();
+      if (this.redeemEvidenceOwnership === ownership) {
+        this.redeemEvidenceOwnership = null;
+      }
+      this.redeemEvidenceClosed = true;
+    })();
+    return this.redeemEvidenceClosePromise;
+  }
+
   get pendingRedeemCount(): number {
     return this.pendingRedeems.size;
   }
 
-  /** Persist pending receipts atomically and best-effort. */
-  private persistPending(): void {
+  get deadLetterRedeemCount(): number {
+    this.loadDeadLetters();
+    return this.deadLetters.size;
+  }
+
+  /** Persist pending receipts through a durable replacement. */
+  private persistPending(required = false): boolean {
     const f = this.cfg.pendingStorePath;
-    if (!f) return;
+    if (!f) return true;
     try {
       const arr = [
         ...this.preservedForeignPending,
@@ -1053,40 +1467,66 @@ export class HaloVaultClient {
           cumulative: v.cumulative.toString(),
           signature: v.signature,
           cycle: v.cycle.toString(),
+          terminalReason: v.terminalError?.reason,
         })),
       ];
-      mkdirSync(dirname(f), { recursive: true });
-      const tmp = `${f}.tmp`;
-      writeFileSync(tmp, JSON.stringify(arr), "utf-8");
-      renameSync(tmp, f);
-    } catch {
-      // Persistence failure must not break a served response.
+      writeDurableJson(f, arr);
+      return true;
+    } catch (error) {
+      if (required) throw error;
+      return false;
     }
   }
 
   /** Reload persisted pending receipts and resume settlement. */
   resumePendingRedeems(): Promise<void> {
+    if (this.redeemEvidenceClosing || this.redeemEvidenceClosed) {
+      return Promise.reject(new Error("vault redeem evidence ownership is closing or closed"));
+    }
     const f = this.cfg.pendingStorePath;
     if (!f) return Promise.resolve();
+    if (!this.loadDeadLetters()) return Promise.resolve();
     let raw: string;
     try {
       raw = readFileSync(f, "utf-8");
     } catch {
       return Promise.resolve();
     }
-    let arr: PersistedPendingRedeem[];
+    let parsed: unknown;
     try {
-      arr = JSON.parse(raw);
+      parsed = JSON.parse(raw);
     } catch (e) {
       // Surface corruption because the file may represent unpaid work.
       this.cfg.log(`pending vault-redeem file unreadable, cannot resume (${errStr(e)}): ${f}`);
       return Promise.resolve();
     }
+    if (!Array.isArray(parsed)) {
+      this.cfg.log(`pending vault-redeem file has an invalid shape, cannot resume: ${f}`);
+      return Promise.resolve();
+    }
+    const arr = parsed as PersistedPendingRedeem[];
+    if (
+      arr.some(
+        (entry) =>
+          entry &&
+          entry.terminalReason !== undefined &&
+          !isVaultRedeemTerminalReason(entry.terminalReason)
+      )
+    ) {
+      this.cfg.log(`pending vault-redeem file has an invalid terminal fence, cannot resume: ${f}`);
+      return Promise.resolve();
+    }
     this.redeemQueue = this.redeemQueue.then(async () => {
-      if (!Array.isArray(arr) || arr.length === 0) return;
+      if (arr.length === 0) return;
       const consumer = getAddress(await this.consumer()).toLowerCase();
-      this.preservedForeignPending.length = 0;
+      const nextPendingRedeems = new Map(this.pendingRedeems);
+      const nextForeignPending: PersistedPendingRedeem[] = [];
+      const quarantinedKeys = new Set<string>();
       let skippedForeignIdentity = 0;
+      let suppressedDeadLetterDuplicates = 0;
+      let promotedDeadLetterHighWater = 0;
+      let recoveredTerminalFences = 0;
+      let reconciledTerminalReasons = 0;
       for (const e of arr) {
         try {
           const persistedVault =
@@ -1100,7 +1540,7 @@ export class HaloVaultClient {
             persistedConsumer !== consumer
           ) {
             skippedForeignIdentity++;
-            this.preservedForeignPending.push(e);
+            nextForeignPending.push(e);
             continue;
           }
           const operator = getAddress(e.operator).toLowerCase();
@@ -1110,26 +1550,115 @@ export class HaloVaultClient {
             continue;
           }
           const key = await this.cycleKey(operator, cycle, consumer);
-          this.pendingRedeems.set(key, {
+          const terminalError = e.terminalReason
+            ? new VaultRedeemTerminalError(e.terminalReason)
+            : undefined;
+          const candidate: PendingRedeem = {
             operator,
             consumer,
             cumulative,
             signature: e.signature,
             cycle,
             inFlight: false,
-          });
+            terminalError,
+          };
+          const deadLetter = this.deadLetters.get(key);
+          if (deadLetter) {
+            suppressedDeadLetterDuplicates++;
+            quarantinedKeys.add(key);
+            nextPendingRedeems.delete(key);
+            if (cumulative > BigInt(deadLetter.cumulative)) {
+              this.deadLetters.set(
+                key,
+                this.deadLetterEntry(key, candidate, terminalError?.reason ?? deadLetter.reason)
+              );
+              promotedDeadLetterHighWater++;
+            } else if (terminalError && terminalError.reason !== deadLetter.reason) {
+              this.deadLetters.set(key, {
+                ...deadLetter,
+                reason: terminalError.reason,
+              });
+              reconciledTerminalReasons++;
+            }
+            continue;
+          }
+          const existing = nextPendingRedeems.get(key);
+          if (terminalError) {
+            const terminalHighWater =
+              existing && existing.cumulative >= cumulative ? existing : candidate;
+            terminalHighWater.terminalError = terminalError;
+            nextPendingRedeems.set(key, terminalHighWater);
+            this.deadLetters.set(
+              key,
+              this.deadLetterEntry(key, terminalHighWater, terminalError.reason)
+            );
+            quarantinedKeys.add(key);
+            recoveredTerminalFences++;
+            continue;
+          }
+          if (existing && existing.cumulative >= cumulative) continue;
+          nextPendingRedeems.set(key, candidate);
           const priorCumulative = this.cumulative.get(key) ?? 0n;
           if (cumulative > priorCumulative) this.cumulative.set(key, cumulative);
           const priorCeiling = this.ceilingByKey.get(key) ?? 0n;
           if (cumulative > priorCeiling) this.ceilingByKey.set(key, cumulative);
         } catch {}
       }
+      if (
+        promotedDeadLetterHighWater > 0 ||
+        recoveredTerminalFences > 0 ||
+        reconciledTerminalReasons > 0
+      ) {
+        try {
+          this.persistDeadLetters();
+        } catch {
+          this.pendingRedeems.clear();
+          for (const [key, pending] of nextPendingRedeems) {
+            this.pendingRedeems.set(key, pending);
+          }
+          this.cfg.log(
+            `active terminal receipt promotion is unavailable; its durable pending fence prevents automatic replay`
+          );
+          return;
+        }
+      }
+      for (const key of quarantinedKeys) nextPendingRedeems.delete(key);
+      this.pendingRedeems.clear();
+      for (const [key, pending] of nextPendingRedeems) {
+        this.pendingRedeems.set(key, pending);
+      }
+      this.preservedForeignPending.length = 0;
+      this.preservedForeignPending.push(...nextForeignPending);
       if (skippedForeignIdentity > 0) {
         this.cfg.log(
           `ignored ${skippedForeignIdentity} pending vault redeem(s) lacking the current chain, vault, and consumer identity`
         );
       }
-      this.persistPending();
+      if (suppressedDeadLetterDuplicates > 0) {
+        this.cfg.log(
+          `suppressed ${suppressedDeadLetterDuplicates} active vault redeem duplicate(s) already held in the dead-letter store`
+        );
+      }
+      if (promotedDeadLetterHighWater > 0) {
+        this.cfg.log(
+          `promoted ${promotedDeadLetterHighWater} newer active terminal receipt(s) into the dead-letter store`
+        );
+      }
+      if (recoveredTerminalFences > 0) {
+        this.cfg.log(
+          `recovered ${recoveredTerminalFences} active terminal receipt fence(s) into the dead-letter store`
+        );
+      }
+      if (reconciledTerminalReasons > 0) {
+        this.cfg.log(
+          `reconciled ${reconciledTerminalReasons} active terminal receipt reason(s) into the dead-letter store`
+        );
+      }
+      if (!this.persistPending()) {
+        this.cfg.log(
+          `pending vault-redeem cleanup could not be persisted; in-memory reconciliation remains fenced from duplicate replay`
+        );
+      }
       if (this.pendingRedeems.size === 0) return;
       this.cfg.log(`resuming ${this.pendingRedeems.size} pending vault redeem(s) from a prior session`);
       this.startRedeemRetry();
@@ -1359,6 +1888,7 @@ export async function payInference(opts: PayInferenceOptions): Promise<Inference
 
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
+    ...cliVersionHeader(),
     "x-halo-payment-mode": "vault",
     "x-halo-operator": pin.address,
     "x-halo-vault-consumer": await withAbort(client.consumer(), opts.signal),

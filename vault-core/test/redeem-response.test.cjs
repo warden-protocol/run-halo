@@ -76,7 +76,14 @@ test("vaultRedeemDisposition clears only canonical success or uncollectable rece
       "uncollectable"
     );
   }
-  for (const reason of ["invalid-request", "unavailable"]) {
+  assert.equal(
+    vaultRedeemDisposition(
+      { status: "rejected", reason: "invalid-request", error: "bad request" },
+      expected
+    ),
+    "terminal"
+  );
+  for (const reason of ["unavailable"]) {
     assert.equal(
       vaultRedeemDisposition({ status: "rejected", reason, error: "retry" }, expected),
       "retry"
