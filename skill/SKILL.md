@@ -68,7 +68,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/warden-protocol/run-halo/mai
 ```
 
 The current dependency set requires **Node 22.19+** because the locked CLI dependency
-`undici@8.5.0` declares that minimum. The installer and CLI runtime checks still accept
+`undici@8.10.0` declares that minimum. The installer and CLI runtime checks still accept
 Node 20+, so passing those checks does not establish compatibility. The script resolves the
 latest CI-verified `cli-vX.Y.Z` release into `~/.halo/src`, builds
 `vault-core → sdk → cli` with `npm ci`, links it with `npm link`, and verifies with
@@ -390,7 +390,7 @@ print(resp.choices[0].message.content)
   authenticity remains subject to the verifier limitation below. Image generation, including
   NEAR image generation, does not use the TEE chat path. Image edits have no TEE adapter and are
   rejected when this flag or request-level `X-Halo-Confidential` requires confidential routing.
-- `--tee-base-url <url>` — TEE provider attestation endpoint (default `https://cloud-api.near.ai/v1`).
+- `--tee-base-url <url>` — override the TEE attestation base URL (default: configured relay `/v1`).
 
 **Endpoints:** `POST /v1/chat/completions`, `POST /v1/images/generations`,
 `POST /v1/images/edits`, `GET /v1/models`, `GET /health`, `GET /v1/account`

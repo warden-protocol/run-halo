@@ -762,6 +762,24 @@ export function requiredVaultReservationBase(payload: unknown): bigint | null {
   return required > 0n ? required : null;
 }
 
+/** Detect the operator's typed credit-window 402. Re-reserving cannot free the
+ *  window (only a receipt or redeem can), but the gate refuses BEFORE any
+ *  provider work, so replaying the identical request after a wait is safe. */
+export function isVaultCreditWindowExceeded(payload: unknown): boolean {
+  let decoded = payload;
+  if (typeof decoded === "string") {
+    try {
+      decoded = JSON.parse(decoded) as unknown;
+    } catch {
+      return false;
+    }
+  }
+  if (!decoded || typeof decoded !== "object") return false;
+  const error = (decoded as { error?: unknown }).error;
+  if (!error || typeof error !== "object") return false;
+  return (error as { type?: unknown }).type === "vault_credit_window_exceeded";
+}
+
 /** OpenAI's published per-message overhead: role + delimiter tokens. */
 const MESSAGE_OVERHEAD_TOKENS = 4;
 

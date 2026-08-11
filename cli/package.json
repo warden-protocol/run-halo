@@ -33,7 +33,7 @@
     "ethers": "6.17.0",
     "nearai-cloud-verifier": "0.0.1-alpha.1",
     "prompts": "2.4.2",
-    "undici": "^8.5.0",
+    "undici": "^8.10.0",
     "ws": "8.21.0"
   },
   "devDependencies": {

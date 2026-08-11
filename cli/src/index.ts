@@ -63,7 +63,7 @@ halo — Halo operator + payer CLI
     --max-usdc <n>             per-request spend ceiling in USD (default 0.10)
     --keystore <path>          wallet keystore to pay from (default: operator keystore)
     --confidential             require TEE routing for chat; image edits fail closed because no TEE edit adapter exists
-    --tee-base-url <url>       TEE provider attestation endpoint (default https://cloud-api.near.ai/v1)
+    --tee-base-url <url>       override TEE attestation base URL (default: configured relay /v1)
     --no-attestation-verify    DEBUG: skip the DCAP hardware attestation check (signature-only); not recommended
     --no-e2e                   disable optional operator E2E for chat completions (sends that prompt to the relay in plaintext); image routes still require encrypted media
     --budget-usdc <n>          cumulative spend cap (USD) for this run — bounds an agent's total spend across many requests (0/unset = uncapped). Raise at runtime: POST /v1/budget {"limitUsd": N}

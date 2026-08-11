@@ -91,7 +91,7 @@ export function newClientKey(): { privateKey: string; pubHex: string } {
   return { privateKey: w.privateKey, pubHex: uncompressedPub(w.privateKey).slice(4) };
 }
 
-/** Fetch the model's attestation (PUBLIC endpoint — no operator key required). */
+/** Fetch the model's attestation from the configured provider or relay base URL. */
 export async function fetchModelAttestation(
   baseUrl: string,
   model: string

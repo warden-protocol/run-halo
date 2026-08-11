@@ -152,6 +152,115 @@ test("vaultSend meters a body settlement frame even under a generic content-type
   assert.deepEqual(redeemed(), { operator, cost: 88n });
 });
 
+const creditWindow402 = () =>
+  new Response(
+    JSON.stringify({
+      error: {
+        type: "vault_credit_window_exceeded",
+        message: "Vault credit window exceeded: awaiting a receipt for prior work",
+        requiredUsdcBase: "6160",
+      },
+    }),
+    { status: 402, headers: { "content-type": "application/json" } }
+  );
+
+test("vaultSend waits out a transiently full credit window and replays the identical request", async (t) => {
+  const originalFetch = global.fetch;
+  const originalWait = process.env.HALO_VAULT_CREDIT_WAIT_BASE_MS;
+  process.env.HALO_VAULT_CREDIT_WAIT_BASE_MS = "1";
+  t.after(() => {
+    global.fetch = originalFetch;
+    if (originalWait === undefined) delete process.env.HALO_VAULT_CREDIT_WAIT_BASE_MS;
+    else process.env.HALO_VAULT_CREDIT_WAIT_BASE_MS = originalWait;
+  });
+  const paymentResponse = Buffer.from(JSON.stringify({ amountUsdc: "42" })).toString("base64");
+  const requestBodies: string[] = [];
+  let sends = 0;
+  global.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    sends += 1;
+    requestBodies.push(String(init?.body ?? ""));
+    if (sends <= 2) return creditWindow402();
+    return new Response('{"choices":[]}', {
+      status: 200,
+      headers: { "PAYMENT-RESPONSE": paymentResponse },
+    });
+  }) as typeof fetch;
+  let reservations = 0;
+  const operator = "0x00000000000000000000000000000000000000c5";
+  const client = {
+    ensureReservation: async () => {
+      reservations += 1;
+      return {
+        ops: { locked: 1_000_000n, redeemed: 0n, expiry: 0n, created: 0n, cycle: 1n },
+        keyEpoch: 1n,
+      };
+    },
+    consumer: async () => "0x00000000000000000000000000000000000000c6",
+    recordAndRedeem: () => {},
+  } as unknown as VaultConsumeClient;
+  const result = await runVaultSend(client, operator);
+  assert.equal(sends, 3, "first send + two credit-window waits");
+  assert.equal(reservations, 1, "a full credit window must not trigger re-reservation");
+  assert.deepEqual(
+    requestBodies,
+    [requestBodies[0], requestBodies[0], requestBodies[0]],
+    "each credit-window replay resends the identical body"
+  );
+  assert.equal(result.status, 200);
+  assert.equal(result.paid, true);
+  assert.equal(result.chargedBase, "42");
+});
+
+test("vaultSend surfaces a persistently full credit window after bounded waits", async (t) => {
+  const originalFetch = global.fetch;
+  const originalWait = process.env.HALO_VAULT_CREDIT_WAIT_BASE_MS;
+  process.env.HALO_VAULT_CREDIT_WAIT_BASE_MS = "1";
+  t.after(() => {
+    global.fetch = originalFetch;
+    if (originalWait === undefined) delete process.env.HALO_VAULT_CREDIT_WAIT_BASE_MS;
+    else process.env.HALO_VAULT_CREDIT_WAIT_BASE_MS = originalWait;
+  });
+  let sends = 0;
+  global.fetch = (async () => {
+    sends += 1;
+    return creditWindow402();
+  }) as typeof fetch;
+  const operator = "0x00000000000000000000000000000000000000c7";
+  const { client, redeemed } = meteringClient(operator);
+  const result = await runVaultSend(client, operator);
+  assert.equal(sends, 4, "first send + the bounded credit-window replays");
+  assert.equal(result.status, 402);
+  assert.equal(result.paid, false);
+  assert.equal(redeemed(), undefined);
+});
+
+test("vaultSend aborts a pending credit-window wait when the caller disconnects", async (t) => {
+  const originalFetch = global.fetch;
+  const originalWait = process.env.HALO_VAULT_CREDIT_WAIT_BASE_MS;
+  process.env.HALO_VAULT_CREDIT_WAIT_BASE_MS = "60000";
+  t.after(() => {
+    global.fetch = originalFetch;
+    if (originalWait === undefined) delete process.env.HALO_VAULT_CREDIT_WAIT_BASE_MS;
+    else process.env.HALO_VAULT_CREDIT_WAIT_BASE_MS = originalWait;
+  });
+  const controller = new AbortController();
+  global.fetch = (async () => {
+    queueMicrotask(() => controller.abort(new Error("client disconnected")));
+    return creditWindow402();
+  }) as typeof fetch;
+  const operator = "0x00000000000000000000000000000000000000c8";
+  const { client } = meteringClient(operator);
+  await assert.rejects(
+    vaultSend(
+      client,
+      "https://relay.invalid/v1/chat/completions",
+      { model: "model", messages: [{ role: "user", content: "hello" }] },
+      { forwardHeaders: {}, signal: controller.signal, operator, priceUsdPerMtok: 1, estTokens: 1_000 }
+    ),
+    /client disconnected/
+  );
+});
+
 test("vaultSend retries reservation-insufficient 402s more than once, up to the bounded cap (F6)", async (t) => {
   const originalFetch = global.fetch;
   t.after(() => {

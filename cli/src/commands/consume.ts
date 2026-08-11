@@ -52,6 +52,7 @@ import {
   IMAGE_EDIT_MAX_OUTPUT_IMAGES,
   IMAGE_EDIT_MAX_PROMPT_BYTES,
   estimateReservationTokens,
+  isVaultCreditWindowExceeded,
   meterVaultResponse,
   priceImages,
   requiredVaultReservationBase,
@@ -86,7 +87,7 @@ interface Args {
   host?: string;
   /** Encrypt to the reported TEE key and require the response signer to match. */
   confidential?: boolean;
-  /** Base URL of the TEE provider's attestation/key endpoint (default NEAR). */
+  /** Optional TEE attestation base URL override (defaults to the configured relay proxy). */
   teeBaseUrl?: string;
   /** Skip the full DCAP hardware attestation verification (Intel TDX + NVIDIA)
    *  on confidential requests — falls back to signature-only verification.
@@ -116,6 +117,10 @@ interface Args {
 }
 
 const MAX_BODY_BYTES = 5 * 1024 * 1024;
+
+export function resolveTeeBaseUrl(relayUrl: string, override?: string): string {
+  return (override ?? `${relayUrl.replace(/\/+$/, "")}/v1`).replace(/\/+$/, "");
+}
 
 interface VaultOperatorPin {
   address: string;
@@ -253,6 +258,31 @@ export async function selectVaultImageOperator(
   }
 }
 
+/** Bounded replays of a credit-window 402; the gate refuses before provider work. */
+const MAX_VAULT_CREDIT_WAIT_ATTEMPTS = 3;
+
+function vaultCreditWaitMs(attempt: number): number {
+  const raw = Number(process.env.HALO_VAULT_CREDIT_WAIT_BASE_MS ?? "1000");
+  const base = Number.isFinite(raw) && raw >= 0 ? raw : 1_000;
+  return base * 2 ** attempt;
+}
+
+function delayUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const fail = (): void => reject(signal.reason ?? new Error("request aborted"));
+    if (signal.aborted) return fail();
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      fail();
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 /** Send one reserved vault inference and return the shared response shape; redeem actual cost in background. */
 export async function vaultSend(
   client: VaultConsumeClient,
@@ -289,15 +319,25 @@ export async function vaultSend(
     fetch(url, { method: "POST", headers, body: requestBody, signal: opts.signal });
   let res = await send();
   let text = await res.text();
-  // Re-reserve and replay boundedly because the operator's gate price may advance between attempts.
-  for (
-    let attempt = 1;
-    attempt < MAX_VAULT_RESERVATION_ATTEMPTS && res.status === 402;
-    attempt++
-  ) {
-    const required = requiredVaultReservationBase(text);
-    if (required === null) break;
-    ({ ops, keyEpoch } = await client.ensureReservation(opts.operator, required));
+  // Bounded 402 recovery. Both refusals happen BEFORE any provider work, so
+  // replaying the identical body cannot double-charge:
+  // - reservation-insufficient: re-reserve to the operator's stated floor
+  //   (its gate price may advance between attempts);
+  // - credit-window-exceeded: wait, because receipts and redeems land
+  //   asynchronously and typically free the window within seconds.
+  let reserveAttempts = 1;
+  let creditWaits = 0;
+  while (res.status === 402) {
+    if (isVaultCreditWindowExceeded(text)) {
+      if (creditWaits >= MAX_VAULT_CREDIT_WAIT_ATTEMPTS) break;
+      await delayUnlessAborted(vaultCreditWaitMs(creditWaits), opts.signal);
+      creditWaits += 1;
+    } else {
+      const required = requiredVaultReservationBase(text);
+      if (required === null || reserveAttempts >= MAX_VAULT_RESERVATION_ATTEMPTS) break;
+      reserveAttempts += 1;
+      ({ ops, keyEpoch } = await client.ensureReservation(opts.operator, required));
+    }
     res = await send();
     text = await res.text();
   }
@@ -1531,10 +1571,8 @@ export async function cmdConsume(args: Args): Promise<void> {
   const defaultModel = cfg.consume?.defaultModel;
   const allowedModels = cfg.consume?.allowedModels;
   // Confidential (TEE) mode: route only to TEE operators and E2E-encrypt the
-  // prompt to the enclave. The base URL is the TEE provider's public
-  // attestation/key endpoint (NEAR by default).
+  // prompt to the enclave.
   const confidential = args.confidential === true;
-  const teeBaseUrl = (args.teeBaseUrl ?? "https://cloud-api.near.ai/v1").replace(/\/+$/, "");
 
   // Passphrase resolution, mirroring `serve`: unattended (empty) when the
   // keystore was created with --no-wallet-passphrase, else HALO_PASSPHRASE env
@@ -1552,6 +1590,7 @@ export async function cmdConsume(args: Args): Promise<void> {
 
   const wallet = await loadWallet(keystorePath, passphrase);
   const relayBase = cfg.relayUrl.replace(/\/+$/, "");
+  const teeBaseUrl = resolveTeeBaseUrl(relayBase, args.teeBaseUrl);
   const completionsUrl = `${relayBase}/v1/chat/completions`;
   const modelsUrl = `${relayBase}/v1/models`;
 
