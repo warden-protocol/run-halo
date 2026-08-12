@@ -25,6 +25,11 @@ RUN npm run build
 # cli — esbuild bundles @halo/vault-core + halo-sdk into a self-contained
 # dist/index.js, so the runner needs neither package at runtime.
 WORKDIR /app/cli
+# The version the CLI reports. Without it the build has no git to describe and
+# falls back to "untagged", which the relay's version gate rejects. CI passes the
+# cli-vX.Y.Z tag being built.
+ARG HALO_CLI_VERSION=""
+ENV HALO_CLI_VERSION=$HALO_CLI_VERSION
 COPY cli/package*.json cli/tsconfig.json ./
 RUN npm ci --silent
 COPY cli/scripts ./scripts
