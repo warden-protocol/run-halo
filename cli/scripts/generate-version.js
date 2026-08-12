@@ -4,15 +4,23 @@ const { writeFileSync } = require("node:fs");
 const path = require("node:path");
 
 const repoRoot = path.resolve(__dirname, "../..");
-let version;
-try {
-  version = execFileSync(
-    "git",
-    ["describe", "--tags", "--match", "cli-v*", "--always", "--dirty"],
-    { cwd: repoRoot, encoding: "utf8" }
-  ).trim();
-} catch {
-  version = "untagged";
+
+// A container build has no usable git: node:20-alpine ships no git binary, and
+// the build context may omit .git entirely, so `git describe` always fails and
+// the version silently becomes "untagged". A CLI reporting that is rejected by
+// the relay's version gate, which parses X.Y.Z. HALO_CLI_VERSION lets the build
+// state the tag it is building; git remains the source for ordinary local work.
+let version = (process.env.HALO_CLI_VERSION || "").trim();
+if (!version) {
+  try {
+    version = execFileSync(
+      "git",
+      ["describe", "--tags", "--match", "cli-v*", "--always", "--dirty"],
+      { cwd: repoRoot, encoding: "utf8" }
+    ).trim();
+  } catch {
+    version = "untagged";
+  }
 }
 
 writeFileSync(

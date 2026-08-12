@@ -1,0 +1,88 @@
+---
+# Publishes the CLI container image on each cli-vX.Y.Z tag.
+#
+# The image exists so downstream images can build FROM a CLI whose reported
+# version is real. Building the CLI from another repository's source produced a
+# binary reporting "untagged" — `generate-version.js` shells out to `git
+# describe`, and a container build has neither the git binary nor, usually, the
+# .git directory. The relay's version gate parses X.Y.Z and rejects anything it
+# cannot parse, so those operators were refused with 426.
+#
+# Tags are cut by cli-release.yaml, which validates vault-core → SDK → CLI before
+# pushing cli-vX.Y.Z. This workflow only packages an already-validated tag, so it
+# deliberately re-runs no tests.
+#
+# The image is the plain CLI and nothing else. Anything operator-fleet specific
+# layers on top of it in a private repository.
+
+name: Publish CLI image
+
+"on":
+  push:
+    tags:
+      - "cli-v*"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-push:
+    name: Build & push CLI image
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/warden-protocol/halo/cli
+          # The git tag verbatim (cli-v0.6.1), plus the bare semver. No `latest`:
+          # a downstream FROM should name the version it was built against, and a
+          # moving tag would let the CLI change under it without a commit.
+          tags: |
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./cli/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # The tag being built, so the CLI reports a version the relay can parse
+          # rather than falling back to "untagged".
+          build-args: |
+            HALO_CLI_VERSION=${{ github.ref_name }}
+          cache-from: type=gha,scope=cli
+          cache-to: type=gha,mode=max,scope=cli
+
+      - name: Verify the image reports the tag it was built from
+        run: |
+          set -euo pipefail
+          reported="$(docker run --rm \
+            ghcr.io/warden-protocol/halo/cli:${{ github.ref_name }} --version)"
+          echo "reported: ${reported}"
+          # Guards the failure this workflow exists to prevent: a published image
+          # that reports "untagged" is refused by the relay's version gate, and
+          # without this check that is only discovered at runtime.
+          if [ "${reported}" != "${{ github.ref_name }}" ]; then
+            echo "::error::image reports '${reported}', expected '${{ github.ref_name }}'"
+            exit 1
+          fi
