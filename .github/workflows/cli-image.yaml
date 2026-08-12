@@ -14,6 +14,11 @@
 #
 # The image is the plain CLI and nothing else. Anything operator-fleet specific
 # layers on top of it in a private repository.
+#
+# workflow_dispatch exists because the tag trigger only fires on a *new* tag:
+# releases cut before this workflow existed would otherwise have no image and no
+# way to get one. It builds a tag that already exists rather than creating one,
+# so it cannot mint a release.
 
 name: Publish CLI image
 
@@ -21,6 +26,12 @@ name: Publish CLI image
   push:
     tags:
       - "cli-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to publish, e.g. cli-v0.6.1"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -32,8 +43,33 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      # One resolved version for the whole job. On a tag push github.ref_name is
+      # the tag; on a manual run it is the branch the workflow was started from,
+      # so the input has to be used instead.
+      - name: Resolve the tag to publish
+        id: resolve
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            version="${{ inputs.tag }}"
+          else
+            version="${{ github.ref_name }}"
+          fi
+          # Exact grammar only. A typo here would publish an image under a tag
+          # nothing can resolve, or overwrite an unrelated one.
+          if ! printf '%s' "$version" | grep -Eq '^cli-v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::'$version' is not an exact cli-vX.Y.Z tag"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "semver=${version#cli-v}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout the tag
         uses: actions/checkout@v4
+        with:
+          # Checking out the tag rather than the dispatching branch is what makes
+          # a manual run reproduce the tagged source exactly.
+          ref: ${{ steps.resolve.outputs.version }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -50,12 +86,14 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/warden-protocol/halo/cli
-          # The git tag verbatim (cli-v0.6.1), plus the bare semver. No `latest`:
-          # a downstream FROM should name the version it was built against, and a
-          # moving tag would let the CLI change under it without a commit.
+          # The git tag verbatim (cli-v0.6.1), plus the bare semver. Written as
+          # raw values so a manual run tags identically to a tag push. No
+          # `latest`: a downstream FROM should name the version it was built
+          # against, and a moving tag would let the CLI change under it without a
+          # commit.
           tags: |
-            type=ref,event=tag
-            type=semver,pattern={{version}}
+            type=raw,value=${{ steps.resolve.outputs.version }}
+            type=raw,value=${{ steps.resolve.outputs.semver }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -69,20 +107,21 @@ jobs:
           # The tag being built, so the CLI reports a version the relay can parse
           # rather than falling back to "untagged".
           build-args: |
-            HALO_CLI_VERSION=${{ github.ref_name }}
+            HALO_CLI_VERSION=${{ steps.resolve.outputs.version }}
           cache-from: type=gha,scope=cli
           cache-to: type=gha,mode=max,scope=cli
 
       - name: Verify the image reports the tag it was built from
         run: |
           set -euo pipefail
+          expected="${{ steps.resolve.outputs.version }}"
           reported="$(docker run --rm \
-            ghcr.io/warden-protocol/halo/cli:${{ github.ref_name }} --version)"
+            ghcr.io/warden-protocol/halo/cli:"${expected}" --version)"
           echo "reported: ${reported}"
           # Guards the failure this workflow exists to prevent: a published image
           # that reports "untagged" is refused by the relay's version gate, and
           # without this check that is only discovered at runtime.
-          if [ "${reported}" != "${{ github.ref_name }}" ]; then
-            echo "::error::image reports '${reported}', expected '${{ github.ref_name }}'"
+          if [ "${reported}" != "${expected}" ]; then
+            echo "::error::image reports '${reported}', expected '${expected}'"
             exit 1
           fi
