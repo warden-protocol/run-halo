@@ -1,8 +1,231 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { Wallet } from "ethers";
+import {
+  EMPTY_VAULT_SSE_REPLAY_DIGEST,
+  VAULT_SSE_REPLAY_EPHEMERAL_PROTOCOL,
+  VAULT_SSE_REPLAY_MANIFEST_TYPES,
+  advanceVaultSseReplayDigest,
+  digestVaultSseReplayRequest,
+  parseVaultSseReplayPrepareRequest,
+  recoverVaultSseReplayReceiptSigner,
+  vaultSseReplayDomain,
+  vaultSseReplayManifestValue,
+  type VaultSseReplayPair,
+  type VaultSseReplayPrepareRequest,
+  type VaultSseReplayUnsignedManifest,
+} from "@halo/vault-core";
 import { vaultSend } from "./commands/consume";
 import type { VaultConsumeClient } from "./vault-consume";
 import { HALO_VERSION } from "./version";
+
+function replayEvent(name: string, data: unknown): string {
+  return `event: ${name}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+test("vaultSend uses capable CLI replay and returns only after exact receipt custody", async (t) => {
+  const originalFetch = global.fetch;
+  t.after(() => {
+    global.fetch = originalFetch;
+  });
+  const consumerSession = Wallet.createRandom();
+  const operatorWallet = Wallet.createRandom();
+  const vaultAddress = Wallet.createRandom().address.toLowerCase();
+  const consumer = Wallet.createRandom().address.toLowerCase();
+  const requestId = "00000000-0000-4000-8000-000000000002";
+  const resumeToken = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+  const frame = JSON.stringify({
+    id: "chat-cli",
+    object: "chat.completion.chunk",
+    created: 2_345,
+    model: "test/model",
+    choices: [
+      {
+        index: 0,
+        delta: { role: "assistant", content: "hello" },
+        finish_reason: "stop",
+      },
+    ],
+  });
+  const responseDigest = advanceVaultSseReplayDigest(
+    EMPTY_VAULT_SSE_REPLAY_DIGEST,
+    frame
+  );
+  let prepared: VaultSseReplayPrepareRequest | undefined;
+  let ordinaryPosts = 0;
+  let receiptDelivered = false;
+  global.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith("/prepare")) {
+      prepared = parseVaultSseReplayPrepareRequest(
+        JSON.parse(String(init?.body))
+      ) ?? undefined;
+      assert.ok(prepared);
+      return Response.json(
+        {
+          protocol: VAULT_SSE_REPLAY_EPHEMERAL_PROTOCOL,
+          requestId,
+          resumeToken,
+          prepareExpiresAtMs: Date.now() + 10_000,
+        },
+        { status: 201 }
+      );
+    }
+    if (url.endsWith("/attach")) {
+      assert.ok(prepared);
+      const pair = prepared.pair as VaultSseReplayPair;
+      const unsigned: VaultSseReplayUnsignedManifest = {
+        protocol: VAULT_SSE_REPLAY_EPHEMERAL_PROTOCOL,
+        requestId,
+        requestDigest: digestVaultSseReplayRequest(prepared.requestBody),
+        responseDigest,
+        vault: pair.vault,
+        consumer: pair.consumer,
+        operator: pair.operator,
+        cycle: pair.cycle,
+        keyEpoch: pair.keyEpoch,
+        amountUsdc: "11",
+        frameCount: 1,
+        outcome: "success",
+      };
+      const manifest = {
+        ...unsigned,
+        signature: await operatorWallet.signTypedData(
+          vaultSseReplayDomain(pair.chainId, pair.vault),
+          VAULT_SSE_REPLAY_MANIFEST_TYPES,
+          vaultSseReplayManifestValue(unsigned)
+        ),
+      };
+      const resultExpiresAtMs = Date.now() + 30_000;
+      return new Response(
+        replayEvent("halo-replay-attached", {
+          protocol: VAULT_SSE_REPLAY_EPHEMERAL_PROTOCOL,
+          requestId,
+          state: "complete",
+          resultExpiresAtMs,
+        }) +
+          replayEvent("halo-replay-frame", {
+            requestId,
+            index: 0,
+            data: frame,
+            encrypted: true,
+          }) +
+          replayEvent("halo-replay-result", {
+            manifest,
+            resultExpiresAtMs,
+          }),
+        { status: 200, headers: { "content-type": "text/event-stream" } }
+      );
+    }
+    if (url.endsWith("/receipt")) {
+      const delivery = JSON.parse(String(init?.body));
+      assert.equal(
+        recoverVaultSseReplayReceiptSigner(delivery),
+        consumerSession.address.toLowerCase()
+      );
+      receiptDelivered = true;
+      return Response.json({ accepted: true, requestId }, { status: 202 });
+    }
+    if (url.endsWith("/v1/chat/completions")) ordinaryPosts += 1;
+    throw new Error(`unexpected request: ${url}`);
+  }) as typeof fetch;
+
+  let replayRecorded = false;
+  const receiptSignature = await consumerSession.signMessage("vault receipt");
+  const client = {
+    ensureReservation: async () => ({
+      ops: {
+        locked: 1_000n,
+        redeemed: 20n,
+        expiry: 0n,
+        created: 0n,
+        cycle: 7n,
+      },
+      keyEpoch: 2n,
+    }),
+    consumer: async () => consumer,
+    recordAndRedeem: () => {
+      throw new Error("legacy receipt path must not run");
+    },
+    recordReplayAndRedeem: async (
+      servedBy: string,
+      _ops: unknown,
+      keyEpoch: bigint,
+      cost: bigint,
+      takeCustody: (receipt: {
+        priorCumulative: string;
+        targetCumulative: string;
+        receiptSignature: string;
+      }) => Promise<void>
+    ) => {
+      assert.equal(servedBy, operatorWallet.address.toLowerCase());
+      assert.equal(keyEpoch, 2n);
+      assert.equal(cost, 11n);
+      await takeCustody({
+        priorCumulative: "20",
+        targetCumulative: "31",
+        receiptSignature,
+      });
+      replayRecorded = true;
+    },
+  } as unknown as VaultConsumeClient;
+  const request = {
+    model: "test/model",
+    stream: true,
+    _enc: { encrypted: "request" },
+  };
+  const result = await vaultSend(
+    client,
+    "https://relay.invalid/v1/chat/completions",
+    request,
+    {
+      forwardHeaders: {},
+      signal: new AbortController().signal,
+      operator: operatorWallet.address.toLowerCase(),
+      priceUsdPerMtok: 1,
+      estTokens: 100,
+      replay: {
+        relayUrl: "https://relay.invalid",
+        vaultAddress,
+        sessionWallet: consumerSession,
+        decryptFrame: async (value) => value,
+      },
+    }
+  );
+
+  assert.equal(ordinaryPosts, 0);
+  assert.equal(receiptDelivered, true);
+  assert.equal(replayRecorded, true);
+  assert.equal(result.status, 200);
+  assert.equal(result.paid, true);
+  assert.equal(result.chargedBase, "11");
+  assert.equal(result.e2eDecrypted, true);
+  assert.deepEqual(JSON.parse(result.body), {
+    id: "chat-cli",
+    object: "chat.completion",
+    created: 2_345,
+    model: "test/model",
+    choices: [
+      {
+        index: 0,
+        message: { role: "assistant", content: "hello" },
+        finish_reason: "stop",
+      },
+    ],
+  });
+  assert.deepEqual(JSON.parse(prepared?.requestBody ?? "null"), {
+    ...request,
+    maxAmountUsdc: "120",
+  });
+  assert.deepEqual(prepared?.pair, {
+    chainId: "8453",
+    vault: vaultAddress,
+    consumer,
+    operator: operatorWallet.address.toLowerCase(),
+    cycle: "7",
+    keyEpoch: "2",
+  });
+});
 
 test("vaultSend re-reserves the typed operator requirement and retries the unserved request once", async (t) => {
   const originalFetch = global.fetch;

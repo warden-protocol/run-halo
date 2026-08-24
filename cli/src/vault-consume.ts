@@ -13,6 +13,7 @@ import {
   deriveSubKeyPrivateKey,
   formatUsdcBase,
   subKeyDerivationMessage,
+  type OpsState,
 } from "@halo/vault-core";
 import {
   facilitatorVaultError,
@@ -56,6 +57,26 @@ export class VaultConsumeClient extends HaloVaultClient {
           target === "relay" ? relayCliVersion() : HALO_VERSION,
       } as SdkVaultConfig,
       sessionSigner
+    );
+  }
+
+  recordReplayAndRedeem(
+    operator: string,
+    ops: OpsState,
+    keyEpoch: bigint,
+    cost: bigint,
+    takeCustody: (receipt: {
+      priorCumulative: string;
+      targetCumulative: string;
+      receiptSignature: string;
+    }) => Promise<void>
+  ): Promise<void> {
+    return this.recordAndRedeemWithCustody(
+      operator,
+      ops,
+      keyEpoch,
+      cost,
+      takeCustody
     );
   }
 }

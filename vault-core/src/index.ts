@@ -13,6 +13,7 @@ import {
 } from "./consensus.generated.js";
 
 export * from "./consensus.generated.js";
+export * from "./vaultSseReplay.js";
 
 export const VAULT_ABI = [
   "function deposit(uint256 amount, address sessionKey)",

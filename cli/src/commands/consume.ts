@@ -60,6 +60,7 @@ import {
   selectVaultOperatorFromList,
   serializeImageEditPlaintext,
   settlementAmount,
+  VAULT_SSE_REPLAY_EPHEMERAL_PROTOCOL,
   withReservationMargin,
   type VaultOperatorSelectionReason,
 } from "@halo/vault-core";
@@ -74,6 +75,12 @@ import { setCliVersionHeader } from "../versionHeader";
 import { restartIntoManagedInstall, startAutoUpdateMonitor } from "../update";
 import { relayCliVersion } from "../relayVersion";
 import { resolveVaultAddress } from "../vault-address";
+import {
+  buildCliVaultSseReplayRequestBody,
+  deliverCliVaultSseReplayReceipt,
+  runCliVaultSseReplay,
+  type RunCliVaultSseReplayInput,
+} from "../vaultSseReplayConsumer";
 
 interface Args {
   port?: number;
@@ -126,6 +133,8 @@ interface VaultOperatorPin {
   address: string;
   priceUsdPerMtok: number;
   encryptionPubkey: string | null;
+  streaming: boolean;
+  vaultSseReplay: boolean;
 }
 
 interface VaultOperatorSelectionResult {
@@ -155,6 +164,8 @@ async function selectVaultOperator(
         tee?: boolean;
         teeModels?: string[];
         vaultPayments?: boolean;
+        streaming?: boolean;
+        vaultProtocols?: string[];
       }>;
     };
     const selection = selectVaultOperatorFromList(operators, model, {
@@ -174,6 +185,12 @@ async function selectVaultOperator(
           operator.encryptionPubkey,
           operator.pubkeyAttestation
         ),
+        streaming: operator.streaming === true,
+        vaultSseReplay:
+          Array.isArray(operator.vaultProtocols) &&
+          operator.vaultProtocols.includes(
+            VAULT_SSE_REPLAY_EPHEMERAL_PROTOCOL
+          ),
       },
       reason: selection.reason,
     };
@@ -294,12 +311,26 @@ export async function vaultSend(
     operator: string;
     priceUsdPerMtok: number;
     estTokens: number;
+    replay?: {
+      relayUrl: string;
+      vaultAddress: string;
+      sessionWallet: RunCliVaultSseReplayInput["sessionWallet"];
+      decryptFrame: RunCliVaultSseReplayInput["decryptFrame"];
+    };
   }
-): Promise<{ status: number; headers: Headers; body: string; paid: boolean; chargedBase?: string }> {
+): Promise<{
+  status: number;
+  headers: Headers;
+  body: string;
+  paid: boolean;
+  chargedBase?: string;
+  e2eDecrypted?: boolean;
+}> {
   const estCost = withReservationMargin(priceTokens(opts.priceUsdPerMtok, opts.estTokens));
   let ops: OpsState;
   let keyEpoch: bigint;
   ({ ops, keyEpoch } = await client.ensureReservation(opts.operator, estCost));
+  const consumer = await client.consumer();
 
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -307,14 +338,80 @@ export async function vaultSend(
     // Vault-critical headers win over any forwarded ones.
     "x-halo-payment-mode": "vault",
     "x-halo-operator": opts.operator,
-    "x-halo-vault-consumer": await client.consumer(),
+    "x-halo-vault-consumer": consumer,
   };
   setCliVersionHeader(headers);
   if (!("x-halo-max-price" in headers) && !("X-Halo-Max-Price" in headers)) {
     headers["x-halo-max-price"] = String(opts.priceUsdPerMtok);
   }
 
-  const requestBody = JSON.stringify(body);
+  const requestBody = JSON.stringify(
+    opts.replay && body && typeof body === "object" && !Array.isArray(body)
+      ? { ...body, maxAmountUsdc: estCost.toString() }
+      : body
+  );
+  if (opts.replay) {
+    const replayResult = await runCliVaultSseReplay({
+      relayUrl: opts.replay.relayUrl,
+      path: "/v1/chat/completions",
+      requestBody,
+      maxAmountUsdc: estCost,
+      pair: {
+        chainId: String(BASE_CHAIN_ID),
+        vault: opts.replay.vaultAddress.toLowerCase(),
+        consumer: consumer.toLowerCase(),
+        operator: opts.operator.toLowerCase(),
+        cycle: ops.cycle.toString(),
+        keyEpoch: keyEpoch.toString(),
+      },
+      sessionWallet: opts.replay.sessionWallet,
+      decryptFrame: opts.replay.decryptFrame,
+      signal: opts.signal,
+    });
+    const replayHeaders = new Headers({
+      "content-type": "application/json",
+      "x-halo-operator": opts.operator,
+    });
+    if (replayResult.manifest.outcome !== "success") {
+      return {
+        status: 502,
+        headers: replayHeaders,
+        body: JSON.stringify({
+          error: {
+            type: "replay_failed_unserved",
+            message: "operator did not complete the replayable inference",
+          },
+        }),
+        paid: false,
+        e2eDecrypted: true,
+      };
+    }
+    const cost = BigInt(replayResult.manifest.amountUsdc);
+    await client.recordReplayAndRedeem(
+      opts.operator,
+      ops,
+      keyEpoch,
+      cost,
+      (receipt) =>
+        deliverCliVaultSseReplayReceipt(
+          replayResult,
+          opts.replay!.sessionWallet,
+          receipt,
+          {
+            relayUrl: opts.replay!.relayUrl,
+            signal: opts.signal,
+          }
+        )
+    );
+    return {
+      status: 200,
+      headers: replayHeaders,
+      body: JSON.stringify(replayResult.body),
+      paid: true,
+      chargedBase: cost.toString(),
+      e2eDecrypted: true,
+    };
+  }
   const send = () =>
     fetch(url, { method: "POST", headers, body: requestBody, signal: opts.signal });
   let res = await send();
@@ -2033,6 +2130,8 @@ export async function cmdConsume(args: Args): Promise<void> {
     // Non-confidential E2E encrypts to and pins the selected operator; missing keys fall back to plaintext.
     let e2eEphemeralPriv: Uint8Array | null = null;
     let e2eOperatorPub: Uint8Array | null = null;
+    const wantsVaultReplay =
+      wantStream && vaultPin.streaming && vaultPin.vaultSseReplay;
     if (!wantConfidential && !args.noE2e) {
       // Encrypt to the same operator that owns the reservation.
       const op = vaultPin.encryptionPubkey
@@ -2044,8 +2143,20 @@ export async function cmdConsume(args: Args): Promise<void> {
           const eph = generateEphemeralKeypair();
           // Keep routing fields cleartext and seal the remaining request in `_enc`.
           const { model: routeModel, ...rest } = parsed as { model?: unknown } & Record<string, unknown>;
-          const envelope = encryptRequest(rest, operatorPub, eph);
-          parsed = { model: routeModel, _enc: envelope } as Record<string, unknown>;
+          const envelope = encryptRequest(
+            wantsVaultReplay ? { ...rest, stream: true } : rest,
+            operatorPub,
+            eph
+          );
+          parsed = wantsVaultReplay
+            ? buildCliVaultSseReplayRequestBody(
+                routeModel,
+                envelope,
+                withReservationMargin(
+                  priceTokens(vaultPin.priceUsdPerMtok, vaultEstTokens)
+                )
+              )
+            : { model: routeModel, _enc: envelope };
           forwardHeaders["x-halo-operator"] = op.address;
           e2eEphemeralPriv = eph.privateKey;
           e2eOperatorPub = operatorPub;
@@ -2064,6 +2175,25 @@ export async function cmdConsume(args: Args): Promise<void> {
         operator: vaultPin.address,
         priceUsdPerMtok: vaultPin.priceUsdPerMtok,
         estTokens: vaultEstTokens,
+        ...(wantsVaultReplay && e2eEphemeralPriv && e2eOperatorPub
+          ? {
+              replay: {
+                relayUrl: relayBase,
+                vaultAddress,
+                sessionWallet: vaultSessionSigner ?? wallet,
+                decryptFrame: async (envelope: unknown) => {
+                  if (!isEncryptedEnvelope(envelope)) {
+                    throw new Error("invalid encrypted replay frame");
+                  }
+                  return decryptResponse(
+                    envelope,
+                    e2eOperatorPub,
+                    e2eEphemeralPriv
+                  );
+                },
+              },
+            }
+          : {}),
       });
       // Accrue what was actually charged into the session budget, then attach the
       // live budget headers (limit/spent/remaining + warning band) so the agent
@@ -2118,18 +2248,20 @@ export async function cmdConsume(args: Args): Promise<void> {
       // Operator-E2E: decrypt the operator's `_enc` reply (relay never saw it in
       // the clear). Marks the response so the agent knows it was relay-blind.
       if (e2eEphemeralPriv && e2eOperatorPub && result.status >= 200 && result.status < 300) {
-        try {
-          outBody = decryptRequiredOperatorE2eResponse(
-            result.body,
-            e2eOperatorPub,
-            e2eEphemeralPriv
-          );
-          headers["X-Halo-E2E-Encrypted"] = "true";
-        } catch (e) {
-          return sendJson(res, 502, {
-            error: { message: `E2E response decrypt failed: ${errMsg(e)}`, type: "halo_e2e_error" },
-          });
+        if (!result.e2eDecrypted) {
+          try {
+            outBody = decryptRequiredOperatorE2eResponse(
+              result.body,
+              e2eOperatorPub,
+              e2eEphemeralPriv
+            );
+          } catch (e) {
+            return sendJson(res, 502, {
+              error: { message: `E2E response decrypt failed: ${errMsg(e)}`, type: "halo_e2e_error" },
+            });
+          }
         }
+        headers["X-Halo-E2E-Encrypted"] = "true";
       }
       // Normalize non-2xx responses to actionable OpenAI JSON, including for stream requests.
       if (result.status >= 400) {

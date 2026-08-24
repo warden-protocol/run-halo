@@ -109,7 +109,11 @@ export interface ReservationCheck {
   redeemed: bigint;
 }
 
-function evaluate(r: Reservation, requiredBase: bigint, nowSec: number): ReservationCheck {
+export function evaluateReservation(
+  r: Reservation,
+  requiredBase: bigint,
+  nowSec: number
+): ReservationCheck {
   if (r.locked === 0n) {
     return { ok: false, reason: "no active reservation for this operator", remaining: 0n, cycle: r.cycle, redeemed: r.redeemed };
   }
@@ -136,7 +140,7 @@ export async function checkReservation(
   nowSec: number = Math.floor(Date.now() / 1000)
 ): Promise<ReservationCheck> {
   const r = await readReservation(consumer, operator);
-  return evaluate(r, requiredBase, nowSec);
+  return evaluateReservation(r, requiredBase, nowSec);
 }
 
 /** Cap served accounting to the amount gated and reserved for this request. */
@@ -222,7 +226,7 @@ export async function checkReservationCached(
       : 0n
     : 0n;
   gateCache.set(key, { r, servedSinceRead });
-  return evaluate(
+  return evaluateReservation(
     {
       ...r,
       remaining: r.remaining > servedSinceRead ? r.remaining - servedSinceRead : 0n,
@@ -263,6 +267,13 @@ async function readConsumerKey(consumer: string): Promise<KeyEntry> {
   keyCache.set(k, entry);
   return entry;
 }
+export async function readVaultConsumerSession(
+  consumer: string
+): Promise<{ sessionKey: string; keyEpoch: bigint }> {
+  const key = await readConsumerKey(consumer);
+  return { sessionKey: key.sessionKey, keyEpoch: key.keyEpoch };
+}
+
 
 export interface ReceiptVerification {
   ok: boolean;
