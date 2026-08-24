@@ -18,7 +18,6 @@ import {
   providerServesConfiguredImageEditModel,
 } from "../config";
 import { loadWallet } from "../wallet";
-import { Facilitator } from "../facilitator";
 import {
   imageEditAdapterFor,
   imageEndpointPathFor,
@@ -159,6 +158,43 @@ interface StreamAbortMessage {
 interface StreamCompleteMessage {
   type: "stream-complete";
   requestId: string;
+}
+
+export type VaultPaymentModeGate =
+  | { accepted: true }
+  | {
+      accepted: false;
+      response: {
+        status: 400;
+        headers: Record<string, string>;
+        body: {
+          error: {
+            message: string;
+            type: "unsupported_payment_mode";
+          };
+        };
+      };
+    };
+
+export function gateVaultPaymentMode(rawMode: unknown): VaultPaymentModeGate {
+  const mode = typeof rawMode === "string" ? rawMode.trim().toLowerCase() : "";
+  if (mode === "vault") return { accepted: true };
+  return {
+    accepted: false,
+    response: {
+      status: 400,
+      headers: {},
+      body: {
+        error: {
+          message:
+            mode === ""
+              ? "x-halo-payment-mode is required"
+              : `unsupported payment mode: ${mode}`,
+          type: "unsupported_payment_mode",
+        },
+      },
+    },
+  };
 }
 
 // Timeout for the upstream provider fetch. Must be shorter than the relay's
@@ -933,31 +969,6 @@ export async function completeVaultImageServe(params: {
   } catch {}
   await params.postServedEvent?.(settlement, servedCumulative);
   return { ok: true, terminal, settlement, servedCumulative };
-}
-
-type SignedVoucher = {
-  voucher: { budgetId: string; operator: string; cumulative: string; expiry: number };
-  signature: string;
-};
-
-/** Parse a voucher for verbatim forwarding; absent or malformed input becomes `undefined`. */
-function parseVoucherHeader(raw: string | undefined): SignedVoucher | undefined {
-  if (!raw) return undefined;
-  try {
-    const obj = JSON.parse(Buffer.from(raw, "base64").toString("utf-8"));
-    if (
-      obj &&
-      typeof obj === "object" &&
-      obj.voucher &&
-      typeof obj.voucher === "object" &&
-      typeof obj.signature === "string"
-    ) {
-      return obj as SignedVoucher;
-    }
-  } catch {
-    /* malformed — treat as no voucher */
-  }
-  return undefined;
 }
 
 // Forward the confidential request's ephemeral-key and scheme headers verbatim.
@@ -2047,12 +2058,6 @@ export async function cmdServe(): Promise<void> {
     `halo-pubkey:${cfg.operator.address.toLowerCase()}:${pubkeyNorm}`
   );
 
-  const facilitator = new Facilitator(
-    cfg.facilitator.url,
-    cfg.facilitator.apiKey,
-    cfg.facilitator.failoverUrls
-  );
-
   const receiptStore = new VaultReceiptStore(path.join(configDir(), "vault-receipts.json"));
 
   const pendingRehydration = new Map<string, PendingHeldReceipt>();
@@ -2624,7 +2629,6 @@ export async function cmdServe(): Promise<void> {
           typeof req.body.model === "string" ? req.body.model : allConfiguredModels(cfg)[0] || "unknown";
         const imageServeKind = resolveImageServeKind(cfg, req.path, requestedModel);
 
-        // Reject open-breaker requests before payment verification or upstream work.
         const brokenSlug = providerForModel(configProviders(cfg), requestedModel).slug;
         if (isBreakerOpen(brokenSlug)) {
           const code = breakerCode(brokenSlug) ?? "provider_error";
@@ -2646,14 +2650,21 @@ export async function cmdServe(): Promise<void> {
           return;
         }
 
-        let out: { status: number; headers: Record<string, string>; body: unknown };
+        const paymentGate = gateVaultPaymentMode(req.headers["x-halo-payment-mode"]);
+        if (!paymentGate.accepted) {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(
+              JSON.stringify({
+                type: "inference-response",
+                requestId: req.requestId,
+                ...paymentGate.response,
+              })
+            );
+          }
+          return;
+        }
 
-        // Match relay normalization so whitespace/case variants cannot select a different rail here.
-        const paymentMode = (
-          (req.headers["x-halo-payment-mode"] as string) || ""
-        )
-          .trim()
-          .toLowerCase();
+        let out: { status: number; headers: Record<string, string>; body: unknown };
 
         // Confidential requests stay buffered because SSE reframing would invalidate the byte-exact proof.
         // The client E2EE public key is the canonical confidential-request marker.
@@ -2674,7 +2685,6 @@ export async function cmdServe(): Promise<void> {
         const imagePrice = imagePriceForModel(cfg, requestedModel);
 
         try {
-          if (paymentMode === "vault") {
             const invalidGenerationControl = invalidVaultTextGenerationControlField(
               req.body,
               imagePrice !== null
@@ -3192,351 +3202,6 @@ export async function cmdServe(): Promise<void> {
               );
             }
             return;
-          }
-          if (paymentMode === "budget") {
-            // Budget mode draws through `/settle-budget`; the facilitator validates authorization per settlement.
-            const sigHeader = req.headers["payment-signature"];
-            if (imagePrice !== null) {
-              out = {
-                status: 402,
-                headers: {},
-                body: {
-                  error: {
-                    message: "Image generation is vault-only; send x-halo-payment-mode: vault for image-priced models.",
-                    type: "image_vault_required",
-                  },
-                },
-              };
-            } else if (!sigHeader) {
-              out = {
-                status: 400,
-                headers: {},
-                body: {
-                  error: {
-                    message:
-                      "budget mode requires PAYMENT-SIGNATURE with the BudgetPaymentPayload",
-                  },
-                },
-              };
-            } else {
-              // Decode base64 → JSON. The payload carries two consumer
-              // signatures: the Permit2 PermitSingle (submitted on-chain)
-              // and the Halo BudgetPolicy (off-chain facilitator validation).
-              let budgetPayload: {
-                mode: string;
-                policy: { operator: string; maxPerSettlement: string };
-              };
-              try {
-                const decoded = Buffer.from(sigHeader, "base64").toString("utf-8");
-                budgetPayload = JSON.parse(decoded);
-                if (budgetPayload.mode !== "budget") {
-                  throw new Error(`expected mode=budget, got ${budgetPayload.mode}`);
-                }
-              } catch (err) {
-                out = {
-                  status: 400,
-                  headers: {},
-                  body: {
-                    error: {
-                      message: `malformed budget payload: ${err instanceof Error ? err.message : String(err)}`,
-                    },
-                  },
-                };
-                // Send the error response now and skip the rest of the handler.
-                if (ws.readyState === WebSocket.OPEN) {
-                  ws.send(
-                    JSON.stringify({
-                      type: "inference-response",
-                      requestId: req.requestId,
-                      status: out.status,
-                      headers: out.headers,
-                      body: out.body,
-                    })
-                  );
-                }
-                return;
-              }
-
-              // Budget authorization is operator-unbound; the routed operator identifies itself as recipient at settlement.
-
-              // Activate (or re-confirm) the budget by submitting the permit
-              // onchain. Idempotent — repeated calls for the same
-              // (consumer, nonce) just return the existing budgetId.
-              const submit = await facilitator.permitSubmit(budgetPayload);
-              if (submit.errorReason || !submit.budgetId) {
-                out = {
-                  status: 400,
-                  headers: {},
-                  body: {
-                    error: {
-                      message: `permit activation failed: ${submit.errorReason || "no budgetId returned"}`,
-                    },
-                  },
-                };
-                if (ws.readyState === WebSocket.OPEN) {
-                  ws.send(
-                    JSON.stringify({
-                      type: "inference-response",
-                      requestId: req.requestId,
-                      status: out.status,
-                      headers: out.headers,
-                      body: out.body,
-                    })
-                  );
-                }
-                return;
-              }
-
-              // WS-closed guard before spending operator money on upstream.
-              if (wsClosed || ws.readyState !== WebSocket.OPEN) {
-                console.warn(
-                  `  ⚠ WS closed after budget activation; aborting (no upstream charge, no settlement)`
-                );
-                return;
-              }
-
-              // Reject when input cost already exhausts the collectible cap; completion can only increase the loss.
-              const witnessCap = BigInt(budgetPayload.policy.maxPerSettlement);
-              const fmtUsd = (b: bigint) => formatUsdcBase(b, { withDollarSign: true });
-              const inputFloor = await priceRequest({
-                cfg,
-                model: requestedModel,
-                promptTokens: estimateRequestPromptTokens(req.body),
-                completionTokens: 0,
-              });
-              if (inputFloor >= witnessCap) {
-                console.warn(
-                  `  ⚠ rejecting budget request ${req.requestId}: input cost ${fmtUsd(inputFloor)} ≥ per-prompt cap ${fmtUsd(witnessCap)} (would serve at a loss)`
-                );
-                out = {
-                  status: 402,
-                  headers: {},
-                  body: {
-                    error: {
-                      message: `This request's input alone costs ~${fmtUsd(inputFloor)}, at or above your per-prompt cap of ${fmtUsd(witnessCap)}. Raise your per-prompt cap to run it.`,
-                      type: "per_prompt_cap_too_low",
-                      requiredUsdcBase: inputFloor.toString(),
-                      capUsdcBase: witnessCap.toString(),
-                    },
-                  },
-                };
-                if (ws.readyState === WebSocket.OPEN) {
-                  ws.send(
-                    JSON.stringify({
-                      type: "inference-response",
-                      requestId: req.requestId,
-                      status: out.status,
-                      headers: out.headers,
-                      body: out.body,
-                    })
-                  );
-                }
-                return;
-              }
-
-              // Streaming is opt-in because content is delivered before settlement.
-              const wantsStream =
-                !!req.body &&
-                typeof req.body === "object" &&
-                (req.body as Record<string, unknown>).stream === true;
-              const useStreaming =
-                process.env.HALO_ENABLE_STREAMING === "1" &&
-                wantsStream &&
-                wireFormatFor(cfg.provider.slug) !== "anthropic";
-              let upstream: { status: number; data: unknown; usage: UpstreamUsage };
-              let streamed = false;
-              if (useStreaming) {
-                const sres = await streamUpstream(cfg, upstreamApiKey, req.body, (deltaObj) => {
-                  if (abortedStreams.has(req.requestId)) return;
-                  if (ws.readyState !== WebSocket.OPEN) return;
-                  const data =
-                    consumerPublicKey !== undefined
-                      ? JSON.stringify(
-                          encryptResponse(deltaObj, consumerPublicKey, encryptionKeys.privateKey)
-                        )
-                      : JSON.stringify(deltaObj);
-                  ws.send(
-                    JSON.stringify({
-                      type: "inference-chunk",
-                      requestId: req.requestId,
-                      data,
-                      encrypted: consumerPublicKey !== undefined,
-                    })
-                  );
-                });
-                streamed = sres.ok;
-                upstream = {
-                  status: sres.status,
-                  data: sres.ok ? { streamed: true } : sres.errorData,
-                  usage: sres.usage,
-                };
-              } else {
-                upstream = await callUpstream(cfg, upstreamApiKey, req.body);
-              }
-              const encryptIfNeeded = (data: unknown): unknown =>
-                consumerPublicKey !== undefined
-                  ? {
-                      _enc: encryptResponse(
-                        data,
-                        consumerPublicKey,
-                        encryptionKeys.privateKey
-                      ),
-                    }
-                  : data;
-
-              const inferenceSucceeded =
-                upstream.status >= 200 && upstream.status < 300;
-
-              if (!inferenceSucceeded) {
-                // Same money-safety rules as per-request mode: upstream
-                // failed, no settlement. Budget remains intact for retry.
-                console.warn(
-                  `  ⚠ upstream ${upstream.status}; skipping budget settlement (consumer not charged)`
-                );
-                out = {
-                  status: upstream.status,
-                  headers: {},
-                  body: encryptIfNeeded(upstream.data),
-                };
-              } else {
-                // Compute uncapped actual cost for loss visibility, then enforce the witness cap.
-                const uncappedAmount = await priceRequest({
-                  cfg,
-                  model: requestedModel,
-                  promptTokens: upstream.usage.prompt_tokens,
-                  completionTokens: upstream.usage.completion_tokens,
-                  cachedPromptTokens: upstream.usage.cached_prompt_tokens,
-                });
-                const actualAmount =
-                  uncappedAmount < witnessCap ? uncappedAmount : witnessCap;
-                if (uncappedAmount > witnessCap) {
-                  console.warn(
-                    `  ⚠ served at a loss on ${req.requestId}: cost ${fmtUsd(uncappedAmount)} exceeds per-prompt cap ${fmtUsd(witnessCap)}; collecting ${fmtUsd(witnessCap)} — consumer should raise their per-prompt cap`
-                  );
-                }
-
-                if (abortedStreams.has(req.requestId)) {
-                  console.warn(
-                    `  ⚠ budget stream ${req.requestId} aborted by relay; skipping settlement`
-                  );
-                  out = {
-                    status: 499,
-                    headers: {},
-                    body: { error: { message: "stream aborted before confirmed delivery" } },
-                  };
-                } else {
-                  // WS-closed guard right before money moves.
-                  if (wsClosed || ws.readyState !== WebSocket.OPEN) {
-                    console.warn(
-                      `  ⚠ WS closed mid-budget-request after upstream succeeded; skipping settlement`
-                    );
-                    return;
-                  }
-
-                  const settle = await facilitator.settleBudget({
-                    budgetId: submit.budgetId,
-                    operator: cfg.operator.address,
-                    amount: actualAmount.toString(),
-                    voucher: parseVoucherHeader(req.headers["x-halo-voucher"]),
-                    metadata: {
-                      inferenceId: req.requestId,
-                      model: typeof req.body.model === "string" ? req.body.model : undefined,
-                      tokens: upstream.usage.total_tokens,
-                    },
-                  });
-
-                  if (wsClosed || ws.readyState !== WebSocket.OPEN) {
-                    console.error(
-                      `  ⚠⚠ WS closed during /settle-budget; settlement tx ${settle.transaction || "?"} may have completed onchain but response cannot reach the consumer`
-                    );
-                    return;
-                  }
-
-                  if (!settle.success) {
-                    logError("budget settlement failed", settle.errorReason);
-                    out = {
-                      status: 502,
-                      headers: {},
-                      body: {
-                        error: {
-                          message: `settlement failed: ${settle.errorReason || "unknown"}`,
-                        },
-                      },
-                    };
-                  } else {
-                    out = {
-                      status: upstream.status,
-                      headers: {
-                        "PAYMENT-RESPONSE": Buffer.from(
-                          JSON.stringify({
-                            success: true,
-                            transaction: settle.transaction,
-                            spent: settle.spent,
-                            remaining: settle.remaining,
-                          }),
-                          "utf-8"
-                        ).toString("base64"),
-                      },
-                      // When streamed, the deltas already carried the content;
-                      // the terminal response only carries settlement (the relay
-                      // emits it as a final SSE event and ignores this body).
-                      body: streamed ? null : encryptIfNeeded(upstream.data),
-                    };
-
-                    const durationMs = Date.now() - requestStartedAt;
-                    const eventPayload = {
-                      id: req.requestId,
-                      operator: cfg.operator.address,
-                      // Attribute to the facilitator-recovered budget owner; retain compatibility fallback if absent.
-                      consumer: submit.consumer ?? cfg.operator.address,
-                      model: req.body.model ?? null,
-                      tokens: upstream.usage.total_tokens,
-                      amountUsdc: actualAmount.toString(),
-                      durationMs,
-                      timestamp: Date.now(),
-                      txHash: settle.transaction || null,
-                      mode: "budget" as const,
-                    };
-                    const sigMessage = canonicalEventMessage(eventPayload);
-                    wallet
-                      .signMessage(sigMessage)
-                      .then((signature) =>
-                        postEvent(cfg, { ...eventPayload, signature })
-                      )
-                      .catch((err) => logError("event post failed", err));
-                  }
-                }
-              }
-            }
-
-            // Send the budget-mode response now and skip the per-request flow.
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.send(
-                JSON.stringify({
-                  type: "inference-response",
-                  requestId: req.requestId,
-                  status: out.status,
-                  headers: out.headers,
-                  body: out.body,
-                })
-              );
-            }
-            return;
-          }
-
-          out = {
-            status: 400,
-            headers: {},
-            body: {
-              error: {
-                message:
-                  paymentMode === ""
-                    ? "x-halo-payment-mode is required"
-                    : `unsupported payment mode: ${paymentMode}`,
-                type: "unsupported_payment_mode",
-              },
-            },
-          };
         } catch (err) {
           // A thrown serve must release its admitted credit ceiling.
           if (creditAdmitted) {
@@ -3735,24 +3400,6 @@ async function buildContextLengthAnnounce(cfg: HaloConfig): Promise<Record<strin
   return out;
 }
 
-interface LegacyBudgetEventPayload {
-  id: string;
-  operator: string;
-  consumer: string;
-  model: string | null;
-  tokens: number;
-  amountUsdc: string;
-  durationMs: number;
-  timestamp: number;
-  txHash: string | null;
-  mode: "budget";
-}
-
-/** Legacy budget-event signature contract; vault events use signed v2 from vault-core. */
-export function canonicalEventMessage(ev: Omit<LegacyBudgetEventPayload, "txHash" | "mode">): string {
-  return `halo-event:${ev.id}:${ev.operator.toLowerCase()}:${ev.consumer.toLowerCase()}:${ev.amountUsdc}:${ev.tokens}:${ev.timestamp}`;
-}
-
 function abbrevAddr(addr: string | null | undefined): string {
   if (!addr || addr.length < 10) return String(addr);
   return `${addr.slice(0, 6)}…${addr.slice(-4)}`;
@@ -3859,18 +3506,6 @@ function logError(label: string, err: unknown): void {
 }
 
 export { abbrevAddr };
-
-async function postEvent(
-  cfg: HaloConfig,
-  ev: LegacyBudgetEventPayload & { signature: string }
-): Promise<void> {
-  const url = `${cfg.indexerUrl.replace(/\/+$/, "")}/v1/events`;
-  await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(ev),
-  });
-}
 
 async function startHeartbeat(
   cfg: HaloConfig,
