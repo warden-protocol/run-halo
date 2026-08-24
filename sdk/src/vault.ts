@@ -1269,6 +1269,111 @@ export class HaloVaultClient {
     this.startRedeemRetry();
   }
 
+  /**
+   * Sign the next cumulative receipt, require external custody, then retain it
+   * for the ordinary best-effort redeem path. Intended for transports whose
+   * result must remain hidden until the operator owns the exact receipt.
+   */
+  protected async recordAndRedeemWithCustody(
+    operator: string,
+    ops: OpsState,
+    keyEpoch: bigint,
+    cost: bigint,
+    takeCustody: (receipt: {
+      priorCumulative: string;
+      targetCumulative: string;
+      receiptSignature: string;
+    }) => Promise<void>
+  ): Promise<void> {
+    if (cost <= 0n) {
+      throw new Error("vault receipt custody requires a positive cost");
+    }
+    if (this.redeemEvidenceClosing || this.redeemEvidenceClosed) {
+      throw new Error("vault redeem evidence ownership is closing or closed");
+    }
+    if (!this.loadDeadLetters()) {
+      throw new Error("vault redeem dead-letter state is unavailable");
+    }
+
+    const work = this.redeemQueue.catch(() => {}).then(async () => {
+      if (!this.loadDeadLetters()) {
+        throw new Error("vault redeem dead-letter state is unavailable");
+      }
+      const consumer = getAddress(await this.consumer()).toLowerCase();
+      const normalizedOperator = getAddress(operator).toLowerCase();
+      const key = await this.cycleKey(normalizedOperator, ops.cycle, consumer);
+      const held = this.pendingRedeems.get(key);
+      const terminal = this.deadLetters.get(key);
+      const terminalReason = terminal?.reason ?? this.terminalReasons.get(key);
+      let previous = this.cumulative.get(key) ?? ops.redeemed;
+      if (ops.redeemed > previous) previous = ops.redeemed;
+      if (held && held.cumulative > previous) previous = held.cumulative;
+      if (terminal && BigInt(terminal.cumulative) > previous) {
+        previous = BigInt(terminal.cumulative);
+      }
+      let priorCeiling = this.ceilingByKey.get(key);
+      if (held && (priorCeiling === undefined || held.cumulative > priorCeiling)) {
+        priorCeiling = held.cumulative;
+      }
+      const { cumulative, ceiling } = advanceCumulativeReceipt({
+        previous,
+        cost,
+        locked: ops.locked,
+        redeemed: ops.redeemed,
+        priorCeiling,
+      });
+      if (cumulative - previous !== cost) {
+        throw new Error("vault replay cost exceeds the retained reservation ceiling");
+      }
+      const signature = await this.signReceipt({
+        operator: normalizedOperator,
+        cumulative,
+        keyEpoch,
+        cycle: ops.cycle,
+      });
+
+      await takeCustody({
+        priorCumulative: previous.toString(),
+        targetCumulative: cumulative.toString(),
+        receiptSignature: signature,
+      });
+
+      this.ceilingByKey.set(key, ceiling);
+      this.cumulative.set(key, cumulative);
+      const terminalError = terminalReason
+        ? new VaultRedeemTerminalError(terminalReason)
+        : undefined;
+      const nextPending: PendingRedeem = {
+        operator: normalizedOperator,
+        consumer,
+        cumulative,
+        signature,
+        cycle: ops.cycle,
+        inFlight: false,
+        terminalError,
+      };
+      this.pendingRedeems.set(key, nextPending);
+      try {
+        this.persistPending(true);
+      } catch (error) {
+        this.cfg.log(
+          `operator has vault receipt custody but local pending persistence failed: ${errStr(error)}`
+        );
+      }
+      if (terminalError) {
+        this.quarantineTerminalRedeem(key, nextPending, terminalError);
+        return;
+      }
+      this.startRedeemRetry();
+      void this.attemptRedeem(key);
+    });
+    this.redeemQueue = work.then(
+      () => {},
+      () => {}
+    );
+    await work;
+  }
+
   private attemptRedeem(key: string): Promise<void> {
     let tracked: Promise<void>;
     tracked = this.runRedeemAttempt(key).finally(() => {

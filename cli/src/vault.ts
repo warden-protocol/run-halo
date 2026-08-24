@@ -267,6 +267,13 @@ async function readConsumerKey(consumer: string): Promise<KeyEntry> {
   keyCache.set(k, entry);
   return entry;
 }
+export async function readVaultConsumerSession(
+  consumer: string
+): Promise<{ sessionKey: string; keyEpoch: bigint }> {
+  const key = await readConsumerKey(consumer);
+  return { sessionKey: key.sessionKey, keyEpoch: key.keyEpoch };
+}
+
 
 export interface ReceiptVerification {
   ok: boolean;

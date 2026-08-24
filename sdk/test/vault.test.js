@@ -1738,6 +1738,102 @@ test("recordAndRedeem clamps to the high-water reservation ceiling, not a stale 
   assert.equal(submitted[submitted.length - 1], 2_000n);
 });
 
+test("receipt custody completes before replay state advances or redeem starts", async () => {
+  const client = new HaloVaultClient(
+    { getAddress: async () => "0x0000000000000000000000000000000000000054" },
+    {
+      facilitatorUrl: "https://facilitator.invalid",
+      rpcUrl: "http://127.0.0.1:1",
+      chainId: 8453,
+    }
+  );
+  client.signReceipt = async ({ cumulative }) => `receipt-${cumulative}`;
+  let redeemStarted = false;
+  client.attemptRedeem = async () => {
+    redeemStarted = true;
+  };
+  let releaseCustody;
+  const custodyGate = new Promise((resolve) => {
+    releaseCustody = resolve;
+  });
+  let received;
+  let custodyStarted;
+  const started = new Promise((resolve) => {
+    custodyStarted = resolve;
+  });
+  const work = client.recordAndRedeemWithCustody(
+    "0x0000000000000000000000000000000000000055",
+    {
+      locked: 1_000n,
+      redeemed: 20n,
+      expiry: 0n,
+      created: 0n,
+      cycle: 1n,
+    },
+    2n,
+    11n,
+    async (receipt) => {
+      received = receipt;
+      custodyStarted();
+      await custodyGate;
+    }
+  );
+
+  await started;
+  assert.equal(client.pendingRedeemCount, 0);
+  assert.equal(redeemStarted, false);
+  assert.deepEqual(received, {
+    priorCumulative: "20",
+    targetCumulative: "31",
+    receiptSignature: "receipt-31",
+  });
+
+  releaseCustody();
+  await work;
+  assert.equal(client.pendingRedeemCount, 1);
+  assert.equal(redeemStarted, true);
+});
+
+test("failed receipt custody leaves the cumulative replay state unchanged", async () => {
+  const client = new HaloVaultClient(
+    { getAddress: async () => "0x0000000000000000000000000000000000000056" },
+    {
+      facilitatorUrl: "https://facilitator.invalid",
+      rpcUrl: "http://127.0.0.1:1",
+      chainId: 8453,
+    }
+  );
+  client.signReceipt = async ({ cumulative }) => `receipt-${cumulative}`;
+  client.attemptRedeem = async () => {};
+  const args = [
+    "0x0000000000000000000000000000000000000057",
+    {
+      locked: 1_000n,
+      redeemed: 20n,
+      expiry: 0n,
+      created: 0n,
+      cycle: 1n,
+    },
+    2n,
+    11n,
+  ];
+
+  await assert.rejects(
+    client.recordAndRedeemWithCustody(...args, async () => {
+      throw new Error("custody rejected");
+    }),
+    /custody rejected/
+  );
+  assert.equal(client.pendingRedeemCount, 0);
+
+  let retryReceipt;
+  await client.recordAndRedeemWithCustody(...args, async (receipt) => {
+    retryReceipt = receipt;
+  });
+  assert.equal(retryReceipt.priorCumulative, "20");
+  assert.equal(retryReceipt.targetCumulative, "31");
+});
+
 test("priceTokens rejects a positive price that rounds to 0 instead of serving unpriced", () => {
   assert.throws(() => priceTokens(1e-13, 1_000_000), /rounds to 0/);
   assert.throws(() => priceTokens(4e-13, 1_000_000), /rounds to 0/);
