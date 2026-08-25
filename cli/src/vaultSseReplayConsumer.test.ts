@@ -18,6 +18,7 @@ import {
 } from "@halo/vault-core";
 import {
   buildCliVaultSseReplayRequestBody,
+  cliOperatorSupportsVaultSseReplayModel,
   deliverCliVaultSseReplayReceipt,
   runCliVaultSseReplay,
 } from "./vaultSseReplayConsumer";
@@ -25,6 +26,24 @@ import {
 function event(name: string, data: unknown): string {
   return `event: ${name}\ndata: ${JSON.stringify(data)}\n\n`;
 }
+
+test("CLI replay selection requires the requested model in the exact list", () => {
+  const globalOnly = { vaultProtocols: [VAULT_SSE_REPLAY_EPHEMERAL_PROTOCOL] };
+  const mixed = {
+    vaultProtocols: [VAULT_SSE_REPLAY_EPHEMERAL_PROTOCOL],
+    vaultSseReplayV1Models: ["vendor/supported"],
+  };
+  assert.equal(cliOperatorSupportsVaultSseReplayModel(globalOnly, "vendor/supported"), false);
+  assert.equal(cliOperatorSupportsVaultSseReplayModel(mixed, "vendor/supported"), true);
+  assert.equal(cliOperatorSupportsVaultSseReplayModel(mixed, "vendor/other"), false);
+  assert.equal(
+    cliOperatorSupportsVaultSseReplayModel(
+      { vaultSseReplayV1Models: ["vendor/supported-plus"] },
+      "vendor/supported"
+    ),
+    false
+  );
+});
 
 test("CLI replay request body passes the shared relay prepare parser", () => {
   const parsed = parseVaultSseReplayPrepareRequest({

@@ -22,12 +22,13 @@ export interface UpstreamRate {
 type Resolver = (model: string, baseUrl: string) => Promise<UpstreamRate | null>;
 
 const CACHE_TTL_MS = 5 * 60 * 1000;
-// Bound catalog fetches so callers can fall back instead of sharing a permanently hung promise.
+// Bound catalog fetches so callers terminate instead of sharing a permanently hung promise.
 const FETCH_TIMEOUT_MS = 5_000;
 
 /** Per-(provider+baseUrl) cache. Pricing tables don't change often. */
 interface CacheEntry {
   rates: Map<string, UpstreamRate>;
+  completionLimitFields: Map<string, CompletionLimitField>;
   expiresAt: number;
   inFlight?: Promise<void>;
 }
@@ -51,6 +52,21 @@ interface ModelsPricingEntry {
     request?: string;
     input_cache_read?: string;
   };
+  supported_parameters?: unknown;
+}
+
+export type CompletionLimitField = "max_tokens" | "max_completion_tokens" | null;
+
+function catalogCompletionLimitField(value: unknown): CompletionLimitField | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const supported = new Set(value.filter((item): item is string => typeof item === "string"));
+  if (supported.has("max_completion_tokens")) return "max_completion_tokens";
+  if (supported.has("max_tokens")) return "max_tokens";
+  return null;
+}
+
+function defaultCompletionLimitField(providerSlug: string): Exclude<CompletionLimitField, null> {
+  return providerSlug === "openai" ? "max_completion_tokens" : "max_tokens";
 }
 
 /** Build a slug-isolated cached resolver for OpenRouter-style `/models` pricing. */
@@ -71,6 +87,7 @@ function makeModelsPricingResolver(slug: string): Resolver {
       } else {
         const newEntry: CacheEntry = entry ?? {
           rates: new Map(),
+          completionLimitFields: new Map(),
           expiresAt: 0,
         };
         const fetchPromise = (async () => {
@@ -81,7 +98,12 @@ function makeModelsPricingResolver(slug: string): Resolver {
             const body = (await res.json()) as { data?: ModelsPricingEntry[] };
             const models = body.data ?? [];
             const fresh = new Map<string, UpstreamRate>();
+            const freshCompletionLimitFields = new Map<string, CompletionLimitField>();
             for (const m of models) {
+              const completionLimitField = catalogCompletionLimitField(m.supported_parameters);
+              if (completionLimitField !== undefined) {
+                freshCompletionLimitFields.set(m.id, completionLimitField);
+              }
               const p = m.pricing;
               if (!p?.prompt || !p?.completion) continue;
               const promptRateUsd = parseFloat(p.prompt);
@@ -100,6 +122,7 @@ function makeModelsPricingResolver(slug: string): Resolver {
               });
             }
             newEntry.rates = fresh;
+            newEntry.completionLimitFields = freshCompletionLimitFields;
             newEntry.expiresAt = Date.now() + CACHE_TTL_MS;
           } finally {
             delete newEntry.inFlight;
@@ -110,13 +133,14 @@ function makeModelsPricingResolver(slug: string): Resolver {
         try {
           await fetchPromise;
         } catch (err) {
-          // Don't poison the cache on a transient failure. If we have stale
-          // data, keep it; if not, leave the entry empty so the next call
-          // tries again.
-          if (entry && entry.rates.size > 0) {
-            // Keep stale entry alive for one more TTL.
-            newEntry.rates = entry.rates;
+          const staleRates = entry?.rates;
+          newEntry.completionLimitFields = new Map();
+          if (staleRates && staleRates.size > 0) {
+            newEntry.rates = staleRates;
             newEntry.expiresAt = Date.now() + CACHE_TTL_MS;
+          } else {
+            newEntry.rates = new Map();
+            newEntry.expiresAt = 0;
           }
           console.warn(
             `[pricing] ${slug} rate fetch failed: ${err instanceof Error ? err.message : String(err)}`
@@ -133,7 +157,7 @@ function makeModelsPricingResolver(slug: string): Resolver {
 const openrouterResolver: Resolver = makeModelsPricingResolver("openrouter");
 // NEAR AI Cloud: same public /models pricing shape (prompt/completion strings).
 const nearResolver: Resolver = makeModelsPricingResolver("near");
-
+const CATALOG_COMPLETION_LIMIT_SLUGS = new Set(["openrouter", "near"]);
 
 const ollamaResolver: Resolver = async () => {
   // Return explicit zero for free local inference; `null` would incorrectly select a fallback.
@@ -146,6 +170,28 @@ const RESOLVERS: Record<string, Resolver> = {
   near: nearResolver,
   ollama: ollamaResolver,
 };
+
+/** Resolve the single completion-limit alias accepted by this model. */
+export async function upstreamCompletionLimitField(params: {
+  providerSlug: string;
+  providerBaseUrl: string;
+  model: string;
+}): Promise<CompletionLimitField | undefined> {
+  const resolver = RESOLVERS[params.providerSlug];
+  if (resolver) {
+    try {
+      await resolver(params.model, params.providerBaseUrl);
+      const entry = CACHES.get(cacheKey(params.providerSlug, params.providerBaseUrl));
+      if (entry?.completionLimitFields.has(params.model)) {
+        return entry.completionLimitFields.get(params.model) ?? null;
+      }
+    } catch {
+      if (CATALOG_COMPLETION_LIMIT_SLUGS.has(params.providerSlug)) return undefined;
+    }
+  }
+  if (CATALOG_COMPLETION_LIMIT_SLUGS.has(params.providerSlug)) return undefined;
+  return defaultCompletionLimitField(params.providerSlug);
+}
 
 /** Whether this provider has a margin-pricing resolver. */
 export function providerSupportsMargin(slug: string): boolean {
