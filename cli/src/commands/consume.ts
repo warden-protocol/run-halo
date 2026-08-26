@@ -60,7 +60,6 @@ import {
   selectVaultOperatorFromList,
   serializeImageEditPlaintext,
   settlementAmount,
-  VAULT_SSE_REPLAY_EPHEMERAL_PROTOCOL,
   withReservationMargin,
   type VaultOperatorSelectionReason,
 } from "@halo/vault-core";
@@ -77,6 +76,7 @@ import { relayCliVersion } from "../relayVersion";
 import { resolveVaultAddress } from "../vault-address";
 import {
   buildCliVaultSseReplayRequestBody,
+  cliOperatorSupportsVaultSseReplayModel,
   deliverCliVaultSseReplayReceipt,
   runCliVaultSseReplay,
   type RunCliVaultSseReplayInput,
@@ -166,6 +166,7 @@ async function selectVaultOperator(
         vaultPayments?: boolean;
         streaming?: boolean;
         vaultProtocols?: string[];
+        vaultSseReplayV1Models?: string[];
       }>;
     };
     const selection = selectVaultOperatorFromList(operators, model, {
@@ -187,10 +188,7 @@ async function selectVaultOperator(
         ),
         streaming: operator.streaming === true,
         vaultSseReplay:
-          Array.isArray(operator.vaultProtocols) &&
-          operator.vaultProtocols.includes(
-            VAULT_SSE_REPLAY_EPHEMERAL_PROTOCOL
-          ),
+          cliOperatorSupportsVaultSseReplayModel(operator, model),
       },
       reason: selection.reason,
     };

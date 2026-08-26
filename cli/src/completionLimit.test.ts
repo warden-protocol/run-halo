@@ -10,9 +10,11 @@ import {
 } from "./anthropic-adapter";
 import type { HaloConfig, ProviderConfig } from "./config";
 import {
+  buildVaultSseReplayModelsAnnounce,
   callUpstream,
   forwardVaultCompletionLimit,
   invalidVaultTextGenerationControlField,
+  shouldAnnounceLegacyGlobalVaultReplay,
   streamUpstream,
 } from "./commands/serve";
 
@@ -35,44 +37,204 @@ function configFor(provider: ProviderConfig): HaloConfig {
   };
 }
 
-test("forwardVaultCompletionLimit injects the shared gate in the provider-compatible field", () => {
+test("forwardVaultCompletionLimit emits one provider-compatible alias", async () => {
+  const legacyProvider: ProviderConfig = {
+    slug: "venice",
+    baseUrl: "https://venice.test/v1",
+    models: ["minimax/minimax-m2.5"],
+  };
   const reasoningBody = {
     model: "minimax/minimax-m2.5",
     messages: [{ role: "user", content: "hi" }],
   };
   const reasoningGate = requestCompletionCeilingTokens(reasoningBody);
-  const compatible = forwardVaultCompletionLimit(reasoningBody, "openrouter", reasoningGate);
+  const compatible = await forwardVaultCompletionLimit(
+    reasoningBody,
+    legacyProvider,
+    reasoningGate
+  );
   assert.equal(reasoningGate, 8192);
   assert.equal(compatible.max_tokens, reasoningGate);
   assert.equal(compatible.max_completion_tokens, undefined);
   assert.equal((reasoningBody as Record<string, unknown>).max_tokens, undefined);
 
-  const directOpenAiBody = {
-    model: "gpt-4o",
-    messages: [{ role: "user", content: "hi" }],
+  const directOpenAiProvider: ProviderConfig = {
+    slug: "openai",
+    baseUrl: "https://openai.test/v1",
+    models: ["gpt-4o"],
   };
+  const directOpenAiBody = { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] };
   const directOpenAiGate = requestCompletionCeilingTokens(directOpenAiBody);
-  const directOpenAi = forwardVaultCompletionLimit(directOpenAiBody, "openai", directOpenAiGate);
+  const directOpenAi = await forwardVaultCompletionLimit(
+    directOpenAiBody,
+    directOpenAiProvider,
+    directOpenAiGate
+  );
   assert.equal(directOpenAiGate, DEFAULT_COMPLETION_CEILING_TOKENS);
   assert.equal(directOpenAi.max_completion_tokens, directOpenAiGate);
   assert.equal(directOpenAi.max_tokens, undefined);
 });
 
-test("forwardVaultCompletionLimit preserves every explicit completion-limit field", () => {
+test("forwardVaultCompletionLimit translates explicit aliases conservatively", async () => {
+  const provider: ProviderConfig = {
+    slug: "openai",
+    baseUrl: "https://openai-alias.test/v1",
+    models: ["gpt-5"],
+  };
   const cases = [
-    { model: "gpt-5", max_tokens: 7 },
-    { model: "gpt-5", max_completion_tokens: 11 },
-    { model: "gpt-5", max_tokens: 7, max_completion_tokens: 11 },
-    { model: "gpt-5", max_tokens: 0 },
-    { model: "gpt-5", max_completion_tokens: -1 },
-    { model: "gpt-5", max_tokens: undefined },
+    { body: { model: "gpt-5", max_tokens: 7 }, expected: 7 },
+    { body: { model: "gpt-5", max_completion_tokens: 11 }, expected: 11 },
+    { body: { model: "gpt-5", max_tokens: 7, max_completion_tokens: 11 }, expected: 7 },
   ];
-  for (const body of cases) {
-    assert.strictEqual(
-      forwardVaultCompletionLimit(body, "openai", requestCompletionCeilingTokens(body)),
-      body
+  for (const { body, expected } of cases) {
+    const forwarded = await forwardVaultCompletionLimit(
+      body,
+      provider,
+      requestCompletionCeilingTokens(body)
     );
+    assert.equal(forwarded.max_completion_tokens, expected);
+    assert.equal(forwarded.max_tokens, undefined);
   }
+});
+
+test("catalog capabilities choose modern, legacy, or no completion-limit alias per model", async (t) => {
+  const provider: ProviderConfig = {
+    slug: "openrouter",
+    baseUrl: "https://capabilities.test/v1",
+    models: ["modern", "legacy", "neither", "unknown"],
+  };
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  globalThis.fetch = (async (url) => {
+    assert.equal(String(url), "https://capabilities.test/v1/models");
+    return new Response(
+      JSON.stringify({
+        data: [
+          { id: "modern", supported_parameters: ["max_completion_tokens"] },
+          { id: "legacy", supported_parameters: ["max_tokens"] },
+          { id: "neither", supported_parameters: ["temperature"] },
+          { id: "unknown" },
+        ],
+      }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  }) as typeof fetch;
+
+  const modern = await forwardVaultCompletionLimit(
+    { model: "modern", max_tokens: 9 },
+    provider,
+    100
+  );
+  const legacy = await forwardVaultCompletionLimit(
+    { model: "legacy", max_completion_tokens: 11 },
+    provider,
+    100
+  );
+  const neither = await forwardVaultCompletionLimit(
+    { model: "neither", max_tokens: 7 },
+    provider,
+    100
+  );
+  assert.deepEqual(modern, { model: "modern", max_completion_tokens: 9 });
+  assert.deepEqual(legacy, { model: "legacy", max_tokens: 11 });
+  assert.deepEqual(neither, { model: "neither" });
+  await assert.rejects(
+    forwardVaultCompletionLimit({ model: "unknown" }, provider, 100),
+    /completion-limit capability unavailable/
+  );
+  await assert.rejects(
+    forwardVaultCompletionLimit({ model: "missing" }, provider, 100),
+    /completion-limit capability unavailable/
+  );
+});
+
+test("catalog capability discovery fails closed before Vault provider work", async (t) => {
+  const provider: ProviderConfig = {
+    slug: "openrouter",
+    baseUrl: "https://capability-unavailable.test/v1",
+    models: ["catalog/model"],
+  };
+  const cfg = configFor(provider);
+  const body = { model: "catalog/model", messages: [{ role: "user", content: "hi" }] };
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  let upstreamRequests = 0;
+  globalThis.fetch = (async (url) => {
+    if (String(url).endsWith("/models")) {
+      return new Response("catalog unavailable", { status: 503 });
+    }
+    upstreamRequests += 1;
+    return new Response(JSON.stringify({ choices: [], usage: {} }), { status: 200 });
+  }) as typeof fetch;
+
+  await assert.rejects(
+    forwardVaultCompletionLimit(body, provider, 100),
+    /completion-limit capability unavailable/
+  );
+  assert.deepEqual(await buildVaultSseReplayModelsAnnounce(cfg, provider.models), []);
+  assert.equal(
+    shouldAnnounceLegacyGlobalVaultReplay(cfg, provider.models, []),
+    false
+  );
+
+  const buffered = await callUpstream(cfg, undefined, body, undefined, 100);
+  assert.equal(buffered.status, 502);
+  assert.deepEqual(buffered.usage, {
+    prompt_tokens: 0,
+    completion_tokens: 0,
+    total_tokens: 0,
+  });
+  const streamed = await streamUpstream(cfg, undefined, { ...body, stream: true }, () => {}, 100);
+  assert.equal(streamed.ok, false);
+  assert.equal(streamed.status, 502);
+  assert.equal(upstreamRequests, 0);
+});
+
+test("replay announcement is exact per model and withholds the legacy global token for mixed operators", async (t) => {
+  const openrouter: ProviderConfig = {
+    slug: "openrouter",
+    baseUrl: "https://announce-capabilities.test/v1",
+    models: ["modern", "neither"],
+  };
+  const anthropic: ProviderConfig = {
+    slug: "anthropic",
+    baseUrl: "https://anthropic.test/v1",
+    models: ["claude"],
+  };
+  const cfg = {
+    ...configFor(openrouter),
+    providers: [openrouter, anthropic],
+  };
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  globalThis.fetch = (async () => new Response(
+    JSON.stringify({
+      data: [
+        { id: "modern", supported_parameters: ["max_completion_tokens"] },
+        { id: "neither", supported_parameters: ["temperature"] },
+      ],
+    }),
+    { status: 200, headers: { "content-type": "application/json" } }
+  )) as typeof fetch;
+
+  const announced = ["modern", "neither", "claude"];
+  const replayModels = await buildVaultSseReplayModelsAnnounce(cfg, announced);
+  assert.deepEqual(replayModels, ["modern"]);
+  assert.equal(
+    shouldAnnounceLegacyGlobalVaultReplay(cfg, announced, replayModels),
+    false
+  );
+  assert.equal(
+    shouldAnnounceLegacyGlobalVaultReplay(cfg, ["modern"], replayModels),
+    true
+  );
 });
 
 test("vault text generation-control validator allows only absent or numeric n=1", () => {
@@ -137,7 +299,19 @@ test("buffered upstream calls add the vault limit only when the vault ceiling is
   });
 
   const seen: Array<Record<string, unknown>> = [];
-  globalThis.fetch = (async (_url, init) => {
+  globalThis.fetch = (async (url, init) => {
+    if (String(url).endsWith("/models")) {
+      return new Response(
+        JSON.stringify({
+          data: [{
+            id: "minimax/minimax-m2.5",
+            supported_parameters: ["max_tokens"],
+            pricing: { prompt: "0.001", completion: "0.001" },
+          }],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    }
     seen.push(JSON.parse(String((init as { body?: unknown }).body)) as Record<string, unknown>);
     return new Response(
       JSON.stringify({
@@ -201,7 +375,15 @@ test("streaming vault calls forward the shared gate through legacy OpenAI-compat
   });
 
   let seen: Record<string, unknown> = {};
-  globalThis.fetch = (async (_url, init) => {
+  globalThis.fetch = (async (url, init) => {
+    if (String(url).endsWith("/models")) {
+      return new Response(
+        JSON.stringify({
+          data: [{ id: "minimax/minimax-m2.5", supported_parameters: ["max_tokens"] }],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    }
     seen = JSON.parse(String((init as { body?: unknown }).body)) as Record<string, unknown>;
     const delta = JSON.stringify({ choices: [{ delta: { content: "ok" } }] });
     const usage = JSON.stringify({
@@ -225,13 +407,155 @@ test("streaming vault calls forward the shared gate through legacy OpenAI-compat
   const result = await streamUpstream(cfg, undefined, body, (delta) => deltas.push(delta), gate);
 
   assert.equal(result.ok, true);
-  assert.deepEqual(result.usage, { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 });
+  assert.deepEqual(result.usage, {
+    prompt_tokens: 2,
+    completion_tokens: 1,
+    total_tokens: 3,
+    cached_prompt_tokens: 0,
+  });
   assert.equal(deltas.length, 1);
   assert.equal(seen.max_tokens, gate);
   assert.equal(seen.max_completion_tokens, undefined);
   assert.equal(seen.stream, true);
   assert.deepEqual(seen.stream_options, { include_usage: true });
   assert.deepEqual(seen.provider, { require_parameters: true });
+});
+
+test("streaming accepts split CRLF, multiline data, EOF dispatch, and component-only usage", async (t) => {
+  const cfg = configFor({
+    slug: "venice",
+    baseUrl: "https://sse-variants.test/v1",
+    models: ["model"],
+  });
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  const chunks = [
+    ": keepalive\r\ndata: {\"choices\":\r",
+    "\ndata: [{\"delta\":{\"content\":\"ok\"}}]}\r\n\r",
+    "\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":2,",
+    "\"completion_tokens\":1}}",
+  ];
+  globalThis.fetch = (async () => new Response(
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(new TextEncoder().encode(chunk));
+        controller.close();
+      },
+    }),
+    { status: 200, headers: { "content-type": "text/event-stream; charset=utf-8" } }
+  )) as typeof fetch;
+
+  const deltas: unknown[] = [];
+  const result = await streamUpstream(
+    cfg,
+    undefined,
+    { model: "model", messages: [], stream: true },
+    (delta) => deltas.push(delta),
+    100
+  );
+  assert.equal(result.ok, true);
+  assert.equal(deltas.length, 1);
+  assert.deepEqual(result.usage, {
+    prompt_tokens: 2,
+    completion_tokens: 1,
+    total_tokens: 3,
+    cached_prompt_tokens: 0,
+  });
+});
+
+test("streaming requires usage to remain terminal", async (t) => {
+  const cfg = configFor({
+    slug: "venice",
+    baseUrl: "https://sse-terminal.test/v1",
+    models: ["model"],
+  });
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  const delta = JSON.stringify({ choices: [{ delta: { content: "late" } }] });
+  const usage = JSON.stringify({
+    choices: [],
+    usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
+  });
+  const bodies = [
+    "data: " + usage + "\n\ndata: " + delta + "\n\n",
+    "data: " + delta + "\n\ndata: " + usage +
+      "\n\ndata: [DONE]\n\ndata: " + delta + "\n\n",
+  ];
+  globalThis.fetch = (async () => new Response(bodies.shift(), {
+    status: 200,
+    headers: { "content-type": "text/event-stream" },
+  })) as typeof fetch;
+
+  for (let index = 0; index < 2; index += 1) {
+    const result = await streamUpstream(
+      cfg,
+      undefined,
+      { model: "model", messages: [], stream: true },
+      () => {},
+      100
+    );
+    assert.equal(result.ok, false);
+    assert.deepEqual(result.usage, {
+      prompt_tokens: 0,
+      completion_tokens: 0,
+      total_tokens: 0,
+    });
+  }
+});
+
+test("streaming fails closed on malformed events, contradictory usage, and non-SSE success", async (t) => {
+  const cfg = configFor({
+    slug: "venice",
+    baseUrl: "https://sse-failure.test/v1",
+    models: ["model"],
+  });
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  const bodies = [
+    new Response("data: {not-json}\n\n", {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    }),
+    new Response(
+      "data: {\"choices\":[{}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":99}}\n\n",
+      { status: 200, headers: { "content-type": "text/event-stream" } }
+    ),
+    new Response(
+      "event: error\ndata: {\"error\":{\"message\":\"bad upstream event\"}}\n\n",
+      { status: 200, headers: { "content-type": "text/event-stream" } }
+    ),
+    new Response(JSON.stringify({ choices: [{}] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }),
+    new Response(null, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    }),
+  ];
+  globalThis.fetch = (async () => bodies.shift() as Response) as typeof fetch;
+
+  for (let index = 0; index < 5; index += 1) {
+    const result = await streamUpstream(
+      cfg,
+      undefined,
+      { model: "model", messages: [], stream: true },
+      () => {},
+      100
+    );
+    assert.equal(result.ok, false);
+    assert.deepEqual(result.usage, {
+      prompt_tokens: 0,
+      completion_tokens: 0,
+      total_tokens: 0,
+    });
+  }
 });
 
 test("Anthropic maps valid modern limits and defaults malformed values", () => {
@@ -310,7 +634,15 @@ test("non-vault Anthropic calls default a non-numeric legacy limit before upstre
   });
 
   let seen: Record<string, unknown> = {};
-  globalThis.fetch = (async (_url, init) => {
+  globalThis.fetch = (async (url, init) => {
+    if (String(url).endsWith("/models")) {
+      return new Response(
+        JSON.stringify({
+          data: [{ id: "minimax/minimax-m2.5", supported_parameters: ["max_tokens"] }],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    }
     seen = JSON.parse(String((init as { body?: unknown }).body)) as Record<string, unknown>;
     return new Response(
       JSON.stringify({

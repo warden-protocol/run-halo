@@ -34,9 +34,11 @@ import {
 import {
   estimateRequestPromptTokens,
   priceRequest,
+  upstreamCompletionLimitField,
   upstreamContextLength,
   upstreamRatePer1KUsd,
 } from "../pricing";
+import { UpstreamSseParser, type UpstreamSseEvent } from "../upstream-sse";
 import {
   checkReservationCached,
   collectibleServeAmount,
@@ -314,21 +316,35 @@ export function shouldFetchTeeProof(
   );
 }
 
-export function forwardVaultCompletionLimit(
+export async function forwardVaultCompletionLimit(
   body: InferenceRequestMessage["body"],
-  providerSlug: string,
+  provider: ProviderConfig,
   completionCeilingTokens: number
-): InferenceRequestMessage["body"] {
-  const hasMaxTokens = Object.prototype.hasOwnProperty.call(body, "max_tokens");
-  const hasMaxCompletionTokens = Object.prototype.hasOwnProperty.call(
-    body,
-    "max_completion_tokens"
+): Promise<InferenceRequestMessage["body"]> {
+  const suppliedLimits = [body.max_tokens, body.max_completion_tokens].filter(
+    (value): value is number =>
+      typeof value === "number" && Number.isSafeInteger(value) && value > 0
   );
-  if (hasMaxTokens || hasMaxCompletionTokens) return body;
-
-  return providerSlug === "openai"
-    ? { ...body, max_completion_tokens: completionCeilingTokens }
-    : { ...body, max_tokens: completionCeilingTokens };
+  const forwardedLimit =
+    suppliedLimits.length > 0
+      ? Math.min(...suppliedLimits)
+      : completionCeilingTokens;
+  const model = typeof body.model === "string" ? body.model : provider.models[0] ?? "";
+  const field = await upstreamCompletionLimitField({
+    providerSlug: provider.slug,
+    providerBaseUrl: provider.baseUrl,
+    model,
+  });
+  if (field === undefined) {
+    throw new Error(
+      "completion-limit capability unavailable for " + provider.slug + "/" + model
+    );
+  }
+  const forwarded = { ...body };
+  delete forwarded.max_tokens;
+  delete forwarded.max_completion_tokens;
+  if (field !== null) forwarded[field] = forwardedLimit;
+  return forwarded;
 }
 
 export function invalidVaultTextGenerationControlField(
@@ -1223,17 +1239,36 @@ export async function callUpstream(
   const wire = wireFormatFor(provider.slug);
   const base = provider.baseUrl.replace(/\/+$/, "");
 
-  const forwardedBody =
-    vaultCompletionCeilingTokens === undefined
-      ? body
-      : forwardVaultCompletionLimit(body, provider.slug, vaultCompletionCeilingTokens);
+  let forwardedBody: InferenceRequestMessage["body"];
+  try {
+    forwardedBody =
+      vaultCompletionCeilingTokens === undefined
+        ? body
+        : await forwardVaultCompletionLimit(body, provider, vaultCompletionCeilingTokens);
+  } catch (err) {
+    console.warn(
+      "  ⚠ upstream completion-limit capability check failed: " +
+        (err instanceof Error ? err.message : String(err))
+    );
+    const normalized = upstreamProviderErrorResponse("provider_error");
+    return {
+      status: normalized.status,
+      data: normalized.data,
+      usage: zeroUsage,
+      respHeaders: {},
+    };
+  }
 
   // Apply the identity-metadata allowlist before either upstream wire-format path.
   const { sanitized, report } = sanitizeChatRequest(forwardedBody);
   if (sanitized.messages !== undefined) {
     sanitized.messages = sanitizeMessages(sanitized.messages);
   }
-  if (vaultCompletionCeilingTokens !== undefined && provider.slug === "openrouter") {
+  if (
+    vaultCompletionCeilingTokens !== undefined &&
+    provider.slug === "openrouter" &&
+    ("max_tokens" in sanitized || "max_completion_tokens" in sanitized)
+  ) {
     sanitized.provider = { require_parameters: true };
   }
   // Buffered calls remove `stream`; the streaming path forces it independently.
@@ -1696,6 +1731,58 @@ export async function callUpstreamImageEdit(
   };
 }
 
+function validUsageTokenCount(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : null;
+}
+
+function normalizeStreamUsage(value: unknown): UpstreamUsage | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const raw = value as {
+    prompt_tokens?: unknown;
+    completion_tokens?: unknown;
+    total_tokens?: unknown;
+    prompt_tokens_details?: { cached_tokens?: unknown } | null;
+  };
+  const promptTokens = validUsageTokenCount(raw.prompt_tokens);
+  const completionTokens = validUsageTokenCount(raw.completion_tokens);
+  if (promptTokens === null || completionTokens === null) return null;
+  const computedTotal = promptTokens + completionTokens;
+  if (!Number.isSafeInteger(computedTotal)) return null;
+  const totalTokens =
+    raw.total_tokens === undefined
+      ? computedTotal
+      : validUsageTokenCount(raw.total_tokens);
+  if (totalTokens === null || totalTokens !== computedTotal) return null;
+  const cachedRaw = raw.prompt_tokens_details?.cached_tokens;
+  const cachedPromptTokens =
+    cachedRaw === undefined ? 0 : validUsageTokenCount(cachedRaw);
+  if (cachedPromptTokens === null || cachedPromptTokens > promptTokens) return null;
+  return {
+    total_tokens: totalTokens,
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    cached_prompt_tokens: cachedPromptTokens,
+  };
+}
+
+function streamProviderFailure(errorData?: unknown): {
+  status: number;
+  usage: UpstreamUsage;
+  ok: false;
+  errorData: unknown;
+} {
+  const zeroUsage: UpstreamUsage = { total_tokens: 0, prompt_tokens: 0, completion_tokens: 0 };
+  const normalized = upstreamProviderErrorResponse("provider_error");
+  return {
+    status: normalized.status,
+    usage: zeroUsage,
+    ok: false,
+    errorData: errorData ?? normalized.data,
+  };
+}
+
 /** Stream OpenAI-format deltas and capture final usage. */
 export async function streamUpstream(
   cfg: HaloConfig,
@@ -1707,13 +1794,26 @@ export async function streamUpstream(
   const zeroUsage: UpstreamUsage = { total_tokens: 0, prompt_tokens: 0, completion_tokens: 0 };
   // Per-model provider resolution (multi-provider operators) — see callUpstream.
   const { provider, apiKey } = resolveProvider(cfg, body);
-  const forwardedBody =
-    vaultCompletionCeilingTokens === undefined
-      ? body
-      : forwardVaultCompletionLimit(body, provider.slug, vaultCompletionCeilingTokens);
+  let forwardedBody: InferenceRequestMessage["body"];
+  try {
+    forwardedBody =
+      vaultCompletionCeilingTokens === undefined
+        ? body
+        : await forwardVaultCompletionLimit(body, provider, vaultCompletionCeilingTokens);
+  } catch (err) {
+    console.warn(
+      "  ⚠ upstream completion-limit capability check failed: " +
+        (err instanceof Error ? err.message : String(err))
+    );
+    return streamProviderFailure();
+  }
   const { sanitized } = sanitizeChatRequest(forwardedBody);
   if (sanitized.messages !== undefined) sanitized.messages = sanitizeMessages(sanitized.messages);
-  if (vaultCompletionCeilingTokens !== undefined && provider.slug === "openrouter") {
+  if (
+    vaultCompletionCeilingTokens !== undefined &&
+    provider.slug === "openrouter" &&
+    ("max_tokens" in sanitized || "max_completion_tokens" in sanitized)
+  ) {
     sanitized.provider = { require_parameters: true };
   }
   const base = provider.baseUrl.replace(/\/+$/, "");
@@ -1745,8 +1845,13 @@ export async function streamUpstream(
     return { status: normalized.status, usage: zeroUsage, ok: false, errorData: normalized.data };
   }
   if (!res.ok || !res.body) {
-    clearTimeout(timer);
+    if (res.ok) {
+      clearTimeout(timer);
+      console.warn("  ⚠ upstream(stream) returned an empty success response");
+      return streamProviderFailure();
+    }
     const text = await res.text().catch(() => "");
+    clearTimeout(timer);
     let parsed: unknown;
     try {
       parsed = JSON.parse(text);
@@ -1772,59 +1877,100 @@ export async function streamUpstream(
     return { status: normalized.status, usage: zeroUsage, ok: false, errorData: normalized.data };
   }
 
+  const contentType = res.headers.get("content-type")?.toLowerCase() ?? "";
+  if (!contentType.includes("text/event-stream")) {
+    clearTimeout(timer);
+    await res.body.cancel().catch(() => {});
+    console.warn("  ⚠ upstream(stream) returned a non-SSE success response");
+    return streamProviderFailure();
+  }
+
   let usage = zeroUsage;
+  let sawUsage = false;
+  let sawDone = false;
+  let deltaCount = 0;
+  let protocolFailure: unknown | undefined;
+  const parser = new UpstreamSseParser();
   const reader = (res.body as ReadableStream<Uint8Array>).getReader();
-  const decoder = new TextDecoder();
-  let buf = "";
+  const invalidProtocol = (): false => {
+    protocolFailure = upstreamProviderErrorResponse("provider_error").data;
+    return false;
+  };
+
+  const processEvents = (events: UpstreamSseEvent[]): boolean => {
+    for (const event of events) {
+      const payload = event.data.trim();
+      if (sawDone) return invalidProtocol();
+      if (event.event === "error") {
+        try {
+          protocolFailure = sanitizeUpstreamError(JSON.parse(payload), 502);
+        } catch {
+          protocolFailure = upstreamProviderErrorResponse("provider_error").data;
+        }
+        return false;
+      }
+      if (payload === "[DONE]") {
+        sawDone = true;
+        continue;
+      }
+      if (sawUsage) return invalidProtocol();
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(payload);
+      } catch {
+        return invalidProtocol();
+      }
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return invalidProtocol();
+      }
+      const record = parsed as { error?: unknown; usage?: unknown; choices?: unknown };
+      if (record.error !== undefined) {
+        protocolFailure = sanitizeUpstreamError(parsed, 502);
+        return false;
+      }
+      if (record.choices !== undefined && !Array.isArray(record.choices)) {
+        return invalidProtocol();
+      }
+      if (Array.isArray(record.choices) && record.choices.length > 0) {
+        onDelta(parsed);
+        deltaCount += 1;
+      }
+      if (record.usage !== undefined && record.usage !== null) {
+        const normalizedUsage = normalizeStreamUsage(record.usage);
+        if (normalizedUsage === null) return invalidProtocol();
+        usage = normalizedUsage;
+        sawUsage = true;
+      }
+    }
+    return true;
+  };
+
   try {
     for (;;) {
       const { value, done } = await reader.read();
       if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      let sep: number;
-      while ((sep = buf.indexOf("\n\n")) !== -1) {
-        const evt = buf.slice(0, sep);
-        buf = buf.slice(sep + 2);
-        for (const line of evt.split("\n")) {
-          const t = line.trim();
-          if (!t.startsWith("data:")) continue;
-          const payload = t.slice(5).trim();
-          if (payload === "[DONE]") continue;
-          let obj: unknown;
-          try {
-            obj = JSON.parse(payload);
-          } catch {
-            continue;
-          }
-          const o = obj as {
-            usage?: { total_tokens?: number; prompt_tokens?: number; completion_tokens?: number };
-            choices?: unknown[];
-          };
-          if (o.usage && typeof o.usage.total_tokens === "number") {
-            usage = {
-              total_tokens: o.usage.total_tokens ?? 0,
-              prompt_tokens: o.usage.prompt_tokens ?? 0,
-              completion_tokens: o.usage.completion_tokens ?? 0,
-            };
-          }
-          if (Array.isArray(o.choices) && o.choices.length > 0) onDelta(obj);
-        }
-      }
+      if (!processEvents(parser.push(value))) break;
     }
+    if (protocolFailure === undefined) processEvents(parser.finish());
   } catch (err) {
-    clearTimeout(timer);
     console.warn(
-      `  ⚠ upstream(stream) read failed: ${err instanceof Error ? err.message : String(err)}`
+      "  ⚠ upstream(stream) read failed: " +
+        (err instanceof Error ? err.message : String(err))
     );
-    const normalized = upstreamProviderErrorResponse("provider_error");
-    return {
-      status: normalized.status,
-      usage,
-      ok: false,
-      errorData: normalized.data,
-    };
+    protocolFailure = upstreamProviderErrorResponse("provider_error").data;
+  } finally {
+    clearTimeout(timer);
   }
-  clearTimeout(timer);
+
+  if (protocolFailure !== undefined) {
+    await reader.cancel().catch(() => {});
+    return streamProviderFailure(protocolFailure);
+  }
+  if (!sawUsage || deltaCount === 0) {
+    console.warn("  ⚠ upstream(stream) ended without billable usage or completion frames");
+    return streamProviderFailure();
+  }
   return { status: 200, usage, ok: true };
 }
 
@@ -2601,6 +2747,15 @@ export async function cmdServe(): Promise<void> {
               .flatMap((p) => p.imageModels ?? [])
               .filter((m) => !deannounced.has(m));
             const imageEditModels = buildImageEditModelsAnnounce(cfg);
+            const vaultSseReplayV1Models = await buildVaultSseReplayModelsAnnounce(
+              cfg,
+              announceModels
+            );
+            const legacyGlobalReplayCompatible = shouldAnnounceLegacyGlobalVaultReplay(
+              cfg,
+              announceModels,
+              vaultSseReplayV1Models
+            );
             ws.send(
               JSON.stringify({
                 type: "announce",
@@ -2624,10 +2779,11 @@ export async function cmdServe(): Promise<void> {
                   // Per-model context window (tokens) so the relay's /v1/models
                   // can expose it for agents to size context / decide compression.
                   contextLength: await buildContextLengthAnnounce(cfg),
-                  // Advertise vault streaming when any provider supports the OpenAI wire; requests re-check their provider.
                   streaming: providers.some((p) => wireFormatFor(p.slug) !== "anthropic"),
-                  // Vault routing requires this reservation-verification capability; no legacy fallback is valid.
-                  vaultProtocols: [VAULT_SSE_REPLAY_EPHEMERAL_PROTOCOL],
+                  vaultSseReplayV1Models,
+                  ...(legacyGlobalReplayCompatible
+                    ? { vaultProtocols: [VAULT_SSE_REPLAY_EPHEMERAL_PROTOCOL] }
+                    : {}),
                   vaultPayments: capability,
                   label: cfg.operator.label,
                   dataRetention: cfg.operator.dataRetention ?? "unknown",
@@ -3869,6 +4025,51 @@ export async function buildPricingAnnounce(
     }
   }
   return out;
+}
+
+/** Exact text models that can honor the v1 replay streaming contract. */
+export async function buildVaultSseReplayModelsAnnounce(
+  cfg: HaloConfig,
+  announcedModels: readonly string[] = allConfiguredModels(cfg)
+): Promise<string[]> {
+  const providers = configProviders(cfg);
+  const replayModels: string[] = [];
+  for (const model of announcedModels) {
+    const provider = providerForModel(providers, model);
+    if (
+      isBreakerOpen(provider.slug) ||
+      wireFormatFor(provider.slug) === "anthropic" ||
+      providerServesConfiguredImageModel(provider, model)
+    ) {
+      continue;
+    }
+    const completionLimitField = await upstreamCompletionLimitField({
+      providerSlug: provider.slug,
+      providerBaseUrl: provider.baseUrl,
+      model,
+    });
+    if (completionLimitField !== undefined && completionLimitField !== null) {
+      replayModels.push(model);
+    }
+  }
+  return [...new Set(replayModels)];
+}
+
+export function shouldAnnounceLegacyGlobalVaultReplay(
+  cfg: HaloConfig,
+  announcedModels: readonly string[],
+  replayModels: readonly string[]
+): boolean {
+  const providers = configProviders(cfg);
+  const replayModelSet = new Set(replayModels);
+  const announcedTextModels = announcedModels.filter((model) => {
+    const provider = providerForModel(providers, model);
+    return !providerServesConfiguredImageModel(provider, model);
+  });
+  return (
+    announcedTextModels.length > 0 &&
+    announcedTextModels.every((model) => replayModelSet.has(model))
+  );
 }
 
 export function buildImagePricingAnnounce(cfg: HaloConfig): Record<string, number> {

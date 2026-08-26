@@ -50,6 +50,16 @@ export interface RunCliVaultSseReplayInput {
   sleep?: (delayMs: number) => Promise<void>;
 }
 
+export function cliOperatorSupportsVaultSseReplayModel(
+  operator: { vaultSseReplayV1Models?: string[]; vaultProtocols?: string[] },
+  model: string
+): boolean {
+  return (
+    Array.isArray(operator.vaultSseReplayV1Models) &&
+    operator.vaultSseReplayV1Models.includes(model)
+  );
+}
+
 export function buildCliVaultSseReplayRequestBody(
   model: unknown,
   encryptedEnvelope: unknown,
