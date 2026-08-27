@@ -6,8 +6,13 @@ import {
   estimateReservationTokens,
   IMAGE_PROMPT_TOKENS,
   LOW_DETAIL_IMAGE_PROMPT_TOKENS,
+  priceVaultSseReplayPricingQuote,
 } from "@halo/vault-core";
-import { estimatePromptTokens } from "./pricing";
+import type { HaloConfig } from "./config";
+import {
+  buildVaultSseReplayPricingAnnounce,
+  estimatePromptTokens,
+} from "./pricing";
 
 test("estimatePromptTokens counts plain string content + per-message overhead", () => {
   // 8 chars -> ceil(8/4)=2 tokens, + 4/message = 6
@@ -116,4 +121,71 @@ test("estimateReservationTokens applies the reasoning completion ceiling, incl. 
   assert.ok(estimateReservationTokens(reason16) >= 8192);
   assert.ok(estimateReservationTokens(reasonOmit) >= 8192);
   assert.ok(estimateReservationTokens(plain16) < 100);
+});
+
+test("replay pricing announce returns the operator's margin-inclusive request-aware quote", async (t) => {
+  const model = "vendor/asymmetric";
+  const cfg: HaloConfig = {
+    version: 1,
+    relayUrl: "http://relay.test",
+    indexerUrl: "http://indexer.test",
+    operator: {
+      address: "0x0000000000000000000000000000000000000001",
+      keystorePath: "/tmp/keystore.json",
+    },
+    provider: {
+      slug: "openrouter",
+      baseUrl: "https://pricing-quote.test/v1",
+      models: [model],
+    },
+    pricing: {
+      mode: "margin",
+      marginPercent: 30,
+      fallbackPerRequestUsdc: 10_000,
+    },
+    facilitator: { url: "http://facilitator.test" },
+  };
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  globalThis.fetch = (async (url) => {
+    assert.equal(String(url), "https://pricing-quote.test/v1/models");
+    return Response.json({
+      data: [
+        {
+          id: model,
+          pricing: {
+            prompt: "0.000001",
+            completion: "0.000010",
+            request: "0.001",
+            input_cache_read: "0.0000005",
+          },
+          supported_parameters: ["max_tokens"],
+        },
+      ],
+    });
+  }) as typeof fetch;
+
+  const quotes = await buildVaultSseReplayPricingAnnounce(
+    cfg,
+    [model],
+    1_000
+  );
+  const quote = quotes[model];
+  assert.ok(quote);
+  assert.equal(quote.promptUsdPerMtok, "1.3");
+  assert.equal(quote.completionUsdPerMtok, "13");
+  assert.equal(quote.cacheReadUsdPerMtok, "0.65");
+  assert.equal(quote.requestUsdcBase, "1300");
+  assert.equal(quote.fallbackUsdcBase, "10000");
+  assert.equal(quote.marginBps, 3000);
+  assert.equal(
+    priceVaultSseReplayPricingQuote(quote, {
+      promptTokens: 1_000,
+      completionTokens: 100,
+      cachedPromptTokens: 200,
+    }),
+    3_770n
+  );
 });

@@ -3,6 +3,12 @@ import {
   configProviders,
   providerForModel,
 } from "./config";
+import {
+  VAULT_SSE_REPLAY_PRICING_PROTOCOL,
+  buildVaultSseReplayPricingQuote,
+  canonicalVaultSseReplayPricingRate,
+  type VaultSseReplayPricingQuoteV1,
+} from "@halo/vault-core";
 
 export interface UpstreamRate {
   /** USD per prompt token (e.g. 0.000003 for $3/M). */
@@ -24,6 +30,8 @@ type Resolver = (model: string, baseUrl: string) => Promise<UpstreamRate | null>
 const CACHE_TTL_MS = 5 * 60 * 1000;
 // Bound catalog fetches so callers terminate instead of sharing a permanently hung promise.
 const FETCH_TIMEOUT_MS = 5_000;
+export const VAULT_SSE_REPLAY_PRICING_QUOTE_TTL_MS = 10 * 60 * 1000;
+export const VAULT_SSE_REPLAY_PRICING_QUOTE_REFRESH_MS = 5 * 60 * 1000;
 
 /** Per-(provider+baseUrl) cache. Pricing tables don't change often. */
 interface CacheEntry {
@@ -335,6 +343,98 @@ export async function upstreamRatePer1KUsd(params: {
   // Per-request surcharges are deliberately excluded: they don't scale with
   // tokens, so folding them into a per-1K rate would distort it.
   return perToken * 1000;
+}
+
+export async function buildVaultSseReplayPricingAnnounce(
+  cfg: HaloConfig,
+  announcedModels: readonly string[],
+  nowMs: number = Date.now()
+): Promise<Record<string, VaultSseReplayPricingQuoteV1>> {
+  const quotes: Record<string, VaultSseReplayPricingQuoteV1> = {};
+  const issuedAtMs = Math.max(1, Math.floor(nowMs));
+  const expiresAtMs = issuedAtMs + VAULT_SSE_REPLAY_PRICING_QUOTE_TTL_MS;
+
+  for (const model of new Set(announcedModels)) {
+    const provider = providerForModel(configProviders(cfg), model);
+    const pricing = provider.pricing ?? cfg.pricing;
+    if (pricing.mode !== "margin") continue;
+    const roundedMarginPercent =
+      typeof pricing.marginPercent === "number"
+        ? Math.round(pricing.marginPercent)
+        : 25;
+    const marginBps = Math.max(0, roundedMarginPercent) * 100;
+    const factor = (100 + Math.max(0, roundedMarginPercent)) / 100;
+    const fallback = cfg.pricing.fallbackPerRequestUsdc;
+    if (!Number.isSafeInteger(fallback) || fallback <= 0) continue;
+
+    try {
+      const resolver = RESOLVERS[provider.slug];
+      let rate: UpstreamRate | null = null;
+      if (resolver) {
+        try {
+          rate = await resolver(model, provider.baseUrl);
+        } catch {
+          rate = null;
+        }
+      }
+      const positiveCatalogRate =
+        rate !== null &&
+        Number.isFinite(rate.promptRateUsd) &&
+        rate.promptRateUsd >= 0 &&
+        Number.isFinite(rate.completionRateUsd) &&
+        rate.completionRateUsd >= 0 &&
+        (rate.promptRateUsd > 0 ||
+          rate.completionRateUsd > 0 ||
+          (rate.requestRateUsd ?? 0) > 0);
+
+      if (positiveCatalogRate && rate) {
+        const requestRateUsd = Math.max(0, rate.requestRateUsd ?? 0);
+        quotes[model] = buildVaultSseReplayPricingQuote({
+          protocol: VAULT_SSE_REPLAY_PRICING_PROTOCOL,
+          model,
+          promptUsdPerMtok: canonicalVaultSseReplayPricingRate(
+            rate.promptRateUsd * 1_000_000 * factor
+          ),
+          completionUsdPerMtok: canonicalVaultSseReplayPricingRate(
+            rate.completionRateUsd * 1_000_000 * factor
+          ),
+          cacheReadUsdPerMtok:
+            rate.cacheReadRateUsd !== undefined && rate.cacheReadRateUsd >= 0
+              ? canonicalVaultSseReplayPricingRate(
+                  rate.cacheReadRateUsd * 1_000_000 * factor
+                )
+              : null,
+          requestUsdcBase: String(Math.ceil(requestRateUsd * 1_000_000 * factor)),
+          fallbackUsdcBase: String(fallback),
+          marginBps,
+          issuedAtMs,
+          expiresAtMs,
+        });
+        continue;
+      }
+
+      quotes[model] = buildVaultSseReplayPricingQuote({
+        protocol: VAULT_SSE_REPLAY_PRICING_PROTOCOL,
+        model,
+        promptUsdPerMtok: "0",
+        completionUsdPerMtok: "0",
+        cacheReadUsdPerMtok: null,
+        requestUsdcBase: String(fallback),
+        fallbackUsdcBase: String(fallback),
+        marginBps,
+        issuedAtMs,
+        expiresAtMs,
+      });
+    } catch (error) {
+      console.warn(
+        `[pricing] replay quote unavailable for ${provider.slug}/${model}: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
+  }
+
+  return quotes;
 }
 
 // Shared media-aware prompt estimator — keeps the operator's vault gate sized

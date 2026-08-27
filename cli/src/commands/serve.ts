@@ -32,6 +32,8 @@ import {
   OpenAIChatRequest,
 } from "../anthropic-adapter";
 import {
+  VAULT_SSE_REPLAY_PRICING_QUOTE_REFRESH_MS,
+  buildVaultSseReplayPricingAnnounce,
   estimateRequestPromptTokens,
   priceRequest,
   upstreamCompletionLimitField,
@@ -78,7 +80,9 @@ import {
   ImageEditPlaintextError,
   ImageEditPlaintextV1,
   parseImageEditPlaintext,
+  isVaultSseReplayPricingQuoteUsable,
   priceImages,
+  priceVaultSseReplayPricingQuote,
   requestCompletionCeilingTokens,
   VAULT_SSE_REPLAY_EPHEMERAL_PROTOCOL,
   VAULT_SSE_REPLAY_MANIFEST_TYPES,
@@ -88,6 +92,7 @@ import {
   vaultSseReplayManifestValue,
   type VaultSseReplayPair,
   type VaultSseReplayReceiptDelivery,
+  type VaultSseReplayPricingQuoteV1,
   type VaultSseReplayUnsignedManifest,
   type VaultEventV2Unsigned,
 } from "@halo/vault-core";
@@ -97,7 +102,6 @@ import { sanitizeChatRequest, sanitizeMessages } from "../sanitize";
 import { installProxyFromEnv } from "../proxy";
 import {
   classifyUpstreamProviderError,
-  CREDIT_EXHAUSTED_400_RE,
   normalizeUpstreamError,
   operatorErrorResponse,
   transientUpstreamErrorResponse,
@@ -1148,6 +1152,81 @@ function tripBreakerLogged(slug: string, code: UpstreamProviderErrorCode | null)
   );
 }
 
+function logChatUpstreamHttpError(
+  streaming: boolean,
+  providerSlug: string,
+  apiKey: string | undefined,
+  base: string,
+  status: number,
+  text: string,
+  code: UpstreamProviderErrorCode | null
+): void {
+  const source = streaming ? "upstream(stream)" : "upstream";
+  if (code === "operator_auth_failure") {
+    console.error(
+      `  ✖ ${source} "${providerSlug}" rejected the API key (HTTP ${status}). ` +
+        `Key sent: ${maskApiKeyForLog(apiKey)}. The key configured for "${providerSlug}" ` +
+        `was refused by ${base} — re-set it with: halo setup --add-provider --provider ${providerSlug} ` +
+        "--api-key <key>  (then restart serve)."
+    );
+  } else if (process.env.HALO_DEBUG_UPSTREAM_ERRORS !== "1") {
+    console.error(
+      `  ${source} ${status} (set HALO_DEBUG_UPSTREAM_ERRORS=1 to print body to this terminal)`
+    );
+  }
+
+  if (process.env.HALO_DEBUG_UPSTREAM_ERRORS === "1") {
+    debugToTerminal(`  ${source} ${status} body: ${text.slice(0, 2000)}`);
+  }
+}
+
+export function handleStartupProviderProbeResponse(
+  providerSlug: string,
+  apiKey: string,
+  status: number,
+  text: string
+): void {
+  if (status >= 200 && status < 300) {
+    console.log(`  ✓ ${providerSlug}: stored key accepted by upstream`);
+    return;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    parsed = { error: { message: text } };
+  }
+  const code = classifyUpstreamProviderError(status, parsed);
+
+  if (process.env.HALO_DEBUG_UPSTREAM_ERRORS === "1") {
+    debugToTerminal(`  upstream(startup-probe) ${status} body: ${text.slice(0, 2000)}`);
+  }
+
+  if (code === "operator_auth_failure") {
+    console.error(
+      `  ✖ ${providerSlug}: upstream REJECTED the stored key (HTTP ${status}) — ${maskApiKeyForLog(apiKey)}.`
+    );
+    console.error(
+      `    This is the key actually loaded for "${providerSlug}"; the upstream reports invalid credentials. ` +
+        `Compare it to a key that works in a direct curl (a 1-char typo keeps the same length/prefix). ` +
+        `Re-set: halo setup --add-provider --provider ${providerSlug} --api-key <key>  then restart serve.`
+    );
+  } else if (code === "credit_exhausted") {
+    console.error(
+      `  ✖ ${providerSlug}: upstream account cannot serve paid requests ` +
+        `(HTTP ${status}, classified as out of credits) — ${maskApiKeyForLog(apiKey)}.`
+    );
+  } else {
+    console.log(
+      `  • ${providerSlug}: key probe reached upstream but returned HTTP ${status}; serve will continue`
+    );
+    return;
+  }
+
+  tripBreakerLogged(providerSlug, code);
+}
+
 function clearBreakerLogged(slug: string): void {
   if (clearBreaker(slug)) {
     console.log(`  ✅ circuit breaker CLOSED for "${slug}"; re-announcing its models`);
@@ -1347,26 +1426,20 @@ export async function callUpstream(
 
   // Sanitize non-2xx bodies; raw debug detail may reach the live terminal but never the consumer or log file.
   if (!res.ok) {
-    // Attribute auth failures to the selected provider and expose only a masked key fingerprint.
-    if (res.status === 401 || res.status === 403) {
-      const masked = maskApiKeyForLog(apiKey);
-      console.error(
-        `  ✖ upstream "${provider.slug}" rejected the API key (HTTP ${res.status}). ` +
-          `Key sent: ${masked}. The key configured for "${provider.slug}" was refused by ${base} — ` +
-          `re-set it with: halo setup --add-provider --provider ${provider.slug} --api-key <key>  (then restart serve).`
-      );
-    } else if (process.env.HALO_DEBUG_UPSTREAM_ERRORS === "1") {
-      // Terminal-only: the body can echo the prompt, so it must not hit serve.log.
-      debugToTerminal(`  upstream ${res.status} body: ${text.slice(0, 2000)}`);
-    } else {
-      console.error(
-        `  upstream ${res.status} (set HALO_DEBUG_UPSTREAM_ERRORS=1 to print body to this terminal)`
-      );
-    }
+    const code = classifyUpstreamProviderError(res.status, parsed);
+    logChatUpstreamHttpError(
+      false,
+      provider.slug,
+      apiKey,
+      base,
+      res.status,
+      text,
+      code
+    );
     // A credit/auth fault won't clear next request — open this provider's
     // breaker so we de-announce its models and stop paying to re-discover it.
-    tripBreakerLogged(provider.slug, classifyUpstreamProviderError(res.status, parsed));
-    const normalized = normalizeUpstreamError(parsed, res.status);
+    tripBreakerLogged(provider.slug, code);
+    const normalized = normalizeUpstreamError(parsed, res.status, code);
     return { ...normalized, usage: zeroUsage, respHeaders: {} };
   }
 
@@ -1858,22 +1931,18 @@ export async function streamUpstream(
     } catch {
       parsed = { error: { message: text } };
     }
-    if (res.status === 401 || res.status === 403) {
-      console.error(
-        `  ✖ upstream(stream) "${provider.slug}" rejected the API key (HTTP ${res.status}). ` +
-          `Key sent: ${maskApiKeyForLog(apiKey)}. The key configured for "${provider.slug}" ` +
-          `was refused by ${base} — re-set it with: halo setup --add-provider --provider ${provider.slug} --api-key <key>  (then restart serve).`
-      );
-    } else if (process.env.HALO_DEBUG_UPSTREAM_ERRORS === "1") {
-      // Terminal-only: the body can echo the prompt, so it must not hit serve.log.
-      debugToTerminal(`  upstream(stream) ${res.status} body: ${text.slice(0, 2000)}`);
-    } else {
-      console.error(
-        `  upstream(stream) ${res.status} (set HALO_DEBUG_UPSTREAM_ERRORS=1 to print body to this terminal)`
-      );
-    }
-    tripBreakerLogged(provider.slug, classifyUpstreamProviderError(res.status, parsed));
-    const normalized = normalizeUpstreamError(parsed, res.status);
+    const code = classifyUpstreamProviderError(res.status, parsed);
+    logChatUpstreamHttpError(
+      true,
+      provider.slug,
+      apiKey,
+      base,
+      res.status,
+      text,
+      code
+    );
+    tripBreakerLogged(provider.slug, code);
+    const normalized = normalizeUpstreamError(parsed, res.status, code);
     return { status: normalized.status, usage: zeroUsage, ok: false, errorData: normalized.data };
   }
 
@@ -2205,36 +2274,7 @@ export async function cmdServe(): Promise<void> {
         });
         clearTimeout(timer);
         const probeText = await res.text().catch(() => "");
-        if (res.status === 401 || res.status === 403) {
-          console.error(
-            `  ✖ ${p.slug}: upstream REJECTED the stored key (HTTP ${res.status}) — ${maskKey(k)}.`
-          );
-          console.error(
-            `    This is the key actually loaded for "${p.slug}"; the upstream says it's invalid. ` +
-              `Compare it to a key that works in a direct curl (a 1-char typo keeps the same length/prefix). ` +
-              `Re-set: halo setup --add-provider --provider ${p.slug} --api-key <key>  then restart serve.`
-          );
-          // Do not announce models whose provider authentication is broken.
-          tripBreakerLogged(p.slug, "operator_auth_failure");
-        } else if (res.status === 402) {
-          console.error(
-            `  ✖ ${p.slug}: upstream accepted the stored key but cannot serve paid requests ` +
-              `(HTTP 402, likely out of credits) — ${maskKey(k)}.`
-          );
-          tripBreakerLogged(p.slug, "credit_exhausted");
-        } else if (res.status === 400 && CREDIT_EXHAUSTED_400_RE.test(probeText)) {
-          console.error(
-            `  ✖ ${p.slug}: upstream accepted the stored key but reports insufficient account credits ` +
-              `(HTTP 400) — ${maskKey(k)}.`
-          );
-          tripBreakerLogged(p.slug, "credit_exhausted");
-        } else if (!res.ok) {
-          console.log(
-            `  • ${p.slug}: key probe reached upstream but returned HTTP ${res.status}; serve will continue`
-          );
-        } else {
-          console.log(`  ✓ ${p.slug}: stored key accepted by upstream`);
-        }
+        handleStartupProviderProbeResponse(p.slug, k, res.status, probeText);
       } catch {
         // Network/timeout — don't block serve on a transient probe failure.
         console.log(`  • ${p.slug}: key probe skipped (upstream unreachable right now)`);
@@ -2297,6 +2337,8 @@ export async function cmdServe(): Promise<void> {
     vault: selectedVaultAddress,
     operator: cfg.operator.address,
   });
+  const vaultReplayPricingQuotes = new Map<string, VaultSseReplayPricingQuoteV1>();
+  let vaultReplayLegacyModels = new Set<string>();
 
   const queueVaultEvent = async (payload: VaultEventV2Unsigned): Promise<void> => {
     const signature = await wallet.signMessage(canonicalVaultEventMessage(payload));
@@ -2751,6 +2793,17 @@ export async function cmdServe(): Promise<void> {
               cfg,
               announceModels
             );
+            vaultReplayLegacyModels = new Set(vaultSseReplayV1Models);
+            const replayPricing = await buildVaultSseReplayPricingCapabilityAnnounce(
+              cfg,
+              announceModels
+            );
+            for (const quote of Object.values(replayPricing.quotes)) {
+              vaultReplayPricingQuotes.set(quote.quoteId, quote);
+            }
+            for (const [quoteId, quote] of vaultReplayPricingQuotes) {
+              if (quote.expiresAtMs <= Date.now()) vaultReplayPricingQuotes.delete(quoteId);
+            }
             const legacyGlobalReplayCompatible = shouldAnnounceLegacyGlobalVaultReplay(
               cfg,
               announceModels,
@@ -2781,6 +2834,8 @@ export async function cmdServe(): Promise<void> {
                   contextLength: await buildContextLengthAnnounce(cfg),
                   streaming: providers.some((p) => wireFormatFor(p.slug) !== "anthropic"),
                   vaultSseReplayV1Models,
+                  vaultSseReplayPricingV1Models: replayPricing.models,
+                  vaultSseReplayPricingV1: replayPricing.quotes,
                   ...(legacyGlobalReplayCompatible
                     ? { vaultProtocols: [VAULT_SSE_REPLAY_EPHEMERAL_PROTOCOL] }
                     : {}),
@@ -2829,11 +2884,18 @@ export async function cmdServe(): Promise<void> {
             );
           });
           void (async () => {
+            let nextPricingRefreshAt =
+              Date.now() + VAULT_SSE_REPLAY_PRICING_QUOTE_REFRESH_MS;
             while (!shuttingDown && !wsClosed) {
               const capability = await probeVaultCapability();
               if (ws.readyState !== WebSocket.OPEN || wsClosed) return;
               try {
                 await capabilityAnnouncements.sync(capability);
+                if (Date.now() >= nextPricingRefreshAt) {
+                  await capabilityAnnouncements.refresh();
+                  nextPricingRefreshAt =
+                    Date.now() + VAULT_SSE_REPLAY_PRICING_QUOTE_REFRESH_MS;
+                }
               } catch (err) {
                 logError("vault capability re-announce failed; will retry", err);
               }
@@ -2936,6 +2998,7 @@ export async function cmdServe(): Promise<void> {
 
         let replayRequest: VaultReplayRequestMessage | null = null;
         let replayChargeCeiling: bigint | null = null;
+        let replayPricingQuote: VaultSseReplayPricingQuoteV1 | null = null;
         let req: InferenceRequestMessage;
         if (msg.type === "vault-replay-request") {
           const candidate = msg as VaultReplayRequestMessage;
@@ -2967,6 +3030,29 @@ export async function cmdServe(): Promise<void> {
             digestVaultSseReplayRequest(candidate.requestBody) !==
               candidate.requestDigest
           ) {
+            await rejectReplayRequest();
+            return;
+          }
+          const outerModel = (replayBody as Record<string, unknown>).model;
+          const quoteId = (replayBody as Record<string, unknown>).pricingQuoteId;
+          if (typeof outerModel !== "string") {
+            await rejectReplayRequest();
+            return;
+          }
+          if (quoteId !== undefined) {
+            const quote =
+              typeof quoteId === "string"
+                ? vaultReplayPricingQuotes.get(quoteId)
+                : undefined;
+            if (
+              !quote ||
+              !isVaultSseReplayPricingQuoteUsable(quote, outerModel)
+            ) {
+              await rejectReplayRequest();
+              return;
+            }
+            replayPricingQuote = quote;
+          } else if (!vaultReplayLegacyModels.has(outerModel)) {
             await rejectReplayRequest();
             return;
           }
@@ -3356,6 +3442,11 @@ export async function cmdServe(): Promise<void> {
               const ceilingCost =
                 imagePrice !== null
                   ? priceImages(imagePrice, requestedImageCount(req.body))
+                  : replayPricingQuote
+                    ? priceVaultSseReplayPricingQuote(replayPricingQuote, {
+                        promptTokens: estimateRequestPromptTokens(req.body),
+                        completionTokens: vaultCompletionCeiling,
+                      })
                   : await priceRequest({
                       cfg,
                       model: requestedModel,
@@ -3718,13 +3809,19 @@ export async function cmdServe(): Promise<void> {
                   // A small max_tokens gate never bounds a reasoning model's tokens, so the
                   // priced actual can exceed the ceiling; awarding the uncapped price would
                   // over-count the credit ledger and strand a permanent txHash:null indexer row.
-                  const uncappedAmount = await priceRequest({
-                    cfg,
-                    model: requestedModel,
-                    promptTokens: upstream.usage.prompt_tokens,
-                    completionTokens: upstream.usage.completion_tokens,
-                    cachedPromptTokens: upstream.usage.cached_prompt_tokens,
-                  });
+                  const uncappedAmount = replayPricingQuote
+                    ? priceVaultSseReplayPricingQuote(replayPricingQuote, {
+                        promptTokens: upstream.usage.prompt_tokens,
+                        completionTokens: upstream.usage.completion_tokens,
+                        cachedPromptTokens: upstream.usage.cached_prompt_tokens,
+                      })
+                    : await priceRequest({
+                        cfg,
+                        model: requestedModel,
+                        promptTokens: upstream.usage.prompt_tokens,
+                        completionTokens: upstream.usage.completion_tokens,
+                        cachedPromptTokens: upstream.usage.cached_prompt_tokens,
+                      });
                   const actualAmount = collectibleServeAmount(uncappedAmount, ceilingCost);
                   const servedTokens = upstream.usage.total_tokens;
                   if (uncappedAmount > actualAmount) {
@@ -4027,8 +4124,7 @@ export async function buildPricingAnnounce(
   return out;
 }
 
-/** Exact text models that can honor the v1 replay streaming contract. */
-export async function buildVaultSseReplayModelsAnnounce(
+async function buildVaultSseReplayDeliveryModelsAnnounce(
   cfg: HaloConfig,
   announcedModels: readonly string[] = allConfiguredModels(cfg)
 ): Promise<string[]> {
@@ -4053,6 +4149,45 @@ export async function buildVaultSseReplayModelsAnnounce(
     }
   }
   return [...new Set(replayModels)];
+}
+
+/** Legacy replay discovery remains available only where one scalar token rate is exact. */
+export async function buildVaultSseReplayModelsAnnounce(
+  cfg: HaloConfig,
+  announcedModels: readonly string[] = allConfiguredModels(cfg)
+): Promise<string[]> {
+  const providers = configProviders(cfg);
+  const deliveryModels = await buildVaultSseReplayDeliveryModelsAnnounce(
+    cfg,
+    announcedModels
+  );
+  return deliveryModels.filter((model) => {
+    const provider = providerForModel(providers, model);
+    return (provider.pricing ?? cfg.pricing).mode === "flat";
+  });
+}
+
+export async function buildVaultSseReplayPricingCapabilityAnnounce(
+  cfg: HaloConfig,
+  announcedModels: readonly string[] = allConfiguredModels(cfg),
+  nowMs: number = Date.now()
+): Promise<{
+  models: string[];
+  quotes: Record<string, VaultSseReplayPricingQuoteV1>;
+}> {
+  const deliveryModels = await buildVaultSseReplayDeliveryModelsAnnounce(
+    cfg,
+    announcedModels
+  );
+  const quotes = await buildVaultSseReplayPricingAnnounce(
+    cfg,
+    deliveryModels,
+    nowMs
+  );
+  return {
+    models: deliveryModels.filter((model) => quotes[model] !== undefined),
+    quotes,
+  };
 }
 
 export function shouldAnnounceLegacyGlobalVaultReplay(

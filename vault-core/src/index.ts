@@ -11,9 +11,11 @@ import {
   EIP712_VERSION,
   VAULT_ADDRESS,
 } from "./consensus.generated.js";
+import type { VaultSseReplayPricingQuoteV1 } from "./vaultSseReplayPricing.js";
 
 export * from "./consensus.generated.js";
 export * from "./vaultSseReplay.js";
+export * from "./vaultSseReplayPricing.js";
 
 export const VAULT_ABI = [
   "function deposit(uint256 amount, address sessionKey)",
@@ -1164,6 +1166,8 @@ export interface VaultOperatorAdvertisement {
   tee?: boolean;
   teeModels?: string[];
   vaultPayments?: boolean;
+  vaultSseReplayPricingV1Models?: string[];
+  vaultSseReplayPricingV1?: Record<string, VaultSseReplayPricingQuoteV1>;
   encryptionPubkey?: string | null;
 }
 

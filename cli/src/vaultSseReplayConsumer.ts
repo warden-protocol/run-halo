@@ -7,6 +7,7 @@ import {
   advanceVaultSseReplayDigest,
   digestVaultSseReplayRequest,
   isVaultSseReplayResultExpiry,
+  isVaultSseReplayPricingQuoteUsable,
   parseVaultSseReplayManifest,
   parseVaultSseReplayPrepareResponse,
   recoverVaultSseReplayManifestSigner,
@@ -17,6 +18,7 @@ import {
   type VaultSseReplayCommand,
   type VaultSseReplayManifest,
   type VaultSseReplayPair,
+  type VaultSseReplayPricingQuoteV1,
   type VaultSseReplayPrepareResponse,
   type VaultSseReplayReceiptDelivery,
 } from "@halo/vault-core";
@@ -51,25 +53,49 @@ export interface RunCliVaultSseReplayInput {
 }
 
 export function cliOperatorSupportsVaultSseReplayModel(
-  operator: { vaultSseReplayV1Models?: string[]; vaultProtocols?: string[] },
+  operator: {
+    vaultSseReplayV1Models?: string[];
+    vaultSseReplayPricingV1Models?: string[];
+    vaultSseReplayPricingV1?: Record<string, VaultSseReplayPricingQuoteV1>;
+    vaultProtocols?: string[];
+  },
   model: string
 ): boolean {
+  if (cliOperatorVaultSseReplayPricingQuote(operator, model)) return true;
   return (
     Array.isArray(operator.vaultSseReplayV1Models) &&
     operator.vaultSseReplayV1Models.includes(model)
   );
 }
 
+export function cliOperatorVaultSseReplayPricingQuote(
+  operator: {
+    vaultSseReplayPricingV1Models?: string[];
+    vaultSseReplayPricingV1?: Record<string, VaultSseReplayPricingQuoteV1>;
+  },
+  model: string,
+  nowMs: number = Date.now()
+): VaultSseReplayPricingQuoteV1 | null {
+  const quote = operator.vaultSseReplayPricingV1?.[model];
+  return operator.vaultSseReplayPricingV1Models?.includes(model) &&
+    quote &&
+    isVaultSseReplayPricingQuoteUsable(quote, model, nowMs)
+    ? quote
+    : null;
+}
+
 export function buildCliVaultSseReplayRequestBody(
   model: unknown,
   encryptedEnvelope: unknown,
-  maxAmountUsdc: bigint
+  maxAmountUsdc: bigint,
+  pricingQuoteId?: string
 ): Record<string, unknown> {
   return {
     model,
     stream: true,
     _enc: encryptedEnvelope,
     maxAmountUsdc: maxAmountUsdc.toString(),
+    ...(pricingQuoteId ? { pricingQuoteId } : {}),
   };
 }
 

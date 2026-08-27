@@ -46,12 +46,14 @@ import {
 } from "../vault-consume";
 import {
   MAX_VAULT_RESERVATION_ATTEMPTS,
-  RESERVATION_PRICE_MARGIN_BPS,
   IMAGE_EDIT_MAX_BODY_BYTES,
   IMAGE_EDIT_MAX_INPUT_BYTES,
   IMAGE_EDIT_MAX_OUTPUT_IMAGES,
   IMAGE_EDIT_MAX_PROMPT_BYTES,
   estimateReservationTokens,
+  estimateRequestPromptTokens,
+  requestCompletionCeilingTokens,
+  priceVaultSseReplayPricingQuote,
   isVaultCreditWindowExceeded,
   meterVaultResponse,
   priceImages,
@@ -62,6 +64,7 @@ import {
   settlementAmount,
   withReservationMargin,
   type VaultOperatorSelectionReason,
+  type VaultSseReplayPricingQuoteV1,
 } from "@halo/vault-core";
 import {
   detectImageFormat,
@@ -77,6 +80,7 @@ import { resolveVaultAddress } from "../vault-address";
 import {
   buildCliVaultSseReplayRequestBody,
   cliOperatorSupportsVaultSseReplayModel,
+  cliOperatorVaultSseReplayPricingQuote,
   deliverCliVaultSseReplayReceipt,
   runCliVaultSseReplay,
   type RunCliVaultSseReplayInput,
@@ -135,6 +139,7 @@ interface VaultOperatorPin {
   encryptionPubkey: string | null;
   streaming: boolean;
   vaultSseReplay: boolean;
+  replayPricingQuote: VaultSseReplayPricingQuoteV1 | null;
 }
 
 interface VaultOperatorSelectionResult {
@@ -142,12 +147,120 @@ interface VaultOperatorSelectionResult {
   reason: VaultOperatorSelectionReason;
 }
 
+export interface VaultDirectoryOperator {
+  address: string;
+  models: string[];
+  encryptionPubkey?: string | null;
+  pubkeyAttestation?: string | null;
+  pricing?: Record<string, number>;
+  tee?: boolean;
+  teeModels?: string[];
+  vaultPayments?: boolean;
+  streaming?: boolean;
+  vaultProtocols?: string[];
+  vaultSseReplayV1Models?: string[];
+  vaultSseReplayPricingV1Models?: string[];
+  vaultSseReplayPricingV1?: Record<string, VaultSseReplayPricingQuoteV1>;
+}
+
+export interface VaultOperatorRequestPricing {
+  maxAmountBase: bigint;
+  reservationTokens: number;
+  promptTokens: number;
+  completionTokens: number;
+  allowReplayPricing: boolean;
+}
+
+export function selectVaultOperatorForRequestFromList(
+  operators: VaultDirectoryOperator[],
+  model: string,
+  teeOnly: boolean,
+  requestPricing: VaultOperatorRequestPricing,
+  requireAddress?: string
+): {
+  selected: {
+    operator: VaultDirectoryOperator;
+    priceUsdPerMtok: number;
+    encryptionPubkey: string | null;
+    replayPricingQuote: VaultSseReplayPricingQuoteV1 | null;
+    reservationCostBase: bigint;
+  } | null;
+  reason: VaultOperatorSelectionReason;
+} {
+  const eligible = selectVaultOperatorFromList(operators, model, {
+    teeOnly,
+    requireAddress,
+  });
+  if (!eligible.selected) {
+    return { selected: null, reason: eligible.reason };
+  }
+
+  const withinLimit = eligible.candidates
+    .map(({ operator, priceUsdPerMtok }) => {
+      const encryptionPubkey = authenticatedOperatorPubkey(
+        operator.address,
+        operator.encryptionPubkey,
+        operator.pubkeyAttestation
+      );
+      const replayPricingQuote = cliOperatorVaultSseReplayPricingQuote(
+        operator,
+        model
+      );
+      const useReplayQuote =
+        requestPricing.allowReplayPricing &&
+        operator.streaming === true &&
+        encryptionPubkey !== null &&
+        replayPricingQuote !== null;
+      const reservationCostBase = useReplayQuote
+        ? withReservationMargin(
+            priceVaultSseReplayPricingQuote(replayPricingQuote, {
+              promptTokens: requestPricing.promptTokens,
+              completionTokens: requestPricing.completionTokens,
+            })
+          )
+        : withReservationMargin(
+            priceTokens(priceUsdPerMtok, requestPricing.reservationTokens)
+          );
+      return {
+        operator,
+        priceUsdPerMtok,
+        encryptionPubkey,
+        replayPricingQuote,
+        reservationCostBase,
+      };
+    })
+    .filter(
+      (candidate) =>
+        candidate.reservationCostBase <= requestPricing.maxAmountBase
+    )
+    .sort((a, b) => {
+      if (a.reservationCostBase < b.reservationCostBase) return -1;
+      if (a.reservationCostBase > b.reservationCostBase) return 1;
+      return a.priceUsdPerMtok - b.priceUsdPerMtok;
+    });
+
+  if (withinLimit.length === 0) {
+    return {
+      selected: null,
+      reason: requireAddress ? "pinned_out_of_range" : "out_of_range",
+    };
+  }
+  const bestCost = withinLimit[0].reservationCostBase;
+  const cheapest = withinLimit.filter(
+    (candidate) => candidate.reservationCostBase === bestCost
+  );
+  const selected = requireAddress
+    ? cheapest[0]
+    : cheapest[Math.floor(Math.random() * cheapest.length)];
+  return { selected, reason: "selected" };
+}
+
 /** Pick the cheapest vault-capable operator, optionally requiring TEE support; return `null` if none qualify. */
 async function selectVaultOperator(
   relayBase: string,
   model: string,
   teeOnly: boolean,
-  maxPriceUsdPerMtok?: number,
+  requestPricing: VaultOperatorRequestPricing,
   requireAddress?: string
 ): Promise<VaultOperatorSelectionResult> {
   try {
@@ -155,40 +268,31 @@ async function selectVaultOperator(
     const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
     if (!res.ok) return { pin: null, reason: "no_operator" };
     const { operators } = (await res.json()) as {
-      operators: Array<{
-        address: string;
-        models: string[];
-        encryptionPubkey?: string | null;
-        pubkeyAttestation?: string | null;
-        pricing?: Record<string, number>;
-        tee?: boolean;
-        teeModels?: string[];
-        vaultPayments?: boolean;
-        streaming?: boolean;
-        vaultProtocols?: string[];
-        vaultSseReplayV1Models?: string[];
-      }>;
+      operators: VaultDirectoryOperator[];
     };
-    const selection = selectVaultOperatorFromList(operators, model, {
+    const selection = selectVaultOperatorForRequestFromList(
+      operators,
+      model,
       teeOnly,
-      maxPriceUsdPerMtok,
-      requireAddress,
-      randomizeCheapestTies: !requireAddress,
-    });
+      requestPricing,
+      requireAddress
+    );
     if (!selection.selected) return { pin: null, reason: selection.reason };
-    const { operator, priceUsdPerMtok } = selection.selected;
+    const {
+      operator,
+      priceUsdPerMtok,
+      encryptionPubkey,
+      replayPricingQuote,
+    } = selection.selected;
     return {
       pin: {
         address: operator.address,
         priceUsdPerMtok,
-        encryptionPubkey: authenticatedOperatorPubkey(
-          operator.address,
-          operator.encryptionPubkey,
-          operator.pubkeyAttestation
-        ),
+        encryptionPubkey,
         streaming: operator.streaming === true,
         vaultSseReplay:
           cliOperatorSupportsVaultSseReplayModel(operator, model),
+        replayPricingQuote,
       },
       reason: selection.reason,
     };
@@ -309,6 +413,7 @@ export async function vaultSend(
     operator: string;
     priceUsdPerMtok: number;
     estTokens: number;
+    estimatedCost?: bigint;
     replay?: {
       relayUrl: string;
       vaultAddress: string;
@@ -324,7 +429,9 @@ export async function vaultSend(
   chargedBase?: string;
   e2eDecrypted?: boolean;
 }> {
-  const estCost = withReservationMargin(priceTokens(opts.priceUsdPerMtok, opts.estTokens));
+  const estCost =
+    opts.estimatedCost ??
+    withReservationMargin(priceTokens(opts.priceUsdPerMtok, opts.estTokens));
   let ops: OpsState;
   let keyEpoch: bigint;
   ({ ops, keyEpoch } = await client.ensureReservation(opts.operator, estCost));
@@ -2029,11 +2136,9 @@ export async function cmdConsume(args: Args): Promise<void> {
     // BEFORE confidential/E2E mutate `parsed`, and pin ONE operator to reserve
     // against, encrypt to, and meter (TEE-only when confidential).
     // Shared reasoning headroom keeps reservation and operator gate equal.
+    const vaultPromptTokens = estimateRequestPromptTokens(parsed);
+    const vaultCompletionTokens = requestCompletionCeilingTokens(parsed);
     const vaultEstTokens = estimateReservationTokens(parsed);
-    const maxPriceUsdPerMtok =
-      Number(maxAmountBase) /
-      Math.max(1, vaultEstTokens) /
-      (1 + Number(RESERVATION_PRICE_MARGIN_BPS) / 10_000);
     const m = typeof parsed.model === "string" ? parsed.model : "";
     // If the caller explicitly pinned an operator (X-Halo-Operator, e.g. a
     // settlement sweep targeting every operator), honor it; otherwise fall back
@@ -2044,7 +2149,14 @@ export async function cmdConsume(args: Args): Promise<void> {
           relayBase,
           m,
           wantConfidential,
-          maxPriceUsdPerMtok,
+          {
+            maxAmountBase,
+            reservationTokens: vaultEstTokens,
+            promptTokens: vaultPromptTokens,
+            completionTokens: vaultCompletionTokens,
+            allowReplayPricing:
+              wantStream && !wantConfidential && !args.noE2e,
+          },
           pinned
         )
       : { pin: null, reason: "no_operator" as VaultOperatorSelectionReason };
@@ -2129,7 +2241,33 @@ export async function cmdConsume(args: Args): Promise<void> {
     let e2eEphemeralPriv: Uint8Array | null = null;
     let e2eOperatorPub: Uint8Array | null = null;
     const wantsVaultReplay =
-      wantStream && vaultPin.streaming && vaultPin.vaultSseReplay;
+      !wantConfidential &&
+      !args.noE2e &&
+      vaultPin.encryptionPubkey !== null &&
+      wantStream &&
+      vaultPin.streaming &&
+      vaultPin.vaultSseReplay;
+    const replayEstimatedCost =
+      wantsVaultReplay && vaultPin.replayPricingQuote
+        ? withReservationMargin(
+            priceVaultSseReplayPricingQuote(vaultPin.replayPricingQuote, {
+              promptTokens: vaultPromptTokens,
+              completionTokens: vaultCompletionTokens,
+            })
+          )
+        : withReservationMargin(
+            priceTokens(vaultPin.priceUsdPerMtok, vaultEstTokens)
+          );
+    if (replayEstimatedCost > maxAmountBase) {
+      return sendJson(res, 402, {
+        error: {
+          message: `request may cost up to ${fmtVaultUsd(replayEstimatedCost)}, above this consumer's ${fmtVaultUsd(maxAmountBase)} per-request limit. Raise it with --max-usdc, lower the completion limit, or route to a cheaper operator.`,
+          type: "vault_request_price_limit_exceeded",
+          requiredUsdcBase: replayEstimatedCost.toString(),
+          limitUsdcBase: maxAmountBase.toString(),
+        },
+      });
+    }
     if (!wantConfidential && !args.noE2e) {
       // Encrypt to the same operator that owns the reservation.
       const op = vaultPin.encryptionPubkey
@@ -2150,9 +2288,8 @@ export async function cmdConsume(args: Args): Promise<void> {
             ? buildCliVaultSseReplayRequestBody(
                 routeModel,
                 envelope,
-                withReservationMargin(
-                  priceTokens(vaultPin.priceUsdPerMtok, vaultEstTokens)
-                )
+                replayEstimatedCost,
+                vaultPin.replayPricingQuote?.quoteId
               )
             : { model: routeModel, _enc: envelope };
           forwardHeaders["x-halo-operator"] = op.address;
@@ -2173,6 +2310,7 @@ export async function cmdConsume(args: Args): Promise<void> {
         operator: vaultPin.address,
         priceUsdPerMtok: vaultPin.priceUsdPerMtok,
         estTokens: vaultEstTokens,
+        estimatedCost: replayEstimatedCost,
         ...(wantsVaultReplay && e2eEphemeralPriv && e2eOperatorPub
           ? {
               replay: {
