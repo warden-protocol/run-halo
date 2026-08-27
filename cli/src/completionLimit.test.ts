@@ -10,6 +10,7 @@ import {
 } from "./anthropic-adapter";
 import type { HaloConfig, ProviderConfig } from "./config";
 import {
+  buildVaultSseReplayPricingCapabilityAnnounce,
   buildVaultSseReplayModelsAnnounce,
   callUpstream,
   forwardVaultCompletionLimit,
@@ -226,7 +227,13 @@ test("replay announcement is exact per model and withholds the legacy global tok
 
   const announced = ["modern", "neither", "claude"];
   const replayModels = await buildVaultSseReplayModelsAnnounce(cfg, announced);
+  const requestAware = await buildVaultSseReplayPricingCapabilityAnnounce(
+    cfg,
+    announced,
+    1_000
+  );
   assert.deepEqual(replayModels, ["modern"]);
+  assert.deepEqual(requestAware, { models: [], quotes: {} });
   assert.equal(
     shouldAnnounceLegacyGlobalVaultReplay(cfg, announced, replayModels),
     false
@@ -234,6 +241,49 @@ test("replay announcement is exact per model and withholds the legacy global tok
   assert.equal(
     shouldAnnounceLegacyGlobalVaultReplay(cfg, ["modern"], replayModels),
     true
+  );
+});
+
+test("margin replay is advertised only through request-aware pricing capability", async (t) => {
+  const model = "margin/model";
+  const provider: ProviderConfig = {
+    slug: "openrouter",
+    baseUrl: "https://margin-replay-capability.test/v1",
+    models: [model],
+  };
+  const cfg = configFor(provider);
+  cfg.pricing = {
+    mode: "margin",
+    marginPercent: 25,
+    fallbackPerRequestUsdc: 1_000,
+  };
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  globalThis.fetch = (async () => Response.json({
+    data: [
+      {
+        id: model,
+        supported_parameters: ["max_tokens"],
+        pricing: { prompt: "0.000001", completion: "0.000010" },
+      },
+    ],
+  })) as typeof fetch;
+
+  const legacyModels = await buildVaultSseReplayModelsAnnounce(cfg, [model]);
+  const requestAware = await buildVaultSseReplayPricingCapabilityAnnounce(
+    cfg,
+    [model],
+    1_000
+  );
+
+  assert.deepEqual(legacyModels, []);
+  assert.deepEqual(requestAware.models, [model]);
+  assert.equal(requestAware.quotes[model]?.marginBps, 2500);
+  assert.equal(
+    shouldAnnounceLegacyGlobalVaultReplay(cfg, [model], legacyModels),
+    false
   );
 });
 

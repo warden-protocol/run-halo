@@ -26,9 +26,90 @@ test("maps upstream 402 credit exhaustion to a structured 502 without leaking pr
   assert.doesNotMatch(JSON.stringify(normalized.data), /Spent: \$28/i);
 });
 
-test("maps upstream auth failures to operator_auth_failure", () => {
+test("maps every upstream 401 to operator_auth_failure", () => {
   assert.equal(classifyUpstreamProviderError(401, { error: { message: "bad key" } }), "operator_auth_failure");
-  assert.equal(classifyUpstreamProviderError(403, { error: { message: "forbidden" } }), "operator_auth_failure");
+});
+
+test("maps only explicit account credential failures on 403 to operator_auth_failure", () => {
+  const bodies = [
+    { error: { message: "Invalid API key" } },
+    { error: { message: "The API key has been revoked." } },
+    { error: { message: "Authentication failed for the supplied credentials." } },
+    { error: { code: "invalid-api-key" } },
+  ];
+
+  for (const body of bodies) {
+    assert.equal(classifyUpstreamProviderError(403, body), "operator_auth_failure");
+  }
+});
+
+test("maps an OpenRouter regional 403 to a request-scoped provider_error", () => {
+  const raw = {
+    error: {
+      message: "Provider returned error",
+      code: 403,
+      metadata: {
+        raw:
+          "sakana/sakana-namazu is not available in your region: " +
+          "Sakana AI blocks requests originating from your location.",
+        provider_name: "Sakana AI",
+      },
+    },
+  };
+
+  assert.equal(classifyUpstreamProviderError(403, raw), "provider_error");
+  const normalized = normalizeUpstreamError(raw, 403);
+  assert.equal(normalized.status, 502);
+  assert.deepEqual(normalized.data, {
+    error: {
+      message: "The selected operator's upstream provider is temporarily unavailable.",
+      type: "upstream_provider_error",
+      code: "provider_error",
+    },
+  });
+  assert.doesNotMatch(JSON.stringify(normalized.data), /sakana|region|location/i);
+});
+
+test("keeps model, moderation, and ambiguous 403 failures request-scoped", () => {
+  const bodies = [
+    { error: { message: "forbidden" } },
+    { error: { message: "This API key does not have access to the selected model." } },
+    { error: { message: "This API key is disabled for the selected model by regional policy." } },
+    {
+      error: {
+        message: "Provider returned error",
+        metadata: {
+          raw: "Request blocked by moderation because the prompt said purchase more credits.",
+        },
+      },
+    },
+    { error: { metadata: { raw: "Authentication failed for the supplied credentials." } } },
+    { error: { metadata: { raw: "Your account balance is too low." } } },
+    {
+      error: {
+        message: "The selected model is unavailable in this region.",
+        code: "invalid_api_key",
+      },
+    },
+    { error: { code: "unauthorized" } },
+    { error: { type: "auth_error" } },
+    { error: { code: "billing_error" } },
+  ];
+
+  for (const body of bodies) {
+    assert.equal(classifyUpstreamProviderError(403, body), "provider_error");
+  }
+});
+
+test("keeps explicit account-credit 403 failures sticky", () => {
+  const bodies = [
+    { error: { message: "Your account balance is too low." } },
+    { error: { code: "insufficient_quota" } },
+  ];
+
+  for (const body of bodies) {
+    assert.equal(classifyUpstreamProviderError(403, body), "credit_exhausted");
+  }
 });
 
 test("splits credit-class 429 from other provider throttling", () => {

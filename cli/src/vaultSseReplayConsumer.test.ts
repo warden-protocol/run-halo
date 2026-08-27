@@ -5,7 +5,9 @@ import {
   EMPTY_VAULT_SSE_REPLAY_DIGEST,
   VAULT_SSE_REPLAY_EPHEMERAL_PROTOCOL,
   VAULT_SSE_REPLAY_MANIFEST_TYPES,
+  VAULT_SSE_REPLAY_PRICING_PROTOCOL,
   advanceVaultSseReplayDigest,
+  buildVaultSseReplayPricingQuote,
   digestVaultSseReplayRequest,
   parseVaultSseReplayPrepareRequest,
   recoverVaultSseReplayCommandSigner,
@@ -19,9 +21,11 @@ import {
 import {
   buildCliVaultSseReplayRequestBody,
   cliOperatorSupportsVaultSseReplayModel,
+  cliOperatorVaultSseReplayPricingQuote,
   deliverCliVaultSseReplayReceipt,
   runCliVaultSseReplay,
 } from "./vaultSseReplayConsumer";
+import { selectVaultOperatorForRequestFromList } from "./commands/consume";
 
 function event(name: string, data: unknown): string {
   return `event: ${name}\ndata: ${JSON.stringify(data)}\n\n`;
@@ -43,6 +47,118 @@ test("CLI replay selection requires the requested model in the exact list", () =
     ),
     false
   );
+});
+
+test("CLI replay selection accepts a live request-aware quote and binds its id into the request", () => {
+  const now = Date.now();
+  const quote = buildVaultSseReplayPricingQuote({
+    protocol: VAULT_SSE_REPLAY_PRICING_PROTOCOL,
+    model: "vendor/margin",
+    promptUsdPerMtok: "1.25",
+    completionUsdPerMtok: "12.5",
+    cacheReadUsdPerMtok: null,
+    requestUsdcBase: "100",
+    fallbackUsdcBase: "1000",
+    marginBps: 2500,
+    issuedAtMs: now - 1_000,
+    expiresAtMs: now + 60_000,
+  });
+  const operator = {
+    vaultSseReplayPricingV1Models: [quote.model],
+    vaultSseReplayPricingV1: { [quote.model]: quote },
+  };
+
+  assert.equal(
+    cliOperatorSupportsVaultSseReplayModel(operator, quote.model),
+    true
+  );
+  assert.equal(
+    cliOperatorVaultSseReplayPricingQuote(operator, quote.model)?.quoteId,
+    quote.quoteId
+  );
+  const body = buildCliVaultSseReplayRequestBody(
+    quote.model,
+    { ciphertext: "request" },
+    1_000n,
+    quote.quoteId
+  );
+  assert.equal(body.pricingQuoteId, quote.quoteId);
+
+  const expired = buildVaultSseReplayPricingQuote({
+    protocol: VAULT_SSE_REPLAY_PRICING_PROTOCOL,
+    model: quote.model,
+    promptUsdPerMtok: quote.promptUsdPerMtok,
+    completionUsdPerMtok: quote.completionUsdPerMtok,
+    cacheReadUsdPerMtok: quote.cacheReadUsdPerMtok,
+    requestUsdcBase: quote.requestUsdcBase,
+    fallbackUsdcBase: quote.fallbackUsdcBase,
+    marginBps: quote.marginBps,
+    issuedAtMs: now - 120_000,
+    expiresAtMs: now - 1,
+  });
+  assert.equal(
+    cliOperatorSupportsVaultSseReplayModel(
+      {
+        vaultSseReplayPricingV1Models: [quote.model],
+        vaultSseReplayPricingV1: { [quote.model]: expired },
+      },
+      quote.model
+    ),
+    false
+  );
+});
+
+test("CLI request selection applies the replay quote before enforcing the per-request limit", async () => {
+  const now = Date.now();
+  const model = "vendor/asymmetric";
+  const operator = Wallet.createRandom();
+  const encryptionPubkey = "11".repeat(32);
+  const quote = buildVaultSseReplayPricingQuote({
+    protocol: VAULT_SSE_REPLAY_PRICING_PROTOCOL,
+    model,
+    promptUsdPerMtok: "1",
+    completionUsdPerMtok: "100",
+    cacheReadUsdPerMtok: null,
+    requestUsdcBase: "0",
+    fallbackUsdcBase: "1000",
+    marginBps: 0,
+    issuedAtMs: now - 1_000,
+    expiresAtMs: now + 60_000,
+  });
+  const pubkeyAttestation = await operator.signMessage(
+    `halo-pubkey:${operator.address.toLowerCase()}:${encryptionPubkey}`
+  );
+
+  const selection = selectVaultOperatorForRequestFromList(
+    [
+      {
+        address: operator.address,
+        models: [model],
+        pricing: { [model]: 0.03565 },
+        vaultPayments: true,
+        streaming: true,
+        encryptionPubkey,
+        pubkeyAttestation,
+        vaultSseReplayV1Models: [],
+        vaultSseReplayPricingV1Models: [model],
+        vaultSseReplayPricingV1: { [model]: quote },
+      },
+    ],
+    model,
+    false,
+    {
+      maxAmountBase: 5_000n,
+      reservationTokens: 1_005,
+      promptTokens: 1_004,
+      completionTokens: 1,
+      allowReplayPricing: true,
+    }
+  );
+
+  assert.equal(selection.reason, "selected");
+  assert.equal(selection.selected?.operator.address, operator.address);
+  assert.equal(selection.selected?.reservationCostBase, 1_325n);
+  assert.equal(selection.selected?.replayPricingQuote?.quoteId, quote.quoteId);
 });
 
 test("CLI replay request body passes the shared relay prepare parser", () => {
