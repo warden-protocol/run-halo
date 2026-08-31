@@ -3,6 +3,7 @@ const assert = require("node:assert/strict");
 const { mkdtempSync, readFileSync, rmSync, writeFileSync } = require("node:fs");
 const { tmpdir } = require("node:os");
 const path = require("node:path");
+const { Interface } = require("ethers");
 
 const {
   HaloVaultClient,
@@ -16,10 +17,66 @@ const {
   selectVaultOperator,
   usageTokensFromSseBody,
 } = require("../dist/vault");
-const { estimateReservationTokens, estimateTokens, withReservationMargin } = require("@halo/vault-core");
+const {
+  VAULT_ABI,
+  estimateReservationTokens,
+  estimateTokens,
+  withReservationMargin,
+} = require("@halo/vault-core");
 
 test("pins the current production vault", () => {
   assert.equal(VAULT_ADDRESS, "0x3907F660B257560883E891fbbB9F997Eff70E40E");
+});
+
+test("polls release and reservation state immediately and then after two seconds", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const operator = "0x0000000000000000000000000000000000000002";
+  const client = new HaloVaultClient(
+    { getAddress: async () => "0x0000000000000000000000000000000000000001" },
+    {
+      facilitatorUrl: "https://facilitator.invalid",
+      rpcUrl: "http://127.0.0.1:1",
+      chainId: 8453,
+    }
+  );
+  const state = (locked, cycle) => ({
+    locked,
+    redeemed: 0n,
+    expiry: 0n,
+    created: 0n,
+    cycle,
+  });
+
+  let releaseReads = 0;
+  client.readOps = async () => {
+    releaseReads += 1;
+    return releaseReads === 1 ? state(1n, 1n) : state(0n, 1n);
+  };
+  const release = client.waitForRelease(operator);
+  await Promise.resolve();
+  assert.equal(releaseReads, 1);
+  t.mock.timers.tick(1_999);
+  await Promise.resolve();
+  assert.equal(releaseReads, 1);
+  t.mock.timers.tick(1);
+  await release;
+  assert.equal(releaseReads, 2);
+
+  const before = state(1n, 1n);
+  let reservationReads = 0;
+  client.readOps = async () => {
+    reservationReads += 1;
+    return reservationReads === 1 ? before : state(2n, 2n);
+  };
+  const reservation = client.waitForReservation(operator, before);
+  await Promise.resolve();
+  assert.equal(reservationReads, 1);
+  t.mock.timers.tick(1_999);
+  await Promise.resolve();
+  assert.equal(reservationReads, 1);
+  t.mock.timers.tick(1);
+  assert.deepEqual(await reservation, state(2n, 2n));
+  assert.equal(reservationReads, 2);
 });
 
 test("validates a custom vault once and uses it for contracts and typed-data domains", async () => {
@@ -2152,16 +2209,48 @@ test("readVaultState falls through to on-chain when the facilitator omits sessio
     { getAddress: async () => "0x00000000000000000000000000000000000000A3" },
     { facilitatorUrl: "https://facilitator.invalid", rpcUrl: "http://127.0.0.1:1", chainId: 8453 }
   );
-  client.vault = {
-    balance: async () => 10n,
-    lockedTotal: async () => 0n,
-    withdrawable: async () => 10n,
-    sessionKey: async () => onchainKey,
-    reserveNonce: async () => 0n,
-    keyEpoch: async () => 0n,
+  const vaultInterface = new Interface(VAULT_ABI);
+  const multicall = new Interface([
+    "function aggregate3((address target,bool allowFailure,bytes callData)[] calls) payable returns ((bool success,bytes returnData)[] returnData)",
+  ]);
+  const values = [
+    ["balance", 10n],
+    ["lockedTotal", 0n],
+    ["withdrawable", 10n],
+    ["sessionKey", onchainKey],
+    ["reserveNonce", 0n],
+    ["keyEpoch", 0n],
+  ];
+  const successfulResult = multicall.encodeFunctionResult("aggregate3", [
+    values.map(([functionName, value]) => [
+      true,
+      vaultInterface.encodeFunctionResult(functionName, [value]),
+    ]),
+  ]);
+  let rpcCalls = 0;
+  client.provider = {
+    call: async () => {
+      rpcCalls += 1;
+      return successfulResult;
+    },
   };
+  client.vault = new Proxy({}, {
+    get() {
+      throw new Error("per-field vault read must not be used");
+    },
+  });
   const state = await client.readVaultState();
   assert.equal(state.sessionKey, onchainKey);
+  assert.equal(rpcCalls, 1);
+
+  client.provider.call = async () =>
+    multicall.encodeFunctionResult("aggregate3", [
+      values.map(([functionName, value], index) => [
+        index !== 3,
+        vaultInterface.encodeFunctionResult(functionName, [value]),
+      ]),
+    ]);
+  await assert.rejects(client.readVaultState(), /failed sessionKey/);
 });
 
 test("readVaultState trusts the facilitator read only after matching its vault identity (#426)", async (t) => {

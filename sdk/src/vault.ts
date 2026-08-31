@@ -1,6 +1,7 @@
 import {
   Contract,
   JsonRpcProvider,
+  Interface,
   MaxUint256,
   Signer,
   getAddress,
@@ -83,6 +84,20 @@ export type {
 } from "@halo/vault-core";
 
 const USDC_DECIMALS = 6;
+const MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11";
+const MULTICALL3 = new Interface([
+  "function aggregate3((address target,bool allowFailure,bytes callData)[] calls) payable returns ((bool success,bytes returnData)[] returnData)",
+]);
+const VAULT_INTERFACE = new Interface(VAULT_ABI);
+const VAULT_STATE_FUNCTIONS = [
+  "balance",
+  "lockedTotal",
+  "withdrawable",
+  "sessionKey",
+  "reserveNonce",
+  "keyEpoch",
+] as const;
+export const VAULT_STATE_CONFIRM_POLL_MS = 2_000;
 
 const READ_TIMEOUT_MS = 8_000;
 const REDEEM_RETRY_INTERVAL_MS = 20_000;
@@ -390,6 +405,41 @@ export class HaloVaultClient {
     ]);
   }
 
+
+  private async readVaultStateFromChain(consumer: string): Promise<VaultState> {
+    const calls = VAULT_STATE_FUNCTIONS.map((functionName) => ({
+      target: this.cfg.vaultAddress,
+      allowFailure: false,
+      callData: VAULT_INTERFACE.encodeFunctionData(functionName, [consumer]),
+    }));
+    const result = await this.provider.call({
+      to: MULTICALL3_ADDRESS,
+      data: MULTICALL3.encodeFunctionData("aggregate3", [calls]),
+    });
+    const decoded = MULTICALL3.decodeFunctionResult("aggregate3", result)[0] as
+      unknown as readonly (readonly [boolean, string])[];
+    if (decoded.length !== VAULT_STATE_FUNCTIONS.length) {
+      throw new Error("vault state Multicall returned an invalid result count");
+    }
+    const value = (index: number, functionName: string): unknown => {
+      const response = decoded[index];
+      if (!response?.[0]) {
+        throw new Error(`vault state Multicall failed ${functionName}`);
+      }
+      return VAULT_INTERFACE.decodeFunctionResult(
+        functionName,
+        response[1]
+      )[0];
+    };
+    return {
+      balance: BigInt(value(0, "balance") as bigint),
+      lockedTotal: BigInt(value(1, "lockedTotal") as bigint),
+      withdrawable: BigInt(value(2, "withdrawable") as bigint),
+      sessionKey: String(value(3, "sessionKey")),
+      reserveNonce: BigInt(value(4, "reserveNonce") as bigint),
+      keyEpoch: BigInt(value(5, "keyEpoch") as bigint),
+    };
+  }
   async readVaultState(signal?: AbortSignal): Promise<VaultState> {
     throwIfAborted(signal);
     const consumer = await withAbort(this.consumer(), signal);
@@ -431,28 +481,12 @@ export class HaloVaultClient {
     } catch {
       throwIfAborted(signal);
     }
-    const [balance, lockedTotal, withdrawable, sessionKey, reserveNonce, keyEpoch] =
-      await withTimeout(
-        Promise.all([
-          this.vault.balance(consumer),
-          this.vault.lockedTotal(consumer),
-          this.vault.withdrawable(consumer),
-          this.vault.sessionKey(consumer),
-          this.vault.reserveNonce(consumer),
-          this.vault.keyEpoch(consumer),
-        ]),
-        READ_TIMEOUT_MS,
-        "vault state read",
-        signal
-      );
-    return {
-      balance: BigInt(balance),
-      lockedTotal: BigInt(lockedTotal),
-      withdrawable: BigInt(withdrawable),
-      sessionKey: String(sessionKey),
-      reserveNonce: BigInt(reserveNonce),
-      keyEpoch: BigInt(keyEpoch),
-    };
+    return await withTimeout(
+      this.readVaultStateFromChain(consumer),
+      READ_TIMEOUT_MS,
+      "vault state read",
+      signal
+    );
   }
 
   async readOps(operator: string, signal?: AbortSignal): Promise<OpsState> {
@@ -972,7 +1006,7 @@ export class HaloVaultClient {
       if (Date.now() > deadline) {
         throw new Error("Reclaim didn't confirm on-chain in time — retry shortly.");
       }
-      await abortableDelay(600, signal);
+      await abortableDelay(VAULT_STATE_CONFIRM_POLL_MS, signal);
     }
   }
 
@@ -993,7 +1027,7 @@ export class HaloVaultClient {
         // Keep polling after transient RPC failures.
       }
       if (Date.now() > deadline) throw new Error("Reservation didn't confirm on-chain in time — retry shortly.");
-      await abortableDelay(600, signal);
+      await abortableDelay(VAULT_STATE_CONFIRM_POLL_MS, signal);
     }
   }
 
