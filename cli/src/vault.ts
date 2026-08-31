@@ -1,4 +1,4 @@
-import { Contract, JsonRpcProvider, verifyTypedData } from "ethers";
+import { Contract, Interface, JsonRpcProvider, verifyTypedData } from "ethers";
 import {
   RECEIPT_TYPES,
   VAULT_ABI,
@@ -11,6 +11,11 @@ import { resolveVaultAddress } from "./vault-address";
 export { VAULT_ADDRESS } from "@halo/vault-core";
 const RPC_URL = (process.env.BASE_RPC_URL || "https://mainnet.base.org").trim();
 
+const MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11";
+const MULTICALL3 = new Interface([
+  "function aggregate3((address target,bool allowFailure,bytes callData)[] calls) payable returns ((bool success,bytes returnData)[] returnData)",
+]);
+const VAULT_INTERFACE = new Interface(VAULT_ABI);
 // Process-wide vault defaults to consensus and accepts one validated config override at startup.
 let activeVault: string = VAULT_ADDRESS;
 
@@ -253,17 +258,52 @@ const KEY_CACHE_TTL_MS = 60_000;
 interface KeyEntry { sessionKey: string; keyEpoch: bigint; at: number }
 const keyCache = new Map<string, KeyEntry>();
 
+export async function readVaultConsumerSessionAt(
+  provider: Pick<JsonRpcProvider, "call">,
+  vaultAddress: string,
+  consumer: string
+): Promise<{ sessionKey: string; keyEpoch: bigint }> {
+  const functions = ["sessionKey", "keyEpoch"] as const;
+  const calls = functions.map((functionName) => ({
+    target: vaultAddress,
+    allowFailure: false,
+    callData: VAULT_INTERFACE.encodeFunctionData(functionName, [consumer]),
+  }));
+  const result = await provider.call({
+    to: MULTICALL3_ADDRESS,
+    data: MULTICALL3.encodeFunctionData("aggregate3", [calls]),
+  });
+  const responses = MULTICALL3.decodeFunctionResult("aggregate3", result)[0] as
+    unknown as readonly (readonly [boolean, string])[];
+  if (responses.length !== functions.length) {
+    throw new Error("sessionKey/keyEpoch Multicall returned an invalid result count");
+  }
+  const value = (index: number, functionName: string): unknown => {
+    const response = responses[index];
+    if (!response?.[0]) {
+      throw new Error(`sessionKey/keyEpoch Multicall failed ${functionName}`);
+    }
+    return VAULT_INTERFACE.decodeFunctionResult(
+      functionName,
+      response[1]
+    )[0];
+  };
+  return {
+    sessionKey: String(value(0, "sessionKey")).toLowerCase(),
+    keyEpoch: BigInt(value(1, "keyEpoch") as bigint),
+  };
+}
 async function readConsumerKey(consumer: string): Promise<KeyEntry> {
   const k = JSON.stringify([activeVault.toLowerCase(), consumer.toLowerCase()]);
   const cached = keyCache.get(k);
+
   if (cached && Date.now() - cached.at < KEY_CACHE_TTL_MS) return cached;
-  const c = new Contract(activeVault, VAULT_ABI, rpc());
-  const [sk, ep] = await withTimeout(
-    Promise.all([c.sessionKey(consumer), c.keyEpoch(consumer)]),
+  const session = await withTimeout(
+    readVaultConsumerSessionAt(rpc(), activeVault, consumer),
     READ_TIMEOUT_MS,
     "sessionKey/keyEpoch read"
   );
-  const entry: KeyEntry = { sessionKey: String(sk).toLowerCase(), keyEpoch: BigInt(ep), at: Date.now() };
+  const entry: KeyEntry = { ...session, at: Date.now() };
   keyCache.set(k, entry);
   return entry;
 }
