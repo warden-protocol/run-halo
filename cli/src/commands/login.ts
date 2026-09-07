@@ -12,7 +12,7 @@ import {
 } from "../wallet-access/application/session";
 import { FileWalletAccessSessionStore } from "../wallet-access/infrastructure/fileSessionStore";
 import { refreshExpiredPrivySession } from "../wallet-access/application/refresh";
-import { configPath, loadConfig, saveConfig } from "../config";
+import { configPath, DEFAULT_PRIVY_APP_ID, loadConfig, saveConfig } from "../config";
 import {
   assertPrivyWalletMatches,
   forgetPrivyWallet,
@@ -76,7 +76,7 @@ function saveCatalogChange(
 export async function cmdLogin(): Promise<void> {
   const config = loadWalletAccessConfig();
   const resolvedCatalog = resolveWalletCatalog(config);
-  const appId = validatePrivyAppId(process.env.HALO_PRIVY_APP_ID);
+  const appId = validatePrivyAppId(process.env.HALO_PRIVY_APP_ID ?? DEFAULT_PRIVY_APP_ID);
   const store = new FileWalletAccessSessionStore();
   const gateway = new PrivyWalletAccessGateway({ appId });
   let stored = store.readState();

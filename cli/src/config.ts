@@ -286,6 +286,7 @@ export function allConfiguredModels(cfg: HaloConfig): string[] {
 
 export const DEFAULT_RELAY_URL = "https://relay.runhalo.xyz";
 export const DEFAULT_INDEXER_URL = "https://indexer.runhalo.xyz";
+export const DEFAULT_PRIVY_APP_ID = "cms7mb4at00ia0cl4z42pspb6";
 // The protocol facilitator is credentialless for operators and covers gas.
 export const DEFAULT_FACILITATOR_URL = "https://facilitator.runhalo.xyz";
 
