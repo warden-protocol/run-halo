@@ -57,6 +57,7 @@ halo — Halo operator + payer CLI
     --consume-port <n>         local consume endpoint port (default 8799)
 
   halo login                                       start, refresh, or reuse a Privy Wallet Access session
+    HALO_PRIVY_APP_ID          optional public app ID override (default: Halo production)
   halo logout                                      remove the local Privy Wallet Access session
     --forget-wallet [address]  explicitly forget the pinned Privy wallet; enter or supply its complete address
 
