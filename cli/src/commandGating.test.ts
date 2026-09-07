@@ -5,12 +5,15 @@ import { shouldPreRunUpdate, KNOWN_COMMANDS, LONG_RUNNING_COMMANDS } from "./com
 test("shouldPreRunUpdate: known short-lived commands update; long-running and unknown do not", () => {
   assert.equal(shouldPreRunUpdate("service"), true);
   assert.equal(shouldPreRunUpdate("setup"), true);
-  assert.equal(shouldPreRunUpdate("doctor"), true);
+  assert.equal(shouldPreRunUpdate("login"), true);
+  assert.equal(shouldPreRunUpdate("logout"), true);
   assert.equal(shouldPreRunUpdate("pay"), true);
 
   assert.equal(shouldPreRunUpdate("run"), false);
   assert.equal(shouldPreRunUpdate("serve"), false);
   assert.equal(shouldPreRunUpdate("consume"), false);
+  assert.equal(shouldPreRunUpdate("status"), false);
+  assert.equal(shouldPreRunUpdate("doctor"), false);
 
   assert.equal(shouldPreRunUpdate("dokctor"), false);
   assert.equal(shouldPreRunUpdate("frobnicate"), false);

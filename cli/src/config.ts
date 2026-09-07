@@ -1,9 +1,25 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import {
+  chmodSync,
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "fs";
+import { randomBytes } from "node:crypto";
 import { homedir } from "os";
 import path from "path";
 import type { EncryptedSecret } from "./secret";
 import { matchesModel, priceImages } from "@halo/vault-core";
 import { imageEditAdapterFor } from "./providers";
+import {
+  validateWalletCatalogMirror,
+  type WalletCatalogV1,
+} from "./wallet-access/domain/walletCatalog";
 
 export type PricingMode = "margin" | "flat";
 
@@ -32,8 +48,7 @@ export interface ProviderConfig {
   pricing?: PricingConfig;
 }
 
-export interface HaloConfig {
-  version: 1;
+interface HaloConfigFields {
   relayUrl: string;
   indexerUrl: string;
   operator: {
@@ -78,6 +93,17 @@ export interface HaloConfig {
   };
 }
 
+export interface HaloConfigV1 extends HaloConfigFields {
+  version: 1;
+}
+
+export interface HaloConfigV2 extends HaloConfigFields {
+  version: 2;
+  walletCatalog: WalletCatalogV1;
+}
+
+export type HaloConfig = HaloConfigV1 | HaloConfigV2;
+
 const DIR_NAME = ".halo";
 
 export function configDir(): string {
@@ -92,8 +118,7 @@ export function defaultKeystorePath(): string {
   return path.join(configDir(), "keystore.json");
 }
 
-export function loadConfig(): HaloConfig {
-  const p = configPath();
+export function loadConfig(p = configPath()): HaloConfig {
   if (!existsSync(p)) {
     throw new Error(`No config at ${p}. Run: halo setup`);
   }
@@ -101,10 +126,37 @@ export function loadConfig(): HaloConfig {
   return validateConfig(JSON.parse(raw) as HaloConfig);
 }
 
-export function saveConfig(cfg: HaloConfig): void {
+export function saveConfig(cfg: HaloConfig, p = configPath()): void {
   validateConfig(cfg);
-  mkdirSync(configDir(), { recursive: true });
-  writeFileSync(configPath(), JSON.stringify(cfg, null, 2), { mode: 0o600 });
+  const directory = path.dirname(p);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const serialized = `${JSON.stringify(cfg, null, 2)}\n`;
+  const temporary = `${p}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+  let fd: number | null = null;
+  try {
+    fd = openSync(temporary, "wx", 0o600);
+    writeFileSync(fd, serialized, "utf8");
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = null;
+    renameSync(temporary, p);
+    chmodSync(p, 0o600);
+    const directoryFd = openSync(directory, "r");
+    try {
+      fsyncSync(directoryFd);
+    } finally {
+      closeSync(directoryFd);
+    }
+    if (readFileSync(p, "utf8") !== serialized) {
+      throw new Error("config persistence readback did not match the requested state");
+    }
+  } catch (error) {
+    if (fd !== null) closeSync(fd);
+    try {
+      unlinkSync(temporary);
+    } catch {}
+    throw error;
+  }
 }
 
 export function providerServesConfiguredImageModel(
@@ -141,6 +193,12 @@ export function isPositiveImagePriceRepresentable(price: unknown): price is numb
 const VALID_PRICING_MODES: PricingMode[] = ["margin", "flat"];
 
 export function validateConfig(cfg: HaloConfig): HaloConfig {
+  if (cfg.version !== 1 && cfg.version !== 2) {
+    throw new Error(`unrecognized config version "${String((cfg as { version?: unknown }).version)}"`);
+  }
+  if (cfg.version === 2) {
+    validateWalletCatalogMirror(cfg.walletCatalog, cfg.operator);
+  }
   const providers = cfg.providers && cfg.providers.length > 0 ? cfg.providers : [cfg.provider];
   if (!VALID_PRICING_MODES.includes(cfg.pricing.mode)) {
     throw new Error(`unrecognized pricing.mode "${cfg.pricing.mode}"`);

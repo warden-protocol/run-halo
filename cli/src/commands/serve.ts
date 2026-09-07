@@ -22,9 +22,14 @@ import {
   imageEditAdapterFor,
   imageEndpointPathFor,
   wireFormatFor,
-  isTeeProviderSlug,
   teeModelsForProviderAnnouncement,
 } from "../providers";
+import {
+  fetchTeeSignature as fetchOperatorTeeSignature,
+  fetchTeeSignatureForRequest as fetchOperatorTeeSignatureForRequest,
+  shouldFetchTeeProof as shouldFetchOperatorTeeProof,
+  type TeeSignatureOptions,
+} from "../confidential/operator-proof";
 import {
   anthropicHeaders,
   anthropicResponseToChatCompletion,
@@ -156,6 +161,9 @@ import {
   type OperatorVaultReplayState,
 } from "../vaultSseReplay";
 import { restartIntoManagedInstall, startAutoUpdateMonitor } from "../update";
+import { startPrivySessionKeepalive } from "../wallet-access/application/keepalive";
+import { FileWalletAccessSessionStore } from "../wallet-access/infrastructure/fileSessionStore";
+import { PrivyWalletAccessGateway } from "../wallet-access/infrastructure/privy";
 
 interface InferenceRequestMessage {
   type: "inference-request";
@@ -260,7 +268,6 @@ const MODEL_WARM_INTERVAL_MS = 4 * 60_000;
 const VAULT_CAPABILITY_RETRY_MS = 60_000;
 const MAX_MEDIA_STREAM_BYTES = 16 * 1024 * 1024;
 const MAX_IMAGE_UPSTREAM_BODY_BYTES = MAX_MEDIA_STREAM_BYTES;
-const MAX_TEE_SIGNATURE_BODY_BYTES = 256 * 1024;
 export const IMAGE_EDIT_PATH = "/v1/images/edit";
 
 interface UpstreamUsage {
@@ -313,11 +320,7 @@ export function shouldFetchTeeProof(
   providerSlug: string,
   headers: Record<string, string | undefined>
 ): boolean {
-  if (!isTeeProviderSlug(providerSlug)) return false;
-  return (
-    typeof headers["x-client-pub-key"] === "string" ||
-    typeof headers["x-encryption-version"] === "string"
-  );
+  return shouldFetchOperatorTeeProof(providerSlug, headers);
 }
 
 export async function forwardVaultCompletionLimit(
@@ -1067,11 +1070,6 @@ function passthroughResponseHeaders(res: { headers: Headers }): Record<string, s
   return out;
 }
 
-interface TeeSignatureOptions {
-  timeoutMs?: number;
-  maxBodyBytes?: number;
-}
-
 /** Fetch the keyed response proof for client-side signer verification; return base64 or `null`. */
 export async function fetchTeeSignature(
   baseUrl: string,
@@ -1080,26 +1078,7 @@ export async function fetchTeeSignature(
   model: string,
   options: TeeSignatureOptions = {}
 ): Promise<string | null> {
-  if (!apiKey || !chatId) return null;
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), options.timeoutMs ?? 10_000);
-  try {
-    const url =
-      `${baseUrl.replace(/\/+$/, "")}/signature/${encodeURIComponent(chatId)}` +
-      `?model=${encodeURIComponent(model)}&signing_algo=ecdsa`;
-    const res = await fetch(url, { headers: { Authorization: `Bearer ${apiKey}` }, signal: ctrl.signal });
-    if (!res.ok) return null;
-    const text = await readImageUpstreamBody(
-      res,
-      ctrl.signal,
-      options.maxBodyBytes ?? MAX_TEE_SIGNATURE_BODY_BYTES
-    );
-    return Buffer.from(text, "utf-8").toString("base64");
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
+  return fetchOperatorTeeSignature(baseUrl, apiKey, chatId, model, readImageUpstreamBody, options);
 }
 
 export async function fetchTeeSignatureForRequest(params: {
@@ -1111,14 +1090,7 @@ export async function fetchTeeSignatureForRequest(params: {
   headers: Record<string, string | undefined>;
   options?: TeeSignatureOptions;
 }): Promise<string | null> {
-  if (!shouldFetchTeeProof(params.providerSlug, params.headers)) return null;
-  return fetchTeeSignature(
-    params.baseUrl,
-    params.apiKey,
-    params.chatId,
-    params.model,
-    params.options
-  );
+  return fetchOperatorTeeSignatureForRequest({ ...params, readBody: readImageUpstreamBody });
 }
 
 /** Resolve which provider serves a request body's model, plus its plaintext key.
@@ -2625,11 +2597,35 @@ export async function cmdServe(): Promise<void> {
   let signalShutdownRequested = false;
   let shutdownPromise: Promise<void> | null = null;
   const activeServeRequests = new ActiveServeRequests();
+  const stopPrivySessionKeepalive = startPrivySessionKeepalive({
+    store: new FileWalletAccessSessionStore(),
+    gatewayForAppId: (appId) => new PrivyWalletAccessGateway({ appId }),
+    onAvailabilityChange: (availability) => {
+      if (availability.kind === "degraded") {
+        console.warn(
+          "  ⚠ Privy unavailable; keystore serving continues and keepalive will retry"
+        );
+      } else {
+        console.log("  ✓ Privy session keepalive recovered");
+      }
+    },
+    onReauthenticationRequired: () => {
+      console.warn(
+        "  ⚠ Privy session keepalive requires halo login; keystore serving continues"
+      );
+    },
+    onFailure: () => {
+      console.warn(
+        "  ⚠ Privy session keepalive stopped unexpectedly; keystore serving continues"
+      );
+    },
+  });
   let stopUpdateMonitor = (): void => {};
   const gracefulShutdown = (): Promise<void> => {
     if (shutdownPromise) return shutdownPromise;
     shuttingDown = true;
     stopUpdateMonitor();
+    stopPrivySessionKeepalive();
     console.log("\n  shutting down");
     shutdownPromise = drainServeForShutdown({
       activeRequests: activeServeRequests,

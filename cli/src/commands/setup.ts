@@ -10,11 +10,13 @@ import {
   DEFAULT_RELAY_URL,
   defaultKeystorePath,
   HaloConfig,
+  HaloConfigV1,
   ProviderConfig,
   configProviders,
   loadConfig,
   saveConfig,
 } from "../config";
+import { preserveConfiguredKeystore } from "../wallet-access/application/catalog";
 import { generateAndEncrypt, importAndEncrypt, loadWallet, writeKeystore } from "../wallet";
 import { detectModels, imageEditAdapterFor, PROVIDER_PRESETS } from "../providers";
 import { providerSupportsMargin } from "../pricing";
@@ -790,7 +792,7 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
     }
   }
 
-  const cfg: HaloConfig = {
+  const nextV1: HaloConfigV1 = {
     version: 1,
     relayUrl,
     indexerUrl,
@@ -825,6 +827,7 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
     },
   };
 
+  const cfg = preserveConfiguredKeystore(existingConfig, nextV1);
   saveConfig(cfg);
 
   console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");

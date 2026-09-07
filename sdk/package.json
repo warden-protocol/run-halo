@@ -1,8 +1,8 @@
 {
   "name": "halo-sdk",
   "version": "0.0.1",
+  "private": true,
   "description": "HaloVault client for Halo",
-  "license": "Apache-2.0",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {
@@ -13,18 +13,11 @@
     },
     "./package.json": "./package.json"
   },
-  "files": [
-    "dist"
-  ],
-  "publishConfig": {
-    "access": "public"
-  },
   "scripts": {
     "build": "tsc",
-    "typecheck": "tsc --noEmit",
-    "test": "npm run build && node --test test/*.test.js",
     "prepare": "test -d dist || npm run build",
-    "prepublishOnly": "npm run build"
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test test/*.test.js"
   },
   "dependencies": {
     "@halo/vault-core": "file:../vault-core",

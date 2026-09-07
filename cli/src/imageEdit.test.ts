@@ -24,7 +24,7 @@ import {
 } from "./commands/serve";
 import { cmdSetup } from "./commands/setup";
 import { parseFlags } from "./flags";
-import { configProviders, loadConfig, validateConfig, type HaloConfig } from "./config";
+import { configProviders, loadConfig, validateConfig, type HaloConfigV1 } from "./config";
 import {
   encryptBytes,
   encryptRequest,
@@ -55,8 +55,8 @@ function pngWithText(text: string): Buffer {
   ]);
 }
 
-function config(overrides: Partial<HaloConfig> = {}): HaloConfig {
-  const cfg: HaloConfig = {
+function config(overrides: Partial<HaloConfigV1> = {}): HaloConfigV1 {
+  const cfg: HaloConfigV1 = {
     version: 1,
     relayUrl: "http://relay.test",
     indexerUrl: "http://indexer.test",

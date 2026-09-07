@@ -2,6 +2,11 @@ import { existsSync, readFileSync, statSync } from "fs";
 import path from "path";
 import { configDir, configPath, defaultKeystorePath, loadConfig } from "../config";
 import { readUpdateDiagnostics, UpdateDiagnostics } from "../update";
+import {
+  readWalletAccessDiagnostics,
+  type WalletAccessDiagnostics,
+} from "../wallet-access/application/diagnostics";
+import { FileWalletAccessSessionStore } from "../wallet-access/infrastructure/fileSessionStore";
 
 export interface DoctorOptions {
   json?: boolean;
@@ -40,6 +45,7 @@ interface DoctorReport {
     source: "config" | "keystore" | null;
     noPassphrase: boolean;
   };
+  walletAccess: WalletAccessDiagnostics;
   provider: {
     slug: string | null;
     baseUrl: string | null;
@@ -52,7 +58,6 @@ interface DoctorReport {
     /** True when the process named in serve.pid is alive. */
     running: boolean;
     logPath: string | null;
-    recentLogLines: string[];
   };
   endpoints: EndpointProbe[];
   network: {
@@ -137,7 +142,6 @@ interface ServeStatus {
   pid: number | null;
   running: boolean;
   logPath: string | null;
-  recentLogLines: string[];
 }
 
 function readServeStatus(): ServeStatus {
@@ -149,7 +153,6 @@ function readServeStatus(): ServeStatus {
     pid: null,
     running: false,
     logPath: existsSync(logPath) ? logPath : null,
-    recentLogLines: [],
   };
 
   if (out.pidFilePresent) {
@@ -173,29 +176,6 @@ function readServeStatus(): ServeStatus {
       }
     } catch {
       out.pidFileStale = true;
-    }
-  }
-
-  if (out.logPath) {
-    try {
-      // Tail ~last 10 KB of the log and return the final 8 non-empty lines.
-      // Bounded so doctor stays cheap even when serve.log grows.
-      const sz = statSync(out.logPath).size;
-      const TAIL_BYTES = 10 * 1024;
-      const start = Math.max(0, sz - TAIL_BYTES);
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const fs = require("fs");
-      const fd = fs.openSync(out.logPath, "r");
-      const buf = Buffer.alloc(sz - start);
-      fs.readSync(fd, buf, 0, buf.length, start);
-      fs.closeSync(fd);
-      const text = buf.toString("utf-8");
-      out.recentLogLines = text
-        .split("\n")
-        .filter((l) => l.trim().length > 0)
-        .slice(-8);
-    } catch {
-      /* unreadable log — leave recentLogLines empty */
     }
   }
 
@@ -228,11 +208,12 @@ async function buildReport(): Promise<DoctorReport> {
   })();
 
   let cfg: ReturnType<typeof loadConfig> | null = null;
+  let configState: "absent" | "invalid" = "absent";
   if (configPresent) {
     try {
       cfg = loadConfig();
     } catch {
-      cfg = null;
+      configState = "invalid";
     }
   }
 
@@ -278,6 +259,12 @@ async function buildReport(): Promise<DoctorReport> {
       source: walletSource,
       noPassphrase: cfg?.operator.noPassphrase === true,
     },
+    walletAccess: readWalletAccessDiagnostics(
+      cfg === null
+        ? { state: configState }
+        : { state: "valid", config: cfg },
+      new FileWalletAccessSessionStore()
+    ),
     provider: {
       slug: cfg?.provider.slug ?? null,
       baseUrl: cfg?.provider.baseUrl ?? null,
@@ -349,6 +336,15 @@ function printText(r: DoctorReport): void {
   }
   console.log();
 
+  console.log(`Wallet Access`);
+  console.log(`  backend: ${r.walletAccess.backend}`);
+  console.log(`  bound address: ${r.walletAccess.boundAddress ?? "not selected"}`);
+  console.log(`  session state: ${r.walletAccess.sessionState}`);
+  console.log(`  session freshness: ${r.walletAccess.sessionFreshness}`);
+  console.log(`  last successful refresh: ${r.walletAccess.lastSuccessfulRefreshAt ?? "never"}`);
+  console.log(`  remediation: ${r.walletAccess.remediation}`);
+  console.log();
+
   console.log(`Provider`);
   if (r.provider.slug) {
     console.log(`  ${mark(true)} ${r.provider.slug} → ${r.provider.baseUrl}`);
@@ -368,12 +364,6 @@ function printText(r: DoctorReport): void {
   }
   if (r.serve.logPath) {
     console.log(`  log: ${r.serve.logPath}`);
-    if (r.serve.recentLogLines.length > 0) {
-      console.log(`  recent log (last ${r.serve.recentLogLines.length} line(s)):`);
-      for (const line of r.serve.recentLogLines) {
-        console.log(`    │ ${line}`);
-      }
-    }
   } else {
     console.log(`  log: (no serve.log yet — serve has never been started, or pre-upgrade install)`);
   }
@@ -412,7 +402,7 @@ function printText(r: DoctorReport): void {
     hints.push("Relay unreachable — operator can't serve until it's back.");
   } else if (r.serve.pidFileStale) {
     hints.push(
-      "Previous serve process crashed (stale pid file). Check `serve.log` recent lines above for the cause, then restart with `halo serve`."
+      "Previous serve process crashed (stale pid file). Inspect `serve.log`, then restart with `halo serve`."
     );
   } else if (r.provider.slug && r.wallet.address && !r.serve.running) {
     hints.push("Looks healthy. Run `halo serve` to start earning.");

@@ -7,6 +7,7 @@ import {
   getAddress,
   isAddress,
   parseUnits,
+  verifyTypedData,
 } from "ethers";
 import { readFileSync } from "node:fs";
 import {
@@ -229,8 +230,9 @@ function nowSec(): number {
   return Math.floor(Date.now() / 1000);
 }
 
-interface PersistedPendingRedeem {
+export interface PersistedPendingRedeem {
   key: string;
+  version?: 1;
   vaultAddress?: string;
   chainId?: number;
   consumer?: string;
@@ -238,7 +240,67 @@ interface PersistedPendingRedeem {
   cumulative: string;
   signature: string;
   cycle: string;
+  keyEpoch?: string;
   terminalReason?: VaultRedeemTerminalReason;
+}
+
+export interface PendingRedeemRecoveryContext {
+  keyEpoch: bigint;
+  sessionAddress: string;
+  strict?: boolean;
+}
+
+const CANONICAL_UINT = /^(0|[1-9]\d{0,77})$/;
+const MAX_UINT64 = (1n << 64n) - 1n;
+
+function parsePersistedKeyEpoch(value: unknown): bigint {
+  if (
+    typeof value !== "string" ||
+    !CANONICAL_UINT.test(value) ||
+    BigInt(value) > MaxUint256
+  ) {
+    throw new Error("pending vault-redeem key epoch is invalid");
+  }
+  return BigInt(value);
+}
+
+function hasOnlyPendingKeys(entry: Record<string, unknown>): boolean {
+  const allowed = new Set([
+    "chainId",
+    "consumer",
+    "cumulative",
+    "cycle",
+    "key",
+    "keyEpoch",
+    "operator",
+    "signature",
+    "terminalReason",
+    "vaultAddress",
+    "version",
+  ]);
+  return Object.keys(entry).every((key) => allowed.has(key));
+}
+
+function hasVersionedPendingKeys(entry: Record<string, unknown>): boolean {
+  const expected = [
+    "chainId",
+    "consumer",
+    "cumulative",
+    "cycle",
+    "key",
+    "keyEpoch",
+    "operator",
+    "signature",
+    "vaultAddress",
+    "version",
+  ];
+  if (entry.terminalReason !== undefined) expected.push("terminalReason");
+  const actual = Object.keys(entry).sort();
+  const sortedExpected = expected.sort();
+  return (
+    actual.length === sortedExpected.length &&
+    actual.every((key, index) => key === sortedExpected[index])
+  );
 }
 
 interface PendingRedeem {
@@ -247,6 +309,7 @@ interface PendingRedeem {
   cumulative: bigint;
   signature: string;
   cycle: bigint;
+  keyEpoch: bigint;
   inFlight: boolean;
   terminalError?: VaultRedeemTerminalError;
 }
@@ -260,7 +323,10 @@ function samePendingRedeemReceipt(
     left.consumer === right.consumer &&
     left.cumulative === right.cumulative &&
     left.signature === right.signature &&
-    left.cycle === right.cycle
+    left.cycle === right.cycle &&
+    (left.keyEpoch === undefined ||
+      right.keyEpoch === undefined ||
+      left.keyEpoch === right.keyEpoch)
   );
 }
 
@@ -1260,6 +1326,7 @@ export class HaloVaultClient {
           cumulative,
           signature,
           cycle: ops.cycle,
+          keyEpoch,
           inFlight: false,
           terminalError,
         };
@@ -1383,6 +1450,7 @@ export class HaloVaultClient {
         cumulative,
         signature,
         cycle: ops.cycle,
+        keyEpoch,
         inFlight: false,
         terminalError,
       };
@@ -1599,6 +1667,7 @@ export class HaloVaultClient {
         ...this.preservedForeignPending,
         ...[...this.pendingRedeems.entries()].map(([key, v]) => ({
           key,
+          version: 1 as const,
           vaultAddress: this.cfg.vaultAddress,
           chainId: this.cfg.chainId,
           consumer: v.consumer,
@@ -1606,6 +1675,7 @@ export class HaloVaultClient {
           cumulative: v.cumulative.toString(),
           signature: v.signature,
           cycle: v.cycle.toString(),
+          keyEpoch: v.keyEpoch.toString(),
           terminalReason: v.terminalError?.reason,
         })),
       ];
@@ -1618,17 +1688,37 @@ export class HaloVaultClient {
   }
 
   /** Reload persisted pending receipts and resume settlement. */
-  resumePendingRedeems(): Promise<void> {
+  resumePendingRedeems(context?: PendingRedeemRecoveryContext): Promise<void> {
     if (this.redeemEvidenceClosing || this.redeemEvidenceClosed) {
       return Promise.reject(new Error("vault redeem evidence ownership is closing or closed"));
     }
     const f = this.cfg.pendingStorePath;
     if (!f) return Promise.resolve();
-    if (!this.loadDeadLetters()) return Promise.resolve();
+    if (context) {
+      try {
+        if (
+          context.keyEpoch < 0n ||
+          context.keyEpoch > MaxUint256 ||
+          !isAddress(context.sessionAddress)
+        ) {
+          throw new Error("invalid pending vault-redeem recovery context");
+        }
+      } catch {
+        return Promise.reject(new Error("invalid pending vault-redeem recovery context"));
+      }
+    }
+    if (!this.loadDeadLetters()) {
+      return context?.strict
+        ? Promise.reject(new Error("vault redeem dead-letter state is unavailable"))
+        : Promise.resolve();
+    }
     let raw: string;
     try {
       raw = readFileSync(f, "utf-8");
-    } catch {
+    } catch (error) {
+      if (context?.strict && (error as NodeJS.ErrnoException).code !== "ENOENT") {
+        return Promise.reject(new Error("pending vault-redeem file could not be read"));
+      }
       return Promise.resolve();
     }
     let parsed: unknown;
@@ -1637,11 +1727,15 @@ export class HaloVaultClient {
     } catch (e) {
       // Surface corruption because the file may represent unpaid work.
       this.cfg.log(`pending vault-redeem file unreadable, cannot resume (${errStr(e)}): ${f}`);
-      return Promise.resolve();
+      return context?.strict
+        ? Promise.reject(new Error("pending vault-redeem file is corrupt"))
+        : Promise.resolve();
     }
     if (!Array.isArray(parsed)) {
       this.cfg.log(`pending vault-redeem file has an invalid shape, cannot resume: ${f}`);
-      return Promise.resolve();
+      return context?.strict
+        ? Promise.reject(new Error("pending vault-redeem file has an invalid shape"))
+        : Promise.resolve();
     }
     const arr = parsed as PersistedPendingRedeem[];
     if (
@@ -1653,11 +1747,16 @@ export class HaloVaultClient {
       )
     ) {
       this.cfg.log(`pending vault-redeem file has an invalid terminal fence, cannot resume: ${f}`);
-      return Promise.resolve();
+      return context?.strict
+        ? Promise.reject(new Error("pending vault-redeem terminal fence is invalid"))
+        : Promise.resolve();
     }
     this.redeemQueue = this.redeemQueue.then(async () => {
       if (arr.length === 0) return;
       const consumer = getAddress(await this.consumer()).toLowerCase();
+      const expectedSession = context
+        ? getAddress(context.sessionAddress).toLowerCase()
+        : null;
       const nextPendingRedeems = new Map(this.pendingRedeems);
       const nextForeignPending: PersistedPendingRedeem[] = [];
       const quarantinedKeys = new Set<string>();
@@ -1668,27 +1767,102 @@ export class HaloVaultClient {
       let reconciledTerminalReasons = 0;
       for (const e of arr) {
         try {
+          if (
+            !e ||
+            typeof e !== "object" ||
+            !hasOnlyPendingKeys(e as unknown as Record<string, unknown>)
+          ) {
+            throw new Error("pending vault-redeem entry has an invalid shape");
+          }
+          if (e.version !== undefined && e.version !== 1) {
+            throw new Error("pending vault-redeem entry uses an unsupported version");
+          }
+          if (
+            e.version === 1 &&
+            !hasVersionedPendingKeys(e as unknown as Record<string, unknown>)
+          ) {
+            throw new Error("versioned pending vault-redeem entry has an invalid shape");
+          }
+          const legacy = e.version === undefined;
+          if (legacy && e.keyEpoch !== undefined) {
+            throw new Error("legacy pending vault-redeem entry has an invalid key epoch");
+          }
           const persistedVault =
-            e.vaultAddress === undefined ? VAULT_ADDRESS : getAddress(e.vaultAddress);
-          const persistedChain = e.chainId ?? 8453;
+            e.vaultAddress === undefined
+              ? context
+                ? this.cfg.vaultAddress
+                : VAULT_ADDRESS
+              : getAddress(e.vaultAddress);
+          const persistedChain = e.chainId ?? (context ? this.cfg.chainId : 8453);
           const persistedConsumer =
-            e.consumer === undefined ? null : getAddress(e.consumer).toLowerCase();
+            e.consumer === undefined
+              ? context
+                ? consumer
+                : null
+              : getAddress(e.consumer).toLowerCase();
           if (
             persistedVault !== this.cfg.vaultAddress ||
             persistedChain !== this.cfg.chainId ||
             persistedConsumer !== consumer
           ) {
+            if (context?.strict) {
+              throw new Error("pending vault-redeem entry belongs to another scope");
+            }
             skippedForeignIdentity++;
             nextForeignPending.push(e);
             continue;
           }
           const operator = getAddress(e.operator).toLowerCase();
+          if (
+            context?.strict &&
+            (!CANONICAL_UINT.test(e.cumulative) || !CANONICAL_UINT.test(e.cycle))
+          ) {
+            throw new Error("pending vault-redeem amount or cycle is noncanonical");
+          }
           const cumulative = BigInt(e.cumulative);
           const cycle = BigInt(e.cycle);
-          if (cumulative <= 0n || cycle <= 0n || typeof e.signature !== "string" || !e.signature) {
-            continue;
+          if (
+            cumulative <= 0n ||
+            cumulative > MaxUint256 ||
+            cycle <= 0n ||
+            cycle > MAX_UINT64 ||
+            typeof e.signature !== "string" ||
+            !e.signature
+          ) {
+            throw new Error("pending vault-redeem entry is invalid");
+          }
+          let keyEpoch: bigint;
+          if (!legacy) {
+            keyEpoch = parsePersistedKeyEpoch(e.keyEpoch);
+          } else {
+            keyEpoch = context?.keyEpoch ?? 0n;
+          }
+          if (
+            context &&
+            e.terminalReason === undefined &&
+            keyEpoch !== context.keyEpoch
+          ) {
+            throw new Error("pending vault-redeem entry belongs to another key epoch");
+          }
+          if (context && e.terminalReason === undefined) {
+            const recovered = getAddress(
+              verifyTypedData(
+                vaultDomain(this.cfg.chainId, this.cfg.vaultAddress),
+                RECEIPT_TYPES,
+                { consumer, operator, cumulative, keyEpoch, cycle },
+                e.signature
+              )
+            ).toLowerCase();
+            if (recovered !== expectedSession) {
+              throw new Error(
+                "pending vault-redeem signature does not match the active session key"
+              );
+            }
           }
           const key = await this.cycleKey(operator, cycle, consumer);
+          if (!legacy && e.key !== key) {
+            throw new Error("pending vault-redeem entry key does not match its scope");
+          }
           const terminalError = e.terminalReason
             ? new VaultRedeemTerminalError(e.terminalReason)
             : undefined;
@@ -1698,6 +1872,7 @@ export class HaloVaultClient {
             cumulative,
             signature: e.signature,
             cycle,
+            keyEpoch,
             inFlight: false,
             terminalError,
           };
@@ -1741,7 +1916,9 @@ export class HaloVaultClient {
           if (cumulative > priorCumulative) this.cumulative.set(key, cumulative);
           const priorCeiling = this.ceilingByKey.get(key) ?? 0n;
           if (cumulative > priorCeiling) this.ceilingByKey.set(key, cumulative);
-        } catch {}
+        } catch (error) {
+          if (context?.strict) throw error;
+        }
       }
       if (
         promotedDeadLetterHighWater > 0 ||
@@ -1793,7 +1970,10 @@ export class HaloVaultClient {
           `reconciled ${reconciledTerminalReasons} active terminal receipt reason(s) into the dead-letter store`
         );
       }
-      if (!this.persistPending()) {
+      const pendingPersisted = context?.strict
+        ? this.persistPending(true)
+        : this.persistPending();
+      if (!pendingPersisted) {
         this.cfg.log(
           `pending vault-redeem cleanup could not be persisted; in-memory reconciliation remains fenced from duplicate replay`
         );
@@ -1932,6 +2112,7 @@ export interface PayInferenceOptions {
   /** OpenAI-compatible chat-completions body. `model` is required. */
   body: Record<string, unknown>;
   chainId?: number;
+  /** Routing constraint only; it does not establish an encrypted or attested client channel. */
   teeOnly?: boolean;
   maxPriceUsdPerMtok?: number;
   reserveTtlSec?: number;

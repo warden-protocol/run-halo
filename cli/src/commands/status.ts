@@ -7,9 +7,31 @@ import {
   imagePriceForModel,
 } from "../config";
 import { readEventOutboxStatus } from "../eventOutbox";
+import { FileWalletAccessSessionStore } from "../wallet-access/infrastructure/fileSessionStore";
+import { resolveWalletCatalog } from "../wallet-access/application/catalog";
+import { readWalletAccessDiagnostics } from "../wallet-access/application/diagnostics";
 
 export async function cmdStatus(): Promise<void> {
   const cfg = loadConfig();
+  const resolvedCatalog = resolveWalletCatalog(cfg);
+  const walletAccess = readWalletAccessDiagnostics(
+    { state: "valid", config: cfg },
+    new FileWalletAccessSessionStore()
+  );
+  console.log(`\n  Wallet Access`);
+  console.log(`  ─────────────`);
+  console.log(`  Backend:    ${walletAccess.backend}`);
+  console.log(`  Bound:      ${walletAccess.boundAddress ?? "not selected"}`);
+  console.log(
+    `  Catalog:    ${resolvedCatalog.explicit ? `v1 · generation ${resolvedCatalog.catalog.generation}` : "implicit config-v1 · migration pending"}`
+  );
+  console.log(`  Keystore:   ${resolvedCatalog.catalog.keystoreIdentity?.address ?? "not retained"}`);
+  console.log(`  Privy:      ${resolvedCatalog.catalog.privyIdentity?.address ?? "not retained"}`);
+  console.log(`  Session:    ${walletAccess.sessionState}`);
+  console.log(`  Freshness:  ${walletAccess.sessionFreshness}`);
+  console.log(`  Refreshed:  ${walletAccess.lastSuccessfulRefreshAt ?? "never"}`);
+  console.log(`  Remediate:  ${walletAccess.remediation}`);
+  console.log(`  Usage:      consume/serve/setup still use keystore`);
   const providers = configProviders(cfg);
   const allModels = allConfiguredModels(cfg);
 

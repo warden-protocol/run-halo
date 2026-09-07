@@ -17,7 +17,7 @@ import {
   requestAcceptsMedia,
   servedImageCountFromResponse,
 } from "./commands/serve";
-import { imagePriceForModel, validateConfig, type HaloConfig } from "./config";
+import { imagePriceForModel, validateConfig, type HaloConfigV1 } from "./config";
 import { priceRequest } from "./pricing";
 import { cmdSetup } from "./commands/setup";
 import {
@@ -34,7 +34,7 @@ import {
   unpackMediaPlaintext,
 } from "./mediaChunks";
 
-function baseConfig(overrides: Partial<HaloConfig> = {}): HaloConfig {
+function baseConfig(overrides: Partial<HaloConfigV1> = {}): HaloConfigV1 {
   // Mirrors the shape `halo setup` actually writes for a single-provider
   // operator: the per-image overlay (`usdcPerImage`) lives on the top-level
   // `pricing` block alongside the chat mode, and `imageModels` on the
@@ -42,7 +42,7 @@ function baseConfig(overrides: Partial<HaloConfig> = {}): HaloConfig {
   // shape, a different case, covered separately below). `slug: "custom"`
   // keeps margin-mode tests network-free (no resolver registered for it, so
   // `priceRequest` falls back to `fallbackPerRequestUsdc` synchronously).
-  const cfg: HaloConfig = {
+  const cfg: HaloConfigV1 = {
     version: 1,
     relayUrl: "http://relay.test",
     indexerUrl: "http://indexer.test",
