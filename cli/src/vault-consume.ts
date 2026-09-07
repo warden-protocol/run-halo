@@ -1,4 +1,4 @@
-import { Wallet, type HDNodeWallet } from "ethers";
+import { Wallet, type HDNodeWallet, type Signer, type VoidSigner } from "ethers";
 import {
   HaloVaultClient,
   type VaultConfig as SdkVaultConfig,
@@ -33,7 +33,7 @@ export {
 } from "@halo/vault-core";
 export type { OpsState, VaultState } from "@halo/vault-core";
 
-type SignerWallet = Wallet | HDNodeWallet;
+type SignerWallet = Wallet | HDNodeWallet | VoidSigner;
 
 export interface VaultConfig
   extends Omit<SdkVaultConfig, "log" | "reserveLiquiditySlots"> {
@@ -46,7 +46,7 @@ const reserveLiquiditySlots = (() => {
 })();
 
 export class VaultConsumeClient extends HaloVaultClient {
-  constructor(wallet: SignerWallet, cfg: VaultConfig, sessionSigner?: SignerWallet) {
+  constructor(wallet: Signer, cfg: VaultConfig, sessionSigner?: Signer) {
     super(
       wallet,
       {

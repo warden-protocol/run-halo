@@ -7,10 +7,12 @@ import { cmdStatus } from "./commands/status";
 import { cmdDoctor } from "./commands/doctor";
 import { cmdService } from "./commands/service";
 import { cmdVault } from "./commands/vault";
+import { cmdLogin, cmdLogout } from "./commands/login";
 import { HALO_VERSION } from "./version";
 import { checkAndApplyUpdate, restartIntoManagedInstall } from "./update";
 import { shouldPreRunUpdate } from "./commandGating";
 import { parseFlags } from "./flags";
+import { WalletAccessError } from "./wallet-access/domain/walletAccess";
 
 // Fail before dispatch because unsupported Node versions can corrupt setup state mid-command.
 const NODE_MAJOR = parseInt(process.versions.node.split(".")[0], 10);
@@ -54,23 +56,27 @@ halo — Halo operator + payer CLI
     --consume-max-usdc <n>     per-request spend ceiling in USD (the consumer cost guard)
     --consume-port <n>         local consume endpoint port (default 8799)
 
+  halo login                                       start, refresh, or reuse a Privy Wallet Access session
+  halo logout                                      remove the local Privy Wallet Access session
+    --forget-wallet [address]  explicitly forget the pinned Privy wallet; enter or supply its complete address
+
   halo run                                         connect to relay, start earning
   halo consume [flags]                             run a vault-backed local OpenAI-compatible endpoint
     --port <n>                 port to listen on (default 8799)
     --host <addr>              bind address (default 127.0.0.1)
-    --detach                   self-daemonize: start the server in its own session (survives the launching agent/gateway restarting) and return. Idempotent — no-ops if one's already serving. Needs an unattended keystore or HALO_PASSPHRASE.
+    --detach                   self-daemonize: start the server in its own session (survives the launching agent/gateway restarting) and return. Idempotent — no-ops if one's already serving. Keystore mode needs an unattended keystore or HALO_PASSPHRASE.
     --api-key <secret>         require this bearer token on /v1/* requests
     --max-usdc <n>             per-request spend ceiling in USD (default 0.10)
-    --keystore <path>          wallet keystore to pay from (default: operator keystore)
+    --keystore <path>          wallet keystore override (keystore backend only)
     --confidential             require TEE routing for chat; image edits fail closed because no TEE edit adapter exists
     --tee-base-url <url>       override TEE attestation base URL (default: configured relay /v1)
     --no-attestation-verify    DEBUG: skip the DCAP hardware attestation check (signature-only); not recommended
     --no-e2e                   disable optional operator E2E for chat completions (sends that prompt to the relay in plaintext); image routes still require encrypted media
     --budget-usdc <n>          cumulative spend cap (USD) for this run — bounds an agent's total spend across many requests (0/unset = uncapped). Raise at runtime: POST /v1/budget {"limitUsd": N}
     --budget-warn-pct <0-1>    warn (X-Halo-Budget-Warning header) at this fraction of the budget (default 0.8)
-    --vault-deposit <usd>      auto-managed: top the vault up to this from the wallet's USDC on startup (needs a little ETH for the deposit tx)
+    --vault-deposit <usd>      top up from wallet USDC; selected Privy wallets use direct user-funded Base transactions
     --vault-reserve-multiple <n>  reserve this many requests' worth per operator (default 5); lower it when fanning out across many operators so reservations don't lock the whole deposit (#367)
-    --session-key <wallet|browser>  vault session-key scheme (default wallet): "wallet" signs receipts with this wallet; "browser" derives the SAME session key the Halo web app uses, so one wallet works on both surfaces (#426)
+    --session-key <wallet|browser>  keystore session-key scheme (default wallet); Privy always uses the deterministic browser-compatible key
     --force                    force unrelated supported behavior; cannot bypass vault identity checks
   halo vault [--session-key <wallet|browser>] <status|deposit <usd>|withdraw>   manage the HaloVault balance for consume (settle-actual billing)
   halo link                                        pair with a dashboard wallet
@@ -131,6 +137,18 @@ async function main(): Promise<void> {
   }
 
   switch (cmd) {
+    case "login":
+      return cmdLogin();
+    case "logout":
+      return cmdLogout({
+        forgetWallet:
+          flags["forget-wallet"] === true ||
+          typeof flags["forget-wallet"] === "string",
+        confirmedAddress:
+          typeof flags["forget-wallet"] === "string"
+            ? flags["forget-wallet"]
+            : undefined,
+      });
     case "setup":
       return cmdSetup({
         provider: typeof flags.provider === "string" ? flags.provider : undefined,
@@ -248,5 +266,8 @@ async function main(): Promise<void> {
 
 main().catch((err) => {
   console.error("Fatal:", err instanceof Error ? err.message : err);
+  if (err instanceof WalletAccessError) {
+    console.error("Wallet Access incident:", JSON.stringify(err.incident));
+  }
   process.exit(1);
 });

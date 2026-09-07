@@ -3,8 +3,10 @@ import prompts from "prompts";
 import { spawn } from "node:child_process";
 import { openSync } from "node:fs";
 import path from "node:path";
+import { VoidSigner } from "ethers";
 import { loadConfig, configDir, BASE_NETWORK, BASE_CHAIN_ID } from "../config";
 import { loadWallet } from "../wallet";
+import { DirectVaultFundingClient } from "halo-sdk";
 import {
   generateEphemeralKeypair,
   encryptRequest,
@@ -77,6 +79,25 @@ import { setCliVersionHeader } from "../versionHeader";
 import { restartIntoManagedInstall, startAutoUpdateMonitor } from "../update";
 import { relayCliVersion } from "../relayVersion";
 import { resolveVaultAddress } from "../vault-address";
+import { resolveWalletCatalog } from "../wallet-access/application/catalog";
+import {
+  readPrivyConsumeVaultPreflight,
+  resolvePrivyConsumerAuthority,
+  resolvePrivySponsoredTransactionAuthorization,
+  resolvePrivyTransactionAuthorization,
+} from "../wallet-access/application/consumerAuthority";
+import { fundPrivyVaultDirect } from "../wallet-access/application/directVaultFunding";
+import { routePrivyVaultFunding } from "../wallet-access/application/sponsoredVaultFunding";
+import { WalletAccessError } from "../wallet-access/domain/walletAccess";
+import { PrivyWalletAccessGateway } from "../wallet-access/infrastructure/privy";
+import {
+  FileConsumeSessionKeyStore,
+  consumeSessionKeyPath,
+  type ConsumeSessionKeyScope,
+} from "../wallet-access/infrastructure/fileConsumeSessionKeyStore";
+import { FileWalletAccessSessionStore } from "../wallet-access/infrastructure/fileSessionStore";
+import { FileDirectVaultFundingStore } from "../wallet-access/infrastructure/fileDirectVaultFundingStore";
+import { FileSponsoredVaultFundingStore } from "../wallet-access/infrastructure/fileSponsoredVaultFundingStore";
 import {
   buildCliVaultSseReplayRequestBody,
   cliOperatorSupportsVaultSseReplayModel,
@@ -131,6 +152,18 @@ const MAX_BODY_BYTES = 5 * 1024 * 1024;
 
 export function resolveTeeBaseUrl(relayUrl: string, override?: string): string {
   return (override ?? `${relayUrl.replace(/\/+$/, "")}/v1`).replace(/\/+$/, "");
+}
+
+export function directVaultFundingTargetBase(value: number | undefined): bigint | null {
+  if (value === undefined || value === 0) return null;
+  const scaled = Math.round(value * 1_000_000);
+  if (!Number.isFinite(value) || value < 0 || !Number.isSafeInteger(scaled) || scaled <= 0) {
+    throw new WalletAccessError(
+      "privy_direct_funding_insufficient",
+      "Privy --vault-deposit must be zero or a positive USDC amount representable in base units. No transaction was sent."
+    );
+  }
+  return BigInt(scaled);
 }
 
 interface VaultOperatorPin {
@@ -1236,7 +1269,7 @@ async function probeConsumeHealth(
 
 /** Re-exec detached with file logs; no-op when a consume server already owns the port. */
 async function runDetached(
-  cfg: { operator: { noPassphrase?: boolean } },
+  needsKeystorePassphrase: boolean,
   port: number,
   host: string
 ): Promise<void> {
@@ -1252,7 +1285,7 @@ async function runDetached(
     process.exit(1);
   }
   // A detached server can't be prompted for a passphrase.
-  if (!cfg.operator.noPassphrase && process.env.HALO_PASSPHRASE == null) {
+  if (needsKeystorePassphrase && process.env.HALO_PASSPHRASE == null) {
     console.error(
       `  ✗ --detach needs an unattended keystore: create one with \`halo setup --no-wallet-passphrase\`,\n` +
         `    or export HALO_PASSPHRASE before launching (a background process can't be prompted).`
@@ -1722,6 +1755,7 @@ export async function cmdConsume(args: Args): Promise<void> {
   installProxyFromEnv();
   relayCliVersion();
   const cfg = loadConfig();
+  const walletCatalog = resolveWalletCatalog(cfg).catalog;
   // Flags override the persisted consume profile (set by `halo setup`), which
   // overrides the built-in defaults.
   // Default 8799 — deliberately NOT the indexer's 8789 (a frequent local clash).
@@ -1730,10 +1764,17 @@ export async function cmdConsume(args: Args): Promise<void> {
 
   // Detached mode survives gateway process-group termination and is idempotent per port.
   if (args.detach) {
-    await runDetached(cfg, port, host);
+    await runDetached(
+      walletCatalog.selector === "keystore" && !cfg.operator.noPassphrase,
+      port,
+      host
+    );
     return;
   }
-  const keystorePath = args.keystore ?? cfg.operator.keystorePath;
+  const privyVaultTarget =
+    walletCatalog.selector === "privy"
+      ? directVaultFundingTargetBase(args.vaultDeposit)
+      : undefined;
   // USD → USDC base units (6 decimals). Default $0.10.
   const maxAmountBase = BigInt(
     Math.round((args.maxUsdc ?? cfg.consume?.maxUsdc ?? 0.1) * 1_000_000)
@@ -1776,37 +1817,102 @@ export async function cmdConsume(args: Args): Promise<void> {
   // prompt to the enclave.
   const confidential = args.confidential === true;
 
-  // Passphrase resolution, mirroring `serve`: unattended (empty) when the
-  // keystore was created with --no-wallet-passphrase, else HALO_PASSPHRASE env
-  // (for headless/daemon launch), else an interactive prompt.
-  let passphrase: string;
-  if (cfg.operator.noPassphrase) {
-    passphrase = "";
-  } else if (typeof process.env.HALO_PASSPHRASE === "string") {
-    passphrase = process.env.HALO_PASSPHRASE;
-  } else {
-    const r = await prompts({ type: "password", name: "passphrase", message: "Keystore passphrase" });
-    if (!r.passphrase) process.exit(130);
-    passphrase = r.passphrase;
-  }
-
-  const wallet = await loadWallet(keystorePath, passphrase);
   const relayBase = cfg.relayUrl.replace(/\/+$/, "");
   const teeBaseUrl = resolveTeeBaseUrl(relayBase, args.teeBaseUrl);
   const completionsUrl = `${relayBase}/v1/chat/completions`;
   const modelsUrl = `${relayBase}/v1/models`;
 
+  const vaultAddress = resolveVaultAddress(cfg.vaultAddress);
   // Browser mode derives the same shared session key as the web app.
   if (args.sessionKey && args.sessionKey !== "wallet" && args.sessionKey !== "browser") {
     console.error(`  ✗ --session-key must be "wallet" or "browser" (got "${args.sessionKey}").`);
     process.exit(1);
   }
-  const sessionKeyMode: SessionKeyMode = args.sessionKey === "browser" ? "browser" : "wallet";
-  const vaultSessionSigner = await resolveSessionSigner(wallet, sessionKeyMode);
+  let sessionKeyMode: SessionKeyMode | "privy";
+  let wallet: Awaited<ReturnType<typeof loadWallet>> | VoidSigner;
+  let vaultSessionSigner: Awaited<ReturnType<typeof resolveSessionSigner>>;
+  let pendingStorePath: string;
+  let deadLetterStorePath: string;
+  let privyFunding:
+    | {
+        catalog: typeof walletCatalog;
+        scope: ConsumeSessionKeyScope;
+        keyStore: FileConsumeSessionKeyStore;
+        sessionStore: FileWalletAccessSessionStore;
+        gateway: PrivyWalletAccessGateway;
+      }
+    | undefined;
+  if (walletCatalog.selector === "keystore") {
+    const keystorePath = args.keystore ?? cfg.operator.keystorePath;
+    let passphrase: string;
+    if (cfg.operator.noPassphrase) {
+      passphrase = "";
+    } else if (typeof process.env.HALO_PASSPHRASE === "string") {
+      passphrase = process.env.HALO_PASSPHRASE;
+    } else {
+      const response = await prompts({
+        type: "password",
+        name: "passphrase",
+        message: "Keystore passphrase",
+      });
+      if (!response.passphrase) process.exit(130);
+      passphrase = response.passphrase;
+    }
+    wallet = await loadWallet(keystorePath, passphrase);
+    sessionKeyMode = args.sessionKey === "browser" ? "browser" : "wallet";
+    vaultSessionSigner = await resolveSessionSigner(wallet, sessionKeyMode);
+    pendingStorePath = path.join(configDir(), `vault-pending-${wallet.address.toLowerCase()}.json`);
+    deadLetterStorePath = path.join(
+      configDir(),
+      `vault-redeem-dead-letter-${wallet.address.toLowerCase()}.json`
+    );
+  } else if (walletCatalog.selector === "privy") {
+    if (args.keystore !== undefined || (args.sessionKey !== undefined && args.sessionKey !== "browser")) {
+      throw new WalletAccessError(
+        "wallet_backend_unsupported_for_command",
+        "A selected Privy consumer uses its pinned identity and deterministic session key; remove the keystore or wallet session-key override."
+      );
+    }
+    const selected = walletCatalog.privyIdentity;
+    const appId = walletCatalog.privyAppId;
+    if (selected === null || appId === null) {
+      throw new WalletAccessError(
+        "wallet_backend_transition_ambiguous",
+        "The selected Privy identity is incomplete. Inspect wallet configuration before retrying."
+      );
+    }
+    const scope: ConsumeSessionKeyScope = {
+      chainId: BASE_CHAIN_ID,
+      vaultAddress,
+      consumerAddress: selected.address,
+      derivationVersion: 1,
+    };
+    const keyStore = new FileConsumeSessionKeyStore(scope);
+    const sessionStore = new FileWalletAccessSessionStore();
+    const gateway = new PrivyWalletAccessGateway({ appId });
+    const authority = await resolvePrivyConsumerAuthority({
+      catalog: walletCatalog,
+      scope,
+      keyStore,
+      sessionStore,
+      gateway,
+    });
+    wallet = new VoidSigner(authority.ownerAddress);
+    vaultSessionSigner = authority.sessionWallet;
+    sessionKeyMode = "privy";
+    const stateDirectory = path.dirname(consumeSessionKeyPath(scope));
+    pendingStorePath = path.join(stateDirectory, "pending-redeems.json");
+    deadLetterStorePath = path.join(stateDirectory, "redeem-dead-letter.json");
+    privyFunding = { catalog: walletCatalog, scope, keyStore, sessionStore, gateway };
+  } else {
+    throw new WalletAccessError(
+      "wallet_backend_unsupported_for_command",
+      "halo consume requires a selected keystore or Privy wallet."
+    );
+  }
   const vaultSessionKeyAddr = vaultSessionSigner
     ? await vaultSessionSigner.getAddress()
     : wallet.address;
-  const vaultAddress = resolveVaultAddress(cfg.vaultAddress);
   const vault = new VaultConsumeClient(
     wallet,
     {
@@ -1820,13 +1926,10 @@ export async function cmdConsume(args: Args): Promise<void> {
       ...(args.vaultReserveMultiple && args.vaultReserveMultiple > 0
         ? { reserveMultiple: BigInt(Math.floor(args.vaultReserveMultiple)) }
         : {}),
-      autoTopUpUsd: args.vaultDeposit,
+      autoTopUpUsd: sessionKeyMode === "privy" ? undefined : args.vaultDeposit,
       // Persist pending redeems per wallet across restarts.
-      pendingStorePath: path.join(configDir(), `vault-pending-${wallet.address.toLowerCase()}.json`),
-      deadLetterStorePath: path.join(
-        configDir(),
-        `vault-redeem-dead-letter-${wallet.address.toLowerCase()}.json`
-      ),
+      pendingStorePath,
+      deadLetterStorePath,
       onTerminalRedeem: (error) => console.error(`  ⚠ ${terminalRedeemGuidance(error)}`),
     },
     vaultSessionSigner
@@ -1836,10 +1939,124 @@ export async function cmdConsume(args: Args): Promise<void> {
   if (!(await guardVaultFresh(facilitatorUrl, vaultAddress, { force: args.force }))) {
     process.exit(1);
   }
-  // Resume any redeems a prior process left pending (restart-durable settlement).
-  // After the freshness gate, so a stale vault never replays receipts.
-  await vault.resumePendingRedeems();
-  if (args.vaultDeposit && args.vaultDeposit > 0) {
+  if (sessionKeyMode === "privy") {
+    if (privyFunding === undefined) {
+      throw new WalletAccessError(
+        "privy_direct_funding_state_ambiguous",
+        "Privy direct-funding state was not initialized. No transaction was sent."
+      );
+    }
+    const target = privyVaultTarget ?? null;
+    const fundingClient = new DirectVaultFundingClient({
+      rpcUrl: (process.env.BASE_RPC_URL || "https://mainnet.base.org").trim(),
+      chainId: BASE_CHAIN_ID,
+      vaultAddress,
+    });
+    const directFundingStore = new FileDirectVaultFundingStore(privyFunding.scope);
+    const directReconciliation = await fundPrivyVaultDirect({
+      initialCatalog: privyFunding.catalog,
+      readCurrentCatalog: () => resolveWalletCatalog(loadConfig()).catalog,
+      consumerAddress: wallet.address,
+      sessionAddress: vaultSessionKeyAddr,
+      targetBalanceBase: null,
+      keyStore: privyFunding.keyStore,
+      fundingStore: directFundingStore,
+      sessionStore: privyFunding.sessionStore,
+      client: fundingClient,
+      authorize: () =>
+        resolvePrivyTransactionAuthorization({
+          catalog: privyFunding!.catalog,
+          sessionStore: privyFunding!.sessionStore,
+          gateway: privyFunding!.gateway,
+        }),
+    });
+    const route = await routePrivyVaultFunding({
+      initialCatalog: privyFunding.catalog,
+      readCurrentCatalog: () => resolveWalletCatalog(loadConfig()).catalog,
+      consumerAddress: wallet.address,
+      sessionAddress: vaultSessionKeyAddr,
+      targetBalanceBase: target,
+      facilitatorUrl,
+      keyStore: privyFunding.keyStore,
+      directFundingStore,
+      fundingStore: new FileSponsoredVaultFundingStore(privyFunding.scope),
+      sessionStore: privyFunding.sessionStore,
+      client: fundingClient,
+      authorize: () =>
+        resolvePrivySponsoredTransactionAuthorization({
+          catalog: privyFunding!.catalog,
+          sessionStore: privyFunding!.sessionStore,
+          gateway: privyFunding!.gateway,
+        }),
+    });
+    const funding = route.mode === "direct"
+      ? await fundPrivyVaultDirect({
+          initialCatalog: privyFunding.catalog,
+          readCurrentCatalog: () => resolveWalletCatalog(loadConfig()).catalog,
+          consumerAddress: wallet.address,
+          sessionAddress: vaultSessionKeyAddr,
+          targetBalanceBase: target,
+          keyStore: privyFunding.keyStore,
+          fundingStore: directFundingStore,
+          sessionStore: privyFunding.sessionStore,
+          client: fundingClient,
+          authorize: () =>
+            resolvePrivyTransactionAuthorization({
+              catalog: privyFunding!.catalog,
+              sessionStore: privyFunding!.sessionStore,
+              gateway: privyFunding!.gateway,
+            }),
+        }).then((direct) => ({
+          funded:
+            directReconciliation.funded ||
+            direct.funded ||
+            route.transactionHashes.length > 0,
+          transactionHashes: [
+            ...directReconciliation.transactionHashes,
+            ...route.transactionHashes,
+            ...direct.transactionHashes,
+          ],
+        }))
+      : {
+          funded:
+            directReconciliation.funded ||
+            (route.mode === "sponsored" && route.transactionHashes.length > 0),
+          transactionHashes: [
+            ...directReconciliation.transactionHashes,
+            ...route.transactionHashes,
+          ],
+        };
+    if (target !== null) {
+      console.log(
+        funding.transactionHashes.length > 0
+          ? `  ✓ Privy Vault target reached at $${args.vaultDeposit!.toFixed(2)} (${funding.transactionHashes.length} Base transaction${funding.transactionHashes.length === 1 ? "" : "s"})`
+          : `  ✓ Privy Vault already funded ≥ $${args.vaultDeposit!.toFixed(2)}`
+      );
+    }
+  }
+  if (sessionKeyMode === "privy") {
+    const state = await readPrivyConsumeVaultPreflight({
+      readState: () => vault.readVaultState(),
+      expectedSessionAddress: vaultSessionKeyAddr,
+    });
+    try {
+      await vault.resumePendingRedeems({
+        keyEpoch: state.keyEpoch,
+        sessionAddress: vaultSessionKeyAddr,
+        strict: true,
+      });
+    } catch {
+      throw new WalletAccessError(
+        "consumer_redeem_state_ambiguous",
+        "Pending Privy redeem evidence could not be validated against current HaloVault state. Inspect the scoped consumer state before retrying."
+      );
+    }
+  } else {
+    // Resume any redeems a prior process left pending (restart-durable settlement).
+    // After the freshness gate, so a stale vault never replays receipts.
+    await vault.resumePendingRedeems();
+  }
+  if (sessionKeyMode !== "privy" && args.vaultDeposit && args.vaultDeposit > 0) {
     // Auto-managed: top the vault up to the target from the wallet's USDC on
     // startup so the first request has reservable funds. Fails loud (and the
     // sidecar still starts in case the agent only hits read endpoints).
@@ -2628,7 +2845,7 @@ export async function cmdConsume(args: Args): Promise<void> {
     console.log(`  relay    : ${relayBase}`);
     console.log(`  rail     : vault (settle ACTUAL tokens; deposit-backed)`);
     console.log(
-      `  session  : ${sessionKeyMode === "browser" ? `browser-derived ${vaultSessionKeyAddr} (shared with the Halo web app)` : "wallet (this wallet signs receipts)"}`
+      `  session  : ${sessionKeyMode === "privy" ? `Privy-derived ${vaultSessionKeyAddr}` : sessionKeyMode === "browser" ? `browser-derived ${vaultSessionKeyAddr} (shared with the Halo web app)` : "wallet (this wallet signs receipts)"}`
     );
     console.log(
       `  budget   : ${budget.budgetBase > 0n ? `$${usd(budget.budgetBase)} cumulative (warn at ${Math.round(budget.warnPct * 100)}%)` : "uncapped (set --budget-usdc to bound an agent)"}`
