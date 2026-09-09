@@ -159,6 +159,29 @@ test("CLI request selection applies the replay quote before enforcing the per-re
   assert.equal(selection.selected?.operator.address, operator.address);
   assert.equal(selection.selected?.reservationCostBase, 1_325n);
   assert.equal(selection.selected?.replayPricingQuote?.quoteId, quote.quoteId);
+  assert.ok(selection.selected);
+  const operators = [selection.selected.operator, {
+    address: "0x0000000000000000000000000000000000000001",
+    models: [model],
+    pricing: { [model]: 0.000001 },
+    vaultPayments: true,
+  }];
+  const pricing = {
+    maxAmountBase: 100n,
+    reservationTokens: 1_005,
+    promptTokens: 1_004,
+    completionTokens: 1,
+    allowReplayPricing: true,
+  };
+  const pinned = selectVaultOperatorForRequestFromList(
+    operators, model, false, pricing, operator.address.toLowerCase()
+  );
+  assert.equal(pinned.selected, null);
+  assert.equal(pinned.reason, "pinned_out_of_range");
+  assert.equal(
+    selectVaultOperatorForRequestFromList(operators, model, false, pricing).selected?.operator.address,
+    operators[1].address
+  );
 });
 
 test("CLI replay request body passes the shared relay prepare parser", () => {

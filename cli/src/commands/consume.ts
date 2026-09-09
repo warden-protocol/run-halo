@@ -1383,14 +1383,39 @@ export interface ConsumeInferenceRoutes {
 export function dispatchConsumeInferenceRoute(
   req: http.IncomingMessage,
   res: http.ServerResponse,
-  routes: ConsumeInferenceRoutes
+  routes: ConsumeInferenceRoutes,
+  operatorAddress?: string
 ): Promise<void> | null {
   if (req.method !== "POST") return null;
   const url = (req.url || "").split("?")[0];
-  if (url === "/v1/chat/completions") return routes.completion(req, res);
-  if (url === "/v1/images/generations") return routes.imageGeneration(req, res);
-  if (url === "/v1/images/edits") return routes.imageEdit(req, res);
-  return null;
+  const route = url === "/v1/chat/completions"
+    ? routes.completion
+    : url === "/v1/images/generations"
+      ? routes.imageGeneration
+      : url === "/v1/images/edits"
+        ? routes.imageEdit
+        : null;
+  if (!route) return null;
+
+  if (operatorAddress !== undefined) {
+    const requested = req.headers["x-halo-operator"];
+    if (
+      requested !== undefined &&
+      (typeof requested !== "string" ||
+        (requested.trim() !== "" && requested.trim().toLowerCase() !== operatorAddress.toLowerCase()))
+    ) {
+      sendJson(res, 400, {
+        error: {
+          message: "X-Halo-Operator conflicts with consume.operatorAddress in ~/.halo/config.json. Remove the header or use the configured address.",
+          type: "halo_request_error",
+          code: "consumer_operator_conflict",
+        },
+      });
+      return Promise.resolve();
+    }
+    req.headers["x-halo-operator"] = operatorAddress;
+  }
+  return route(req, res);
 }
 
 interface ImageEditOperatorPin {
@@ -1813,6 +1838,10 @@ export async function cmdConsume(args: Args): Promise<void> {
   // allowlist of models the agent will pay for (refuse anything else pre-payment).
   const defaultModel = cfg.consume?.defaultModel;
   const allowedModels = cfg.consume?.allowedModels;
+  const operatorAddress = cfg.consume?.operatorAddress;
+  const unpinGuidance = operatorAddress
+    ? "Change or remove consume.operatorAddress in ~/.halo/config.json and restart halo consume to choose another operator."
+    : "Drop X-Halo-Operator to use the cheapest eligible operator.";
   // Confidential (TEE) mode: route only to TEE operators and E2E-encrypt the
   // prompt to the enclave.
   const confidential = args.confidential === true;
@@ -2210,7 +2239,7 @@ export async function cmdConsume(args: Args): Promise<void> {
       completion: handleCompletion,
       imageGeneration: handleImage,
       imageEdit: handleImageEdit,
-    });
+    }, operatorAddress);
     if (inferenceRoute) return inferenceRoute;
 
     // GET reports budget state; authenticated POST changes only the ceiling, never accrued spend.
@@ -2357,9 +2386,6 @@ export async function cmdConsume(args: Args): Promise<void> {
     const vaultCompletionTokens = requestCompletionCeilingTokens(parsed);
     const vaultEstTokens = estimateReservationTokens(parsed);
     const m = typeof parsed.model === "string" ? parsed.model : "";
-    // If the caller explicitly pinned an operator (X-Halo-Operator, e.g. a
-    // settlement sweep targeting every operator), honor it; otherwise fall back
-    // to the default cheapest-tier selection.
     const pinned = (forwardHeaders["x-halo-operator"] || "").trim() || undefined;
     const selection = m
       ? await selectVaultOperator(
@@ -2384,7 +2410,7 @@ export async function cmdConsume(args: Args): Promise<void> {
         selection.reason === "pinned_out_of_range";
       const message =
         selection.reason === "pinned_not_vault_capable"
-          ? `pinned operator ${pinned} serves "${m}" but is not vault-capable. Upgrade that operator to announce vaultPayments, or drop X-Halo-Operator to choose a vault-capable operator.`
+          ? `pinned operator ${pinned} serves "${m}" but is not vault-capable. ${operatorAddress ? `Upgrade that operator to announce vaultPayments. ${unpinGuidance}` : "Upgrade that operator to announce vaultPayments, or drop X-Halo-Operator to choose a vault-capable operator."}`
           : selection.reason === "pinned_free_model"
             ? `pinned operator ${pinned} advertises "${m}" as free. A zero-price model cannot produce a redeemable vault receipt; use a metered model.`
             : selection.reason === "free_model"
@@ -2392,7 +2418,7 @@ export async function cmdConsume(args: Args): Promise<void> {
               : overPriceCeiling
                 ? `no eligible operator for "${m}" is within the $${(Number(maxAmountBase) / 1_000_000).toFixed(2)} per-request cap.`
                 : pinned
-                  ? `pinned operator ${pinned} is unavailable or not advertising a usable price for "${m}"${wantConfidential ? " (confidential)" : ""}. Drop X-Halo-Operator to use the cheapest eligible operator.`
+                  ? `pinned operator ${pinned} is unavailable or not advertising a usable price for "${m}"${wantConfidential ? " (confidential)" : ""}. ${unpinGuidance}`
                   : `no priced${wantConfidential ? " confidential" : ""} vault-capable operator is online for "${m}".`;
       return sendJson(
         res,
@@ -2719,7 +2745,7 @@ export async function cmdConsume(args: Args): Promise<void> {
         : free
           ? `Image model "${model}" is advertised as free and cannot produce a redeemable vault receipt. Use a metered image model.`
           : pinned
-            ? `pinned operator ${pinned} is unavailable or not advertising a usable per-image price for "${model}". Drop X-Halo-Operator to use the cheapest eligible image operator.`
+            ? `pinned operator ${pinned} is unavailable or not advertising a usable per-image price for "${model}". ${operatorAddress ? unpinGuidance : "Drop X-Halo-Operator to use the cheapest eligible image operator."}`
             : `No priced image operator is online for "${model}". Image generation needs a vault operator advertising a positive per-image price for this exact model.`;
       return sendJson(res, 503, {
         error: {
