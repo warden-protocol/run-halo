@@ -368,6 +368,34 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
+**Optional operator restriction:** add `operatorAddress` to the existing `consume`
+object in `~/.halo/config.json`, preserving your other settings. For example:
+
+```json
+{
+  "consume": {
+    "maxUsdc": 0.10,
+    "operatorAddress": "0x1234567890abcdef1234567890abcdef12345678"
+  }
+}
+```
+
+Replace the example with the operator's address and restart `halo consume`.
+This config-only setting requires that operator for text, streaming, image
+generation, and image editing. There is no fallback if the operator is unavailable,
+ineligible, or over the spending limit; model, budget, encryption, and capability
+checks still apply. A conflicting `X-Halo-Operator` request header returns HTTP 400
+with code `consumer_operator_conflict` before inference work; the same address in
+different letter case is accepted. Empty, malformed, non-string, or zero configured
+addresses prevent startup. If an existing configuration cannot be loaded or is
+invalid, setup stops before changing configuration or wallet files, even with
+`--rotate-wallet`; repair the file before rerunning setup. Setup preserves the field
+when retaining or reconfiguring
+an enabled consumer profile. Omit the field to retain existing automatic selection
+and request-header behavior; removing it takes effect after restart. There is no
+new CLI flag or setup prompt. The model-list endpoint still shows the relay's full
+catalog.
+
 **`consume` flags:**
 - `--port <n>` (default `8799`) — port to listen on.
 - `--host <addr>` (default `127.0.0.1`) — bind address. Keep it loopback unless you also set

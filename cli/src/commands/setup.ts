@@ -70,7 +70,7 @@ const CONSUME_DEFAULT_MAX_USDC = 0.1;
 const CONSUME_DEFAULT_PORT = 8799;
 
 /** Resolve consumer defaults: explicit flag wins, unattended mode preserves state, interactive mode prompts. */
-async function resolveConsumeConfig(
+export async function resolveConsumeConfig(
   flags: SetupFlags,
   models: string[],
   existing: HaloConfig | null,
@@ -85,6 +85,7 @@ async function resolveConsumeConfig(
   const fromFlags = (): NonNullable<HaloConfig["consume"]> => {
     const allow = csv(flags.consumeAllow);
     return {
+      operatorAddress: existing?.consume?.operatorAddress,
       maxUsdc:
         flags.consumeMaxUsdc !== undefined && flags.consumeMaxUsdc > 0
           ? flags.consumeMaxUsdc
@@ -154,6 +155,7 @@ async function resolveConsumeConfig(
   );
   const allowed = csv(allow);
   return {
+    operatorAddress: existing?.consume?.operatorAddress,
     maxUsdc: typeof mx === "number" && mx > 0 ? mx : CONSUME_DEFAULT_MAX_USDC,
     defaultModel: ((dm as string) || "").trim() || undefined,
     allowedModels: allowed.length ? allowed : undefined,
@@ -177,7 +179,7 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
   const cancel = { onCancel: () => process.exit(130) };
 
   // Preserve configured or orphaned keystores unless rotation is explicit.
-  const existingConfig = existsSync(configPath()) ? safeLoadConfig() : null;
+  const existingConfig = existsSync(configPath()) ? loadExistingSetupConfig() : null;
   const orphanedAddr = !existingConfig ? readOrphanedKeystoreAddress() : null;
   const preserveExisting =
     (existingConfig !== null || orphanedAddr !== null) && !flags.rotateWallet;
@@ -881,11 +883,14 @@ export async function cmdSetup(flags: SetupFlags = {}): Promise<void> {
   }
 }
 
-function safeLoadConfig(): HaloConfig | null {
+function loadExistingSetupConfig(): HaloConfig {
   try {
     return loadConfig();
   } catch {
-    return null;
+    throw new Error(
+      `Cannot load existing Halo configuration at ${configPath()}. ` +
+      "Repair it before rerunning halo setup; no setup changes were made."
+    );
   }
 }
 

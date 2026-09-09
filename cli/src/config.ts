@@ -79,8 +79,10 @@ interface HaloConfigFields {
   };
   /** Config-only vault override; every facilitator and consumer must use the same address. */
   vaultAddress?: string;
-  /** Persisted `halo consume` defaults; command flags override them. */
+  /** Persisted `halo consume` settings; matching command flags override defaults. */
   consume?: {
+    /** Config-only operator restriction for every inference route; no fallback. */
+    operatorAddress?: string;
     /** Per-request spend ceiling in USD: estimated vault cost above it is refused (402). */
     maxUsdc: number;
     /** Model used when a consume request omits `model`. */
@@ -198,6 +200,15 @@ export function validateConfig(cfg: HaloConfig): HaloConfig {
   }
   if (cfg.version === 2) {
     validateWalletCatalogMirror(cfg.walletCatalog, cfg.operator);
+  }
+  const operatorAddress = cfg.consume?.operatorAddress;
+  if (
+    operatorAddress !== undefined &&
+    (typeof operatorAddress !== "string" ||
+      !/^0x[0-9a-fA-F]{40}$/.test(operatorAddress) ||
+      /^0x0{40}$/.test(operatorAddress))
+  ) {
+    throw new Error("consume.operatorAddress must be a non-zero 0x-prefixed 20-byte hex address; omit it to allow automatic operator selection");
   }
   const providers = cfg.providers && cfg.providers.length > 0 ? cfg.providers : [cfg.provider];
   if (!VALID_PRICING_MODES.includes(cfg.pricing.mode)) {
