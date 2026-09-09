@@ -136,7 +136,7 @@ export class VaultCreditLedger {
     operator: string,
     cycle: bigint,
     ceilingBase: bigint,
-    windowBase: bigint
+    windowBase: bigint | null
   ): AdmitResult {
     const e = this.entryFor(consumer, operator, cycle);
     // Refuse stale cycles without mutating the newer generation.
@@ -151,7 +151,7 @@ export class VaultCreditLedger {
     const outstanding = VaultCreditLedger.outstanding(e);
     const projected = outstanding + ceilingBase;
     // A lone request may exceed the window; subsequent accumulation may not.
-    if (outstanding > 0n && projected > windowBase) {
+    if (windowBase !== null && outstanding > 0n && projected > windowBase) {
       return {
         ok: false,
         reason: `credit window exceeded (floating ${outstanding} + ${ceilingBase} > ${windowBase}); awaiting a receipt for prior work`,
@@ -298,4 +298,10 @@ export function creditWindowBase(): bigint {
     }
   }
   return 100_000n;
+}
+
+/** Trusted-mode escape hatch for operators that accept unbounded local
+ * unreceipted exposure. Receipt, cycle, and on-chain per-request checks remain. */
+export function creditWindowDisabled(): boolean {
+  return process.env.HALO_VAULT_CREDIT_WINDOW_DISABLED === "1";
 }

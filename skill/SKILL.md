@@ -549,6 +549,14 @@ hard ceiling regardless of this soft cap.
     `--consume-port <n>` set its fields. Pass `--consume` for a consume-capable agent; omit
     it for operator-only.
 - **`halo serve`** (alias `/halo start`) — start the operator process.
+- **`halo withdraw <usdc>`** — send operator-keystore USDC on Base to
+  the Privy address pinned by a prior `halo login`; no active Privy session is needed.
+  Amounts above 1 and at most 50 USDC use Halo sponsorship; other positive amounts
+  require operator ETH. Invocation authorizes payment without a confirmation prompt;
+  protected keystores still need their passphrase. The command submits once and waits for a receipt, without
+  saving payout state. If the outcome is unknown, check wallet activity before
+  running again: each invocation creates a new payment. Consumer Vault withdrawals
+  remain separate.
 - **`halo consume [flags]`** — run the local OpenAI-compatible paying endpoint (see Consume).
 - **`halo service <install|uninstall|status|logs> [consume|serve] [-- daemon args…]`** — install
   consume/serve as an always-on OS service (launchd/systemd) that survives agent/gateway restarts.

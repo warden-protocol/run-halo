@@ -59,7 +59,13 @@ import {
   getVaultAddress,
   setActiveVaultAddress,
 } from "../vault";
-import { VaultCreditLedger, creditWindowBase, AdmitResult, ReceiptSnapshot } from "../vaultCredit";
+import {
+  VaultCreditLedger,
+  creditWindowBase,
+  creditWindowDisabled,
+  AdmitResult,
+  ReceiptSnapshot,
+} from "../vaultCredit";
 import { VaultReceiptStore } from "../vaultReceiptStore";
 import {
   PendingHeldReceipt,
@@ -2079,6 +2085,7 @@ export async function cmdServe(): Promise<void> {
   installProxyFromEnv(); // honor HTTP(S)_PROXY for upstream/relay/facilitator calls
   const reportedRelayVersion = relayCliVersion();
   const cfg = loadConfig();
+  const disableCreditWindow = creditWindowDisabled();
 
   // Point vault reads + receipt verification at the configured vault (defaults to
   // the consensus-pinned address). Throws on a malformed override so a typo fails
@@ -2089,6 +2096,11 @@ export async function cmdServe(): Promise<void> {
   // Persistent logs rotate to one backup; the PID file supports deterministic status checks.
   setupFileLogging();
   writePidFile();
+  if (disableCreditWindow) {
+    console.warn(
+      "  ⚠ trusted mode — HALO_VAULT_CREDIT_WINDOW_DISABLED=1 allows unbounded accumulated unreceipted exposure"
+    );
+  }
 
   // Empty-passphrase unattended keystores unlock without prompting.
   let passphrase: string;
@@ -3514,8 +3526,11 @@ export async function cmdServe(): Promise<void> {
                 if (await rejectReplayCycleMismatch(chk.cycle)) return;
                 // Cap accumulated unreceipted work by configured credit and on-chain locked funds.
                 // One larger request may be admitted when nothing is outstanding; refresh from current cycle state.
-                const creditWindow = (): bigint =>
-                  creditWindowBase() < chk.remaining ? creditWindowBase() : chk.remaining;
+                const creditWindow = (): bigint | null => {
+                  if (disableCreditWindow) return null;
+                  const configured = creditWindowBase();
+                  return configured < chk.remaining ? configured : chk.remaining;
+                };
                 // Align local cumulative accounting with the on-chain collectible ceiling.
                 eventOutbox.observeOnchain(
                   consumerAddr,
