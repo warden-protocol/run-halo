@@ -14,6 +14,10 @@ RUN npm ci --silent
 RUN npm run build
 
 WORKDIR /app/cli
+# Container builds have no Git metadata, so pass the release tag through to the
+# version generator. The release workflow supplies this build argument.
+ARG HALO_CLI_VERSION=""
+ENV HALO_CLI_VERSION=$HALO_CLI_VERSION
 COPY cli/package*.json cli/tsconfig.json ./
 RUN npm ci --silent
 COPY cli/scripts ./scripts
