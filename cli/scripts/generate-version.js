@@ -4,15 +4,20 @@ const { writeFileSync } = require("node:fs");
 const path = require("node:path");
 
 const repoRoot = path.resolve(__dirname, "../..");
-let version;
-try {
-  version = execFileSync(
-    "git",
-    ["describe", "--tags", "--match", "cli-v*", "--always", "--dirty"],
-    { cwd: repoRoot, encoding: "utf8" }
-  ).trim();
-} catch {
-  version = "untagged";
+
+// Container builds have no usable Git metadata. Allow the release workflow to
+// inject the exact tag while retaining git describe for ordinary local builds.
+let version = (process.env.HALO_CLI_VERSION || "").trim();
+if (!version) {
+  try {
+    version = execFileSync(
+      "git",
+      ["describe", "--tags", "--match", "cli-v*", "--always", "--dirty"],
+      { cwd: repoRoot, encoding: "utf8" }
+    ).trim();
+  } catch {
+    version = "untagged";
+  }
 }
 
 writeFileSync(
