@@ -6,6 +6,7 @@ import { cmdLink } from "./commands/link";
 import { cmdStatus } from "./commands/status";
 import { cmdDoctor } from "./commands/doctor";
 import { cmdService } from "./commands/service";
+import { cmdWithdraw } from "./commands/withdraw";
 import { cmdVault } from "./commands/vault";
 import { cmdLogin, cmdLogout } from "./commands/login";
 import { HALO_VERSION } from "./version";
@@ -62,6 +63,7 @@ halo — Halo operator + payer CLI
     --forget-wallet [address]  explicitly forget the pinned Privy wallet; enter or supply its complete address
 
   halo run                                         connect to relay, start earning
+    HALO_VAULT_CREDIT_WINDOW_DISABLED=1  trusted mode: remove the local unreceipted-credit limit
   halo consume [flags]                             run a vault-backed local OpenAI-compatible endpoint
     --port <n>                 port to listen on (default 8799)
     --host <addr>              bind address (default 127.0.0.1)
@@ -79,6 +81,7 @@ halo — Halo operator + payer CLI
     --vault-reserve-multiple <n>  reserve this many requests' worth per operator (default 5); lower it when fanning out across many operators so reservations don't lock the whole deposit (#367)
     --session-key <wallet|browser>  keystore session-key scheme (default wallet); Privy always uses the deterministic browser-compatible key
     --force                    force unrelated supported behavior; cannot bypass vault identity checks
+  halo withdraw <usdc>                             send operator USDC to the pinned Privy wallet (no confirmation)
   halo vault [--session-key <wallet|browser>] <status|deposit <usd>|withdraw>   manage the HaloVault balance for consume (settle-actual billing)
   halo link                                        pair with a dashboard wallet
   halo status                                      show wallet + league stats
@@ -246,6 +249,8 @@ async function main(): Promise<void> {
         detach: flags.detach === true,
         force: flags.force === true,
       });
+    case "withdraw":
+      return cmdWithdraw(rest);
     case "vault":
       return cmdVault(rest);
     case "link":

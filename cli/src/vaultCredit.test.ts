@@ -1,6 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { VaultCreditLedger, creditWindowBase } from "./vaultCredit";
+import {
+  VaultCreditLedger,
+  creditWindowBase,
+  creditWindowDisabled,
+} from "./vaultCredit";
 
 const C = "0x1111111111111111111111111111111111111111";
 const O = "0x2222222222222222222222222222222222222222";
@@ -14,6 +18,16 @@ test("admits while within the window, refuses past it", () => {
   assert.equal(l.admit(C, O, CY, 600n, W).ok, true);
   assert.equal(l.admit(C, O, CY, 400n, W).ok, true);
   assert.equal(l.admit(C, O, CY, 1n, W).ok, false);
+});
+
+test("a disabled window admits accumulated exposure but preserves ledger accounting", () => {
+  const l = new VaultCreditLedger();
+  assert.equal(l.admit(C, O, CY, 600n, null).ok, true);
+  assert.equal(l.admit(C, O, CY, 900n, null).ok, true);
+  assert.equal(l.outstandingFor(C, O), 1500n);
+  assert.equal(l.settleServed(C, O, CY, 600n, 400n), 400n);
+  assert.equal(l.outstandingFor(C, O), 1300n);
+  assert.equal(l.admit(C, O, CY - 1n, 1n, null).stale, true);
 });
 
 test("a single request larger than the window is admitted when nothing is outstanding", () => {
@@ -356,4 +370,18 @@ test("creditWindowBase honors the env override and falls back to the default", (
   assert.equal(creditWindowBase(), 100_000n);
   if (prev === undefined) delete process.env.HALO_VAULT_CREDIT_WINDOW_BASE;
   else process.env.HALO_VAULT_CREDIT_WINDOW_BASE = prev;
+});
+
+test("creditWindowDisabled requires the exact trusted-mode opt-in", () => {
+  const prev = process.env.HALO_VAULT_CREDIT_WINDOW_DISABLED;
+  delete process.env.HALO_VAULT_CREDIT_WINDOW_DISABLED;
+  assert.equal(creditWindowDisabled(), false);
+  process.env.HALO_VAULT_CREDIT_WINDOW_DISABLED = "true";
+  assert.equal(creditWindowDisabled(), false);
+  process.env.HALO_VAULT_CREDIT_WINDOW_DISABLED = " 1 ";
+  assert.equal(creditWindowDisabled(), false);
+  process.env.HALO_VAULT_CREDIT_WINDOW_DISABLED = "1";
+  assert.equal(creditWindowDisabled(), true);
+  if (prev === undefined) delete process.env.HALO_VAULT_CREDIT_WINDOW_DISABLED;
+  else process.env.HALO_VAULT_CREDIT_WINDOW_DISABLED = prev;
 });

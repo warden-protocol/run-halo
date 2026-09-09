@@ -7,6 +7,7 @@ export const KNOWN_COMMANDS = new Set([
   "pay",
   "consume",
   "vault",
+  "withdraw",
   "link",
   "status",
   "doctor",
