@@ -1,4 +1,4 @@
-FROM node:20-alpine AS builder
+FROM node:22.23.4-alpine AS builder
 WORKDIR /app/vault-core
 COPY vault-core/package*.json vault-core/tsconfig.*.json ./
 COPY vault-core/scripts ./scripts
@@ -24,7 +24,7 @@ COPY cli/scripts ./scripts
 COPY cli/src ./src
 RUN npm run build
 
-FROM node:20-alpine AS runner
+FROM node:22.23.4-alpine AS runner
 ENV NODE_ENV=production
 # Non-root user (uid/gid 10001) — keeps the CLI image consistent with the
 # backend services. No HEALTHCHECK: the CLI has no HTTP endpoint.
